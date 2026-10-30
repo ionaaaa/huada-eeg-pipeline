@@ -1,0 +1,9 @@
+subject_id,task,label,label_name,exclusion_reason
+SUB1,age_regression,31.0,,
+SUB2,age_regression,29.0,,
+SUB3,age_regression,26.0,,
+SUB4,age_regression,26.0,,
+SUB5,age_regression,,,age_missing
+SUB6,age_regression,28.0,,
+SUB7,age_regression,28.0,,
+SUB8,age_regression,22.0,,

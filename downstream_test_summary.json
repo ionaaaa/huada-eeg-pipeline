@@ -1,0 +1,35 @@
+{
+  "generated_at": "2026-10-30T14:35:00+08:00",
+  "command": "D:\\miniconda\\python.exe -m pytest -q",
+  "result": "passed",
+  "tests_passed": 62,
+  "tests_failed": 0,
+  "subtests_passed": 5,
+  "warnings": 2,
+  "new_downstream_tests": 16,
+  "new_downstream_tests_passed": 16,
+  "coverage_areas": [
+    "local Lance reading and real schema",
+    "sample_id string and tensor shapes/dtypes",
+    "female=0 and male=1 mapping",
+    "SUB5 retained for sex and excluded for age without imputation",
+    "subject-manifest window inheritance and split validation",
+    "fixed-seed split reproducibility",
+    "normal 640-token and single-bad-channel 630-token fixtures",
+    "real smoke-cache 600/590 masks and batch alignment",
+    "masked flatten and masked mean behavior",
+    "classification and regression heads/loss backward",
+    "linear-probe freeze and finetune parameter states",
+    "actual 50M representation forward shape",
+    "checkpoint prefix/hash/mismatch report",
+    "upstream/migrated downstream output parity",
+    "small-sample metric reliability flags"
+  ],
+  "parity": {
+    "status": "passed",
+    "seed": 7,
+    "tolerance": {"atol": 1e-6, "rtol": 1e-6},
+    "scope": "EEGDownstreamClassifier masked-flatten/head path with identical weights and inputs",
+    "pretrained_checkpoint_parity": "not_run_checkpoint_unavailable"
+  }
+}

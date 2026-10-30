@@ -1,0 +1,9 @@
+subject_id,task,label,label_name,exclusion_reason,split,split_seed
+SUB1,sex_classification,1,male,,test,42
+SUB2,sex_classification,0,female,,train,42
+SUB3,sex_classification,0,female,,train,42
+SUB4,sex_classification,0,female,,train,42
+SUB5,sex_classification,1,male,,train,42
+SUB6,sex_classification,1,male,,validation,42
+SUB7,sex_classification,0,female,,train,42
+SUB8,sex_classification,1,male,,train,42

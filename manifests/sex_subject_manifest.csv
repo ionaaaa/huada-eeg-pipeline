@@ -1,0 +1,9 @@
+subject_id,task,label,label_name,exclusion_reason
+SUB1,sex_classification,1,male,
+SUB2,sex_classification,0,female,
+SUB3,sex_classification,0,female,
+SUB4,sex_classification,0,female,
+SUB5,sex_classification,1,male,
+SUB6,sex_classification,1,male,
+SUB7,sex_classification,0,female,
+SUB8,sex_classification,1,male,

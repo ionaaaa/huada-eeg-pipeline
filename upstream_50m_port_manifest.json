@@ -1,0 +1,109 @@
+{
+  "upstream": {
+    "url": "https://github.com/ionaaaa/50M_Model",
+    "branch": "main",
+    "commit": "0f102b10ac885df759f1d7052a36669c7412c5e6",
+    "audited_at": "2026-10-30T14:00:00+08:00",
+    "downstream_entries": [
+      "largeScale_fineTune.py",
+      "largeScale_fineTune_ddp_bacc.py",
+      "largeScale_fineTune_ddp_clean.py",
+      "evaluate_best_ckpts_bacc.py"
+    ]
+  },
+  "project_before": {
+    "commit": "57e645164ecf6e5bbbebe20becdbed18d7ccf0b0",
+    "branch": "main",
+    "dirty": false
+  },
+  "files": [
+    {
+      "upstream_file": "model.py",
+      "project_file": "scripts/downstream_50m/model.py",
+      "handling": "verbatim_copy",
+      "reason": "Preserve the 50M tokenizer, positional embeddings, 12-layer encoder, pretraining heads, and extract_token_embeddings behavior.",
+      "math_changed": false,
+      "upstream_sha256": "ca86ef63eef13f8d0089af8b33a7e68fe75999cea7a8cf78234e90b07125d7cc",
+      "project_sha256": "ca86ef63eef13f8d0089af8b33a7e68fe75999cea7a8cf78234e90b07125d7cc"
+    },
+    {
+      "upstream_file": "prefetch_loader.py",
+      "project_file": "scripts/downstream_50m/prefetch_loader.py",
+      "handling": "verbatim_copy",
+      "reason": "Preserve upstream CPU/CUDA loader behavior.",
+      "math_changed": false,
+      "upstream_sha256": "6cb1244c36a9fe330a324f0ef3a2ec8155aa1075c5c0dea52dabdf141ceebab6",
+      "project_sha256": "6cb1244c36a9fe330a324f0ef3a2ec8155aa1075c5c0dea52dabdf141ceebab6"
+    },
+    {
+      "upstream_file": "utils.py",
+      "project_file": "scripts/downstream_50m/utils.py",
+      "handling": "verbatim_copy",
+      "reason": "Preserve upstream seed behavior.",
+      "math_changed": false,
+      "upstream_sha256": "d7a4395ab8dbb6e15644ffc03d060694594eaa0e833c227e03b6e17f98178890",
+      "project_sha256": "d7a4395ab8dbb6e15644ffc03d060694594eaa0e833c227e03b6e17f98178890"
+    },
+    {
+      "upstream_file": "dataset.py",
+      "project_file": "scripts/downstream_50m/dataset.py",
+      "handling": "minimal_modification",
+      "reason": "Keep upstream tensor stacking and add sample_id, recording_id, label_name, and sampling-rate metadata to batches.",
+      "math_changed": false,
+      "reverse_sync_candidate": true
+    },
+    {
+      "upstream_file": "configs.py",
+      "project_file": "scripts/downstream_50m/configs.py",
+      "handling": "minimal_modification",
+      "reason": "Remove hard-coded upstream object-store experiment paths and add Huada task/manifest/checkpoint/smoke controls while retaining model and optimizer defaults.",
+      "math_changed": false,
+      "reverse_sync_candidate": false
+    },
+    {
+      "upstream_file": "lance_dataset.py",
+      "project_file": "scripts/downstream_50m/lance_dataset.py",
+      "handling": "minimal_modification",
+      "reason": "The shared Huada Lance has sex and nullable age rather than label. A thin adapter derives labels in memory, excludes missing ages, and filters explicit subject splits without copying tokens.",
+      "math_changed": false,
+      "reverse_sync_candidate": true
+    },
+    {
+      "upstream_file": "largeScale_fineTune.py",
+      "project_file": "scripts/downstream_50m/largeScale_fineTune.py",
+      "handling": "necessary_modification",
+      "reason": "Replace leaking window-index split with explicit subject manifests; add regression loss/metrics, checkpoint mismatch audit, local/remote Lance CLI, non-overwrite output, evaluation, and smoke mode. Preserve representation layer, masked flatten, head construction, SGD/AdamW, and core epoch loop.",
+      "math_changed": true,
+      "math_change_scope": "Only the task output/loss changes for age regression. Sex-classification backbone, representation, pooling, head, and optimization behavior are preserved.",
+      "reverse_sync_candidate": true
+    },
+    {
+      "upstream_file": null,
+      "project_file": "scripts/create_downstream_manifest.py",
+      "handling": "new_adapter",
+      "reason": "Generate auditable task and subject-level split manifests from a shared Lance without token duplication.",
+      "math_changed": false
+    },
+    {
+      "upstream_file": null,
+      "project_file": "tests/test_downstream_50m.py",
+      "handling": "new_tests",
+      "reason": "Cover the Huada token, label, split, mask, task, checkpoint, 50M shape, and parity contracts.",
+      "math_changed": false
+    }
+  ],
+  "not_migrated": [
+    {
+      "upstream_file": "largeScale_fineTune_ddp_bacc.py",
+      "reason": "The non-DDP upstream entry is the smallest faithful basis for the requested single-machine smoke and preserves the same 50M backbone; full DDP-specific experiment machinery is outside this migration's minimal scope."
+    },
+    {
+      "upstream_file": "largeScale_fineTune_ddp_clean.py",
+      "reason": "Large experimental balancing/cache/diagnostic surface was not required for the two Huada tasks and would be a large unrelated port."
+    },
+    {
+      "upstream_file": "evaluate_best_ckpts_bacc.py",
+      "reason": "Evaluation was added as a thin mode of the migrated entry so it uses the same task adapter and subject manifest."
+    }
+  ]
+}
