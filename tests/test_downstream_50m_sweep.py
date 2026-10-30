@@ -506,6 +506,7 @@ def test_cloud_sweep_script_is_sequential_new_timestamp_and_has_no_legacy_flow()
         assert path in script
     for option in (
         "--feature-cache-root", "--feature-cache-policy", "--feature-cache-batch-size",
+        "--feature-cache-build-root",
         "--cache-log-every-batches", "--train-log-every-epochs", "--log-level",
     ):
         assert option in script

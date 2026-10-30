@@ -198,6 +198,27 @@ def test_cache_manifest_success_and_parity_fields(tiny_cache):
         assert validated[key] == pytest.approx(0.0)
 
 
+def test_publish_to_mount_uses_copy_and_success_marker_not_directory_rename(
+    tiny_cache, tmp_path, monkeypatch
+):
+    build_path, _, _, manifest = tiny_cache
+    final_path = tmp_path / "mounted" / manifest["cache_key"]
+    original_replace = cache.os.replace
+
+    def reject_directory_replace(source, destination):
+        if Path(source) == build_path or Path(destination) == final_path:
+            raise OSError(38, "Function not implemented")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(cache.os, "replace", reject_directory_replace)
+    published = cache.publish_feature_cache(
+        build_path, final_path, manifest["cache_identity"], manifest["cache_key"]
+    )
+    assert published["cache_key"] == manifest["cache_key"]
+    assert (final_path / cache.SUCCESS_NAME).read_text(encoding="utf-8").strip() == manifest["cache_key"]
+    assert cache.validate_feature_cache(final_path)["parity_passed"] is True
+
+
 def _identity(**overrides):
     values = {
         "input_fingerprint": "input-a", "input_row_count": 3,

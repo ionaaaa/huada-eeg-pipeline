@@ -114,7 +114,9 @@ def test_cache_miss_explicitly_logs_build_reason(tmp_path, monkeypatch, capsys):
     }
 
     def fake_build(**kwargs):
-        Path(kwargs["output_dir"]).mkdir(parents=True)
+        output = Path(kwargs["output_dir"])
+        output.mkdir(parents=True)
+        (output / cache.SUCCESS_NAME).write_text("fixture\n", encoding="utf-8")
         return built_manifest
 
     monkeypatch.setattr(cache, "build_feature_cache", fake_build)

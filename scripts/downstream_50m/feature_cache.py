@@ -7,8 +7,10 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -525,18 +527,20 @@ def build_feature_cache(
     return manifest
 
 
-def validate_cache_manifest(cache_dir, expected_identity=None, expected_key=None):
+def validate_cache_manifest(
+    cache_dir, expected_identity=None, expected_key=None, require_success=True,
+):
     cache_dir = Path(cache_dir)
     success = cache_dir / SUCCESS_NAME
     manifest_path = cache_dir / MANIFEST_NAME
-    if not success.is_file() or not manifest_path.is_file():
+    if not manifest_path.is_file() or (require_success and not success.is_file()):
         raise ValueError("Feature cache is incomplete: _SUCCESS or manifest is missing")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("status") != "completed":
         raise ValueError("Feature cache manifest is not completed")
     if expected_key is not None and manifest.get("cache_key") != expected_key:
         raise ValueError("Feature cache key mismatch")
-    if success.read_text(encoding="utf-8").strip() != manifest.get("cache_key"):
+    if require_success and success.read_text(encoding="utf-8").strip() != manifest.get("cache_key"):
         raise ValueError("Feature cache _SUCCESS key mismatch")
     if expected_identity is not None:
         if manifest.get("cache_identity") != expected_identity:
@@ -548,11 +552,16 @@ def validate_cache_manifest(cache_dir, expected_identity=None, expected_key=None
     return manifest
 
 
-def validate_feature_cache(cache_dir, expected_identity=None, expected_key=None, logger=None):
+def validate_feature_cache(
+    cache_dir, expected_identity=None, expected_key=None, logger=None,
+    require_success=True,
+):
     cache_dir = Path(cache_dir)
     log_event(logger, "INFO", "cache.validate", "validating existing cache",
               cache_path=str(cache_dir))
-    manifest = validate_cache_manifest(cache_dir, expected_identity, expected_key)
+    manifest = validate_cache_manifest(
+        cache_dir, expected_identity, expected_key, require_success=require_success
+    )
     row_count = int(manifest["input_row_count"])
     expected_ids = manifest.get("sample_ids")
     if not isinstance(expected_ids, list):
@@ -570,6 +579,50 @@ def validate_feature_cache(cache_dir, expected_identity=None, expected_key=None,
         sample_ids_unique=True, finite_values=True,
         mean_feature_dim=manifest["mean_feature_dim"],
         flatten_feature_dim=manifest["flatten_feature_dim"],
+    )
+    return manifest
+
+
+def publish_feature_cache(build_dir, final_dir, identity, cache_key, logger=None):
+    """Publish a validated local build to a mount without using directory rename.
+
+    Some TI-ONE CFS/COS mounts do not implement the rename operation Lance uses
+    for commits.  All Lance writes therefore happen in local scratch.  Publication
+    is a copy followed by a final _SUCCESS marker; readers never accept a cache
+    before that marker exists and matches the manifest key.
+    """
+    build_dir = Path(build_dir)
+    final_dir = Path(final_dir)
+    if final_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite feature cache: {final_dir}")
+    if not (build_dir / SUCCESS_NAME).is_file():
+        raise ValueError("Local feature cache build has no _SUCCESS marker")
+    log_event(
+        logger, "INFO", "cache.publish", "copying validated local cache to mounted cache root",
+        build_path=str(build_dir), cache_path=str(final_dir),
+        publish_mode="copy_then_success_marker",
+    )
+    shutil.copytree(
+        build_dir, final_dir,
+        ignore=shutil.ignore_patterns(SUCCESS_NAME, "BUILD_FAILED.json"),
+    )
+    try:
+        validate_feature_cache(
+            final_dir, identity, cache_key, logger=logger, require_success=False
+        )
+        (final_dir / SUCCESS_NAME).write_text(cache_key + "\n", encoding="utf-8")
+        manifest = validate_feature_cache(
+            final_dir, identity, cache_key, logger=logger, require_success=True
+        )
+    except Exception:
+        success_path = final_dir / SUCCESS_NAME
+        if success_path.exists():
+            success_path.unlink()
+        raise
+    log_event(
+        logger, "INFO", "cache.publish", "mounted cache publication committed",
+        cache_path=str(final_dir), success_path=str(final_dir / SUCCESS_NAME),
+        publish_mode="copy_then_success_marker",
     )
     return manifest
 
@@ -672,6 +725,11 @@ def ensure_feature_cache(options):
             "feature_cache_path": str(final_dir),
             "feature_cache_policy": policy,
             "feature_cache_reused": True,
+            "feature_cache_build_root": (
+                str(Path(options.feature_cache_build_root).resolve())
+                if getattr(options, "feature_cache_build_root", None) else None
+            ),
+            "cache_publish_mode": manifest.get("cache_publish_mode", "existing_cache"),
             "cache_build_seconds": 0.0,
             "manifest": manifest,
         }
@@ -682,7 +740,23 @@ def ensure_feature_cache(options):
     )
     if final_dir.exists():
         raise FileExistsError(f"Refusing to overwrite feature cache: {final_dir}")
-    temporary_dir = root / f".{final_dir.name}.building.{uuid.uuid4().hex}"
+    build_root_value = getattr(options, "feature_cache_build_root", None)
+    build_root = Path(
+        build_root_value
+        if build_root_value is not None
+        else Path(tempfile.gettempdir()) / "huada_downstream_feature_cache_build"
+    ).resolve()
+    build_root.mkdir(parents=True, exist_ok=True)
+    if build_root == root or root in build_root.parents:
+        raise ValueError(
+            "feature-cache-build-root must be local scratch outside feature-cache-root"
+        )
+    temporary_dir = build_root / f".{final_dir.name}.building.{uuid.uuid4().hex}"
+    log_event(
+        logger, "INFO", "cache.build", "using local scratch for Lance transactions",
+        build_path=str(temporary_dir), publish_path=str(final_dir),
+        reason="mounted filesystems may not implement Lance commit rename",
+    )
     source = TokenFeatureSourceDataset(options.input_lance, storage_options)
     manifest_base = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -705,6 +779,8 @@ def ensure_feature_cache(options):
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
         "lance_version": lance.__version__,
+        "cache_build_root": str(build_root),
+        "cache_publish_mode": "copy_then_success_marker",
     }
     try:
         device = torch.device(options.device)
@@ -738,18 +814,33 @@ def ensure_feature_cache(options):
             log_every_batches=getattr(options, "cache_log_every_batches", 5),
         )
         del backbone
-        manifest = validate_feature_cache(temporary_dir, identity, cache_key, logger=logger)
-        log_event(logger, "INFO", "cache.publish", "atomically publishing completed cache",
-                  temporary_path=str(temporary_dir), cache_path=str(final_dir))
-        os.replace(temporary_dir, final_dir)
+        validate_feature_cache(temporary_dir, identity, cache_key, logger=logger)
+        manifest = publish_feature_cache(
+            temporary_dir, final_dir, identity, cache_key, logger=logger
+        )
+        try:
+            shutil.rmtree(temporary_dir)
+        except OSError as cleanup_error:
+            log_event(
+                logger, "WARNING", "cache.cleanup",
+                "published cache is valid but local scratch cleanup failed",
+                build_path=str(temporary_dir), error=repr(cleanup_error),
+            )
     except Exception as exc:
         temporary_dir.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(temporary_dir / "BUILD_FAILED.json", {
+        failure_payload = {
             "status": "failed", "error": repr(exc),
             "failed_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        atomic_write_json(temporary_dir / "BUILD_FAILED.json", failure_payload)
+        if final_dir.exists() and not (final_dir / SUCCESS_NAME).exists():
+            (final_dir / "BUILD_FAILED.json").write_text(
+                json.dumps(failure_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         log_exception(logger, "cache.failed", "feature cache build failed",
-                      cache_path=str(temporary_dir), error=repr(exc))
+                      cache_path=str(temporary_dir), publish_path=str(final_dir),
+                      error=repr(exc))
         raise
     elapsed = time.monotonic() - started
     log_event(
@@ -768,6 +859,8 @@ def ensure_feature_cache(options):
         "feature_cache_path": str(final_dir),
         "feature_cache_policy": policy,
         "feature_cache_reused": False,
+        "feature_cache_build_root": str(build_root),
+        "cache_publish_mode": "copy_then_success_marker",
         "cache_build_seconds": elapsed,
         "manifest": manifest,
     }

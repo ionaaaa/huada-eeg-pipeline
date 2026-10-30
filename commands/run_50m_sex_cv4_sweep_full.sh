@@ -9,6 +9,7 @@ PRETRAINED_50M_CKPT="${PRETRAINED_50M_CKPT:-/opt/ml/input/data/checkpoint/pretra
 SWEEP_CONFIG="${SWEEP_CONFIG:-/opt/ml/input/configs/50m_sex_cv4_sweep.json}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${TIONE_OUTPUT_ROOT:-/opt/ml/input/downstream_outputs}}"
 FEATURE_CACHE_ROOT="${FEATURE_CACHE_ROOT:-/opt/ml/input/data/downstream_feature_cache}"
+FEATURE_CACHE_BUILD_ROOT="${FEATURE_CACHE_BUILD_ROOT:-/tmp/huada_downstream_feature_cache_build}"
 FEATURE_CACHE_POLICY="${FEATURE_CACHE_POLICY:-auto}"
 FEATURE_CACHE_BATCH_SIZE="${FEATURE_CACHE_BATCH_SIZE:-8}"
 CACHE_LOG_EVERY_BATCHES="${CACHE_LOG_EVERY_BATCHES:-5}"
@@ -25,6 +26,7 @@ test -f "$PRETRAINED_50M_CKPT"
 test -f "$SWEEP_CONFIG"
 test -d "$OUTPUT_ROOT"
 mkdir -p "$FEATURE_CACHE_ROOT"
+mkdir -p "$FEATURE_CACHE_BUILD_ROOT"
 
 cd "$HUADA_ROOT"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -39,6 +41,7 @@ test ! -e "$SWEEP_OUTPUT"
   --sweep-config "$SWEEP_CONFIG" \
   --output-dir "$SWEEP_OUTPUT" \
   --feature-cache-root "$FEATURE_CACHE_ROOT" \
+  --feature-cache-build-root "$FEATURE_CACHE_BUILD_ROOT" \
   --feature-cache-policy "$FEATURE_CACHE_POLICY" \
   --feature-cache-batch-size "$FEATURE_CACHE_BATCH_SIZE" \
   --cache-log-every-batches "$CACHE_LOG_EVERY_BATCHES" \

@@ -39,6 +39,7 @@ PROTECTED_ARGS = {
     "--downstream-checkpoint", "--evaluate", "--sweep-candidate-id",
     "--sweep-config-sha256", "--sweep-args-json",
     "--feature-cache-path", "--feature-cache-key", "--feature-cache-reused",
+    "--feature-cache-root", "--feature-cache-build-root", "--feature-cache-policy",
 }
 ALLOWED_SELECTION_METRICS = {
     "best_validation_balanced_accuracy", "best_validation_loss",
@@ -279,6 +280,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--feature-cache-root", type=Path, default=Path("downstream_feature_cache"))
+    parser.add_argument("--feature-cache-build-root", type=Path)
     parser.add_argument(
         "--feature-cache-policy", choices=["auto", "require", "rebuild"], default="auto"
     )
@@ -667,6 +669,7 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
         input_lance=str(options.input_lance), checkpoint=str(options.checkpoint),
         sweep_config=str(options.sweep_config), output_dir=str(output_dir),
         feature_cache_root=str(options.feature_cache_root),
+        feature_cache_build_root=str(options.feature_cache_build_root),
         feature_cache_policy=options.feature_cache_policy, device=options.device,
         epochs=options.epochs, batch_size=options.batch_size, seed=options.seed,
         split_seed=options.split_seed, cache_batch_size=options.feature_cache_batch_size,
@@ -696,6 +699,10 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
         cache_plan = {
             "feature_cache_root": str(Path(options.feature_cache_root).resolve()),
             "feature_cache_policy": options.feature_cache_policy,
+            "feature_cache_build_root": (
+                str(options.feature_cache_build_root)
+                if options.feature_cache_build_root else "<system-local-temp>"
+            ),
             "action": "validate/reuse or build once before all folds and candidates",
             "cache_key": "<resolved from Lance, checkpoint, backbone, probe and code fingerprints>",
             "build_performed": False,
@@ -1014,6 +1021,8 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
         "feature_cache_path": feature_cache_info["feature_cache_path"],
         "feature_cache_policy": feature_cache_info["feature_cache_policy"],
         "feature_cache_reused": feature_cache_info["feature_cache_reused"],
+        "feature_cache_build_root": feature_cache_info.get("feature_cache_build_root"),
+        "cache_publish_mode": feature_cache_info.get("cache_publish_mode"),
         "cache_build_seconds": feature_cache_info["cache_build_seconds"],
         "cache_mean_size_bytes": directory_size(
             Path(feature_cache_info["feature_cache_path"]) / MEAN_CACHE_NAME
