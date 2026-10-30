@@ -1,4 +1,6 @@
 $ErrorActionPreference = "Stop"
+# LEGACY ONLY: historical single subject split. Recommended protocol is
+# run_50m_sex_cv4_full.sh (sex_stratified_subject_cv4).
 $InputLance = "<REPLACE_WITH_TENCENT_CLOUD_MODEL_TOKEN_LANCE_URI>"
 $StorageOptions = "<REPLACE_WITH_TENCENT_CLOUD_STORAGE_OPTIONS_JSON>"
 $Checkpoint = "<REPLACE_WITH_50M_PRETRAINED_CHECKPOINT>"
@@ -9,6 +11,7 @@ $OutputDir = Join-Path "D:\repo\华大\downstream_runs" "50m_sex_full_$Stamp"
   --input-lance $InputLance `
   --storage-options $StorageOptions `
   --task sex_classification `
+  --protocol legacy_single_split `
   --subject-split-manifest "D:\repo\华大\manifests\sex_subject_splits.csv" `
   --output-dir $OutputDir `
   --checkpoint $Checkpoint `

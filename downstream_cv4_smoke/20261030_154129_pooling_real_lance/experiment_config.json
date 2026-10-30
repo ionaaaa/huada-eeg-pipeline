@@ -1,0 +1,132 @@
+{
+  "actual_command": "D:\\miniconda\\python.exe D:\\repo\\华大\\scripts\\downstream_50m\\largeScale_fineTune.py --input-lance D:\\repo\\华大\\model_tokens_smoke\\20261030_134527\\huada_model_tokens.lance --task sex_classification --protocol legacy_single_split --output-dir D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance --device cpu --mode linear_probe --epochs 1 --batch-size 2 --seed 42 --split-seed 42 --smoke --smoke-max-samples 2 --allow-random-init-smoke",
+  "cli_args": {
+    "allow_random_init_smoke": true,
+    "batch_size": 2,
+    "checkpoint": null,
+    "device": "cpu",
+    "downstream_checkpoint": null,
+    "epochs": 1,
+    "evaluate": false,
+    "folds": 4,
+    "input_lance": "D:\\repo\\华大\\model_tokens_smoke\\20261030_134527\\huada_model_tokens.lance",
+    "mode": "linear_probe",
+    "num_workers": 0,
+    "output_dir": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance",
+    "overwrite": false,
+    "protocol": "legacy_single_split",
+    "seed": 42,
+    "smoke": true,
+    "smoke_max_samples": 2,
+    "smoke_max_samples_per_subject": 1,
+    "split_seed": 42,
+    "storage_options": null,
+    "subject_split_manifest": null,
+    "task": "sex_classification"
+  },
+  "config": {
+    "data": {
+      "band_defs": [
+        [
+          "delta",
+          1.0,
+          4.0
+        ],
+        [
+          "theta",
+          4.0,
+          8.0
+        ],
+        [
+          "alpha",
+          8.0,
+          13.0
+        ],
+        [
+          "beta",
+          13.0,
+          30.0
+        ],
+        [
+          "gamma_low",
+          30.0,
+          45.0
+        ]
+      ],
+      "clip_seconds": 10.0,
+      "clip_stride_seconds": 10.0,
+      "convert_v_to_uv": true,
+      "eps": 1e-06,
+      "lance_path": "D:\\repo\\华大\\model_tokens_smoke\\20261030_134527\\huada_model_tokens.lance",
+      "n_channels": 64,
+      "patch_seconds": 1.0,
+      "patch_stride_seconds": 1.0,
+      "stft_hop_seconds": 0.1,
+      "stft_window_seconds": 1.0,
+      "storage_options_path": null,
+      "target_frame_seconds": 0.2,
+      "target_sfreq": 100.0,
+      "use_multi_lance_parts": false
+    },
+    "finetune": {
+      "allow_random_init_smoke": true,
+      "backbone_lr": 0.001,
+      "batch_size": 2,
+      "checkpoint_dir": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance\\checkpoints",
+      "device": "cpu",
+      "downstream_checkpoint": "",
+      "evaluate_only": false,
+      "experiment_name": "huada_50m_downstream",
+      "folds": 4,
+      "head_dropout": 0.2,
+      "head_lr": 0.001,
+      "lr": 0.001,
+      "metric_for_best": "val_acc",
+      "metrics_dir": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance\\metrics",
+      "mlp_hidden_dim": 2048,
+      "mode": "linear_probe",
+      "num_classes": 2,
+      "num_epochs": 1,
+      "num_workers": 0,
+      "output_root": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance",
+      "prefetch": 2,
+      "pretrained_ckpt_path": "",
+      "probe_layer_ratio": 0.75,
+      "protocol": "legacy_single_split",
+      "run_dir": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance",
+      "save_path": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance\\checkpoints\\downstream_finetune.pt",
+      "scaling_result_csv": "D:\\repo\\华大\\downstream_cv4_smoke\\20261030_154129_pooling_real_lance\\metrics\\summary.csv",
+      "seed": 42,
+      "smoke": true,
+      "smoke_max_samples": 2,
+      "smoke_max_samples_per_subject": 1,
+      "split_seed": 42,
+      "subject_split_manifest": "",
+      "task": "sex_classification",
+      "use_mlp_head": false,
+      "use_prefetch_loader": true,
+      "weight_decay": 0.001
+    },
+    "mask": {
+      "mask_ratio": 0.5,
+      "max_block_tokens": 32,
+      "min_block_tokens": 4
+    },
+    "model": {
+      "d_model": 512,
+      "depth": 12,
+      "dropout": 0.1,
+      "mlp_ratio": 4.0,
+      "n_heads": 8
+    },
+    "train": {
+      "batch_size": 64,
+      "device": "cuda",
+      "lr": 0.0001,
+      "num_epochs": 1,
+      "num_workers": 0,
+      "seed": 42,
+      "weight_decay": 1e-05
+    }
+  }
+}

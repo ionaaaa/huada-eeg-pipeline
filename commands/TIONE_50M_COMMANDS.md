@@ -37,7 +37,38 @@ fi
 
 `INPUT_LANCE` 是已生成的正式 model-token Lance，不是 common-window Lance。若使用挂载目录，训练进程不会读取云密钥；若使用远程 URI，`STORAGE_OPTIONS` 应指向 Ti-ONE 注入或挂载的 JSON，禁止提交到 Git。
 
-## 2. 生成性别 manifest/split
+## 推荐：性别 4 折被试级交叉验证
+
+新的正式性别协议为 `sex_stratified_subject_cv4`。完成上面的公共环境变量设置后直接运行：
+
+```bash
+STAMP="$(date +%Y%m%d_%H%M%S)"
+SEX_CV4_OUTPUT="$TIONE_OUTPUT_ROOT/50m_sex_cv4_$STAMP"
+test ! -e "$SEX_CV4_OUTPUT"
+
+"$PYTHON_BIN" scripts/downstream_50m/largeScale_fineTune.py \
+  --input-lance "$INPUT_LANCE" \
+  "${LANCE_AUTH[@]}" \
+  --task sex_classification \
+  --protocol sex_stratified_subject_cv4 \
+  --folds 4 \
+  --output-dir "$SEX_CV4_OUTPUT" \
+  --checkpoint "$PRETRAINED_50M_CKPT" \
+  --device cuda \
+  --mode linear_probe \
+  --epochs 5 \
+  --batch-size 64 \
+  --seed 42 \
+  --split-seed 42
+
+echo "CV4 output: $SEX_CV4_OUTPUT"
+```
+
+命令会在正式 Lance 中核验恰好 4 female + 4 male，并生成每折 manifest、独立 checkpoint、test-only OOF 窗口预测和被试聚合指标。它不包含 smoke、样本限制、随机初始化或覆盖参数。
+
+下述单次 split 性别命令仅为历史复现，协议标记为 `legacy_single_split`，不再作为推荐正式协议。
+
+## 2. 生成性别 manifest/split（legacy_single_split）
 
 ```bash
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -80,7 +111,7 @@ cat "$AGE_SPLIT_MANIFEST"
 
 年龄 manifest 中 SUB5 应显示 `age_missing` 且 split 为空。
 
-## 4. 正式性别训练
+## 4. 旧版单次 split 性别训练（legacy_single_split）
 
 ```bash
 : "${SEX_SPLIT_MANIFEST:?先生成并检查性别 split manifest}"
@@ -91,6 +122,7 @@ SEX_OUTPUT="$TIONE_OUTPUT_ROOT/50m_sex_full_$STAMP"
   --input-lance "$INPUT_LANCE" \
   "${LANCE_AUTH[@]}" \
   --task sex_classification \
+  --protocol legacy_single_split \
   --subject-split-manifest "$SEX_SPLIT_MANIFEST" \
   --output-dir "$SEX_OUTPUT" \
   --checkpoint "$PRETRAINED_50M_CKPT" \
@@ -128,7 +160,7 @@ AGE_OUTPUT="$TIONE_OUTPUT_ROOT/50m_age_full_$STAMP"
 export AGE_DOWNSTREAM_CKPT="$AGE_OUTPUT/checkpoints/downstream_finetune.pt"
 ```
 
-## 6. 性别 evaluation
+## 6. 旧版单次 split 性别 evaluation（legacy_single_split）
 
 ```bash
 : "${SEX_DOWNSTREAM_CKPT:?填写性别 downstream checkpoint}"
@@ -138,6 +170,7 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
   --input-lance "$INPUT_LANCE" \
   "${LANCE_AUTH[@]}" \
   --task sex_classification \
+  --protocol legacy_single_split \
   --subject-split-manifest "$SEX_SPLIT_MANIFEST" \
   --output-dir "$TIONE_OUTPUT_ROOT/eval_50m_sex_$STAMP" \
   --downstream-checkpoint "$SEX_DOWNSTREAM_CKPT" \
@@ -166,13 +199,9 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 
 ## 8. Ti-ONE 任务启动命令示例
 
-若把上述变量写入 Ti-ONE 的环境变量配置，并把代码挂载到 `$HUADA_ROOT`，启动命令可以写成：
+若把上述变量写入 Ti-ONE 的环境变量配置，并把代码挂载到 `$HUADA_ROOT`，任务启动命令应依次执行“公共环境变量”代码块中的检查和 `LANCE_AUTH` 初始化，再执行“推荐：性别 4 折被试级交叉验证”代码块；不需要仓库内额外的 `.sh` 文件。
 
-```bash
-bash -lc 'set -euo pipefail; cd "$HUADA_ROOT"; python scripts/downstream_50m/largeScale_fineTune.py --input-lance "$INPUT_LANCE" --task sex_classification --subject-split-manifest "$SEX_SPLIT_MANIFEST" --output-dir "$TIONE_OUTPUT_ROOT/50m_sex_$(date +%Y%m%d_%H%M%S)" --checkpoint "$PRETRAINED_50M_CKPT" --device cuda --mode linear_probe --epochs 5 --batch-size 64 --seed 42 --split-seed 42'
-```
-
-如果直连远程 Lance 而不是使用 COSFS/CFS 本地挂载，需要在该启动命令中额外加入：
+如果直连远程 Lance 而不是使用 COSFS/CFS 本地挂载，保留公共环境变量代码块中的：
 
 ```bash
 --storage-options "$STORAGE_OPTIONS"

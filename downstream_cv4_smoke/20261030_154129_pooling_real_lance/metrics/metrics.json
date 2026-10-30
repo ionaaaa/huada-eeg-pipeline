@@ -1,0 +1,36 @@
+{
+  "excluded": [],
+  "metrics": {
+    "epoch": 1,
+    "smoke": true,
+    "train": {
+      "accuracy": 1.0,
+      "balanced_accuracy": null,
+      "confusion_matrix": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          2
+        ]
+      ],
+      "loss": 0.37553438544273376,
+      "macro_f1": null,
+      "metrics_not_statistically_meaningful": true,
+      "num_samples": 2
+    }
+  },
+  "sample_count": 2,
+  "split_subjects": {
+    "test": [],
+    "train": [
+      "SUB1"
+    ],
+    "validation": []
+  },
+  "subjects": [
+    "SUB1"
+  ]
+}

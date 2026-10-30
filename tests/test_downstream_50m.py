@@ -27,6 +27,7 @@ from largeScale_fineTune import (
     compute_metrics,
     compute_shape_params,
     get_labels_from_batch,
+    load_downstream_checkpoint_strict,
     strip_module_prefix,
     validate_subject_split_manifest,
 )
@@ -155,14 +156,26 @@ def _tiny_batch(batch_size=2):
     }
 
 
-def test_invalid_tokens_do_not_enter_flatten_or_mean_pooling():
-    model = EEGDownstreamClassifier(TinyBackbone(), 3, 2, num_tokens=4)
+def test_masked_mean_pooling_contract():
+    model = EEGDownstreamClassifier(TinyBackbone(), 3, 2)
     embeddings = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
     mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.float32)
-    flattened = model.flatten_valid_tokens(embeddings, mask)
-    assert torch.equal(flattened[1, -3:], torch.zeros(3))
     pooled = model.pool_valid_tokens(embeddings, mask)
+    assert torch.allclose(pooled[0], embeddings[0].mean(dim=0))
     assert torch.allclose(pooled[1], embeddings[1, :3].mean(dim=0))
+    assert pooled.shape == (2, 3)
+    assert not hasattr(model, "flatten_valid_tokens")
+
+
+def test_masked_values_and_all_false_mask_are_safe():
+    model = EEGDownstreamClassifier(TinyBackbone(), 3, 2)
+    embeddings = torch.ones(2, 4, 3)
+    embeddings[0, 3] = 1e30
+    mask = torch.tensor([[1, 1, 1, 0], [0, 0, 0, 0]], dtype=torch.bool)
+    pooled = model.pool_valid_tokens(embeddings, mask)
+    assert torch.allclose(pooled[0], torch.ones(3))
+    assert torch.equal(pooled[1], torch.zeros(3))
+    assert torch.isfinite(pooled).all()
 
 
 def test_normal_and_single_bad_channel_mask_contract():
@@ -180,7 +193,7 @@ def test_normal_and_single_bad_channel_mask_contract():
     ("age_regression", 1, torch.float32),
 ])
 def test_task_heads_forward_and_backward(task, output_dim, label_dtype):
-    model = EEGDownstreamClassifier(TinyBackbone(), 3, output_dim, num_tokens=4)
+    model = EEGDownstreamClassifier(TinyBackbone(), 3, output_dim)
     batch = _tiny_batch()
     outputs = model(**batch)
     if task == "sex_classification":
@@ -196,25 +209,20 @@ def test_task_heads_forward_and_backward(task, output_dim, label_dtype):
 
 
 def test_frozen_and_finetune_parameter_states():
-    frozen = EEGDownstreamClassifier(TinyBackbone(), 3, 2, freeze_backbone=True, num_tokens=4)
-    finetune = EEGDownstreamClassifier(TinyBackbone(), 3, 2, freeze_backbone=False, num_tokens=4)
+    frozen = EEGDownstreamClassifier(TinyBackbone(), 3, 2, freeze_backbone=True)
+    finetune = EEGDownstreamClassifier(TinyBackbone(), 3, 2, freeze_backbone=False)
     assert not any(parameter.requires_grad for parameter in frozen.backbone.parameters())
     assert all(parameter.requires_grad for parameter in frozen.head.parameters())
     assert all(parameter.requires_grad for parameter in finetune.backbone.parameters())
 
 
-def test_upstream_classifier_parity_allclose():
-    class UpstreamClassifier(EEGDownstreamClassifier):
-        pass
-
+def test_masked_pool_matches_explicit_reference_allclose():
     torch.manual_seed(7)
-    migrated = EEGDownstreamClassifier(TinyBackbone(), 3, 2, num_tokens=4)
-    upstream = UpstreamClassifier(TinyBackbone(), 3, 2, num_tokens=4)
-    upstream.load_state_dict(migrated.state_dict(), strict=True)
-    batch = _tiny_batch()
-    migrated.eval()
-    upstream.eval()
-    assert torch.allclose(migrated(**batch), upstream(**batch), atol=1e-6, rtol=1e-6)
+    model = EEGDownstreamClassifier(TinyBackbone(), 3, 2)
+    embeddings = torch.randn(2, 4, 3)
+    mask = torch.tensor([[1, 1, 0, 1], [0, 1, 0, 0]], dtype=torch.int64)
+    reference = torch.stack([embeddings[0, [0, 1, 3]].mean(0), embeddings[1, 1]])
+    assert torch.allclose(model.pool_valid_tokens(embeddings, mask), reference, atol=1e-6)
 
 
 def test_50m_forward_shape():
@@ -249,7 +257,8 @@ def test_checkpoint_helpers_and_mismatch_report(monkeypatch, tmp_path):
     assert float(backbone.weight) == 2.0
     assert report["missing_keys"] == []
     assert report["unexpected_keys"] == []
-    assert len(report["sha256"]) == 64
+    assert len(report["checkpoint_sha256"]) == 64
+    assert report["matched_parameter_fraction"] == 1.0
     assert "weight" in strip_module_prefix({"module.weight": torch.tensor(1.0)})
 
 
@@ -261,3 +270,15 @@ def test_small_sample_metrics_are_marked_unreliable():
     regression = compute_metrics("age_regression", [31.0], [30.0], 1.0, smoke=True)
     assert regression["r2"] is None
     assert regression["r2_reliable"] is False
+
+
+def test_head_dimension_parameter_count_and_legacy_checkpoint_rejection(tmp_path):
+    model = EEGDownstreamClassifier(TinyBackbone(input_dim=4, d_model=512), 512, 2)
+    assert model.head.in_features == 512
+    assert sum(parameter.numel() for parameter in model.head.parameters()) == 1026
+    legacy_state = model.state_dict()
+    legacy_state["head.weight"] = torch.zeros(2, 640 * 512)
+    path = tmp_path / "legacy_flatten.pt"
+    torch.save({"model_state_dict": legacy_state}, path)
+    with pytest.raises(RuntimeError, match="Legacy flattened downstream head"):
+        load_downstream_checkpoint_strict(model, path, torch.device("cpu"))

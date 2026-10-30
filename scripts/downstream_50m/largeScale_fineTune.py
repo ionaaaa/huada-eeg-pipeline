@@ -1,14 +1,15 @@
 """Huada port of 50M_Model/largeScale_fineTune.py.
 
-The backbone, representation layer, masked-flatten pooling, heads, optimizer
+The backbone, representation layer, masked-mean pooling, heads, optimizer
 choices, and epoch loop follow upstream. Adaptations are limited to the shared
 Huada Lance contract, explicit subject manifests, regression, richer metrics,
-checkpoint auditing, smoke mode, and evaluation mode.
+checkpoint auditing, smoke mode, evaluation mode, and sex-stratified subject CV4.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -39,6 +40,13 @@ from lance_dataset import (
 )
 from model import EEGPretrainModel
 from prefetch_loader import PrefetchLoader
+from sex_cv4 import (
+    PROTOCOL as SEX_CV4_PROTOCOL,
+    build_sex_stratified_subject_cv4,
+    binary_classification_metrics,
+    write_oof_artifacts,
+    write_split_artifacts,
+)
 from utils import set_seed
 
 
@@ -131,8 +139,15 @@ def parse_args(argv=None):
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument(
+        "--protocol",
+        choices=["legacy_single_split", SEX_CV4_PROTOCOL],
+        default="legacy_single_split",
+    )
+    parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--smoke-max-samples", type=int, default=4)
+    parser.add_argument("--smoke-max-samples-per-subject", type=int, default=1)
     parser.add_argument("--allow-random-init-smoke", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -153,8 +168,11 @@ def apply_cli_overrides(cfg, args):
     cfg.finetune.num_workers = args.num_workers
     cfg.finetune.seed = args.seed
     cfg.finetune.split_seed = args.split_seed
+    cfg.finetune.protocol = args.protocol
+    cfg.finetune.folds = args.folds
     cfg.finetune.smoke = args.smoke
     cfg.finetune.smoke_max_samples = args.smoke_max_samples
+    cfg.finetune.smoke_max_samples_per_subject = args.smoke_max_samples_per_subject
     cfg.finetune.allow_random_init_smoke = args.allow_random_init_smoke
     cfg.finetune.evaluate_only = args.evaluate
     cfg.finetune.num_classes = 2 if args.task == "sex_classification" else 1
@@ -212,7 +230,6 @@ class EEGDownstreamClassifier(nn.Module):
         use_mlp_head=False,
         mlp_hidden_dim=512,
         head_dropout=0.0,
-        num_tokens=None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -220,7 +237,8 @@ class EEGDownstreamClassifier(nn.Module):
         self.freeze_backbone = freeze_backbone
         for parameter in self.backbone.parameters():
             parameter.requires_grad = not freeze_backbone
-        head_input_dim = d_model if num_tokens is None else num_tokens * d_model
+        head_input_dim = d_model
+        self.head_input_dim = int(head_input_dim)
         if use_mlp_head:
             self.head = nn.Sequential(
                 nn.Linear(head_input_dim, mlp_hidden_dim), nn.GELU(),
@@ -235,14 +253,14 @@ class EEGDownstreamClassifier(nn.Module):
             self.backbone.eval()
         return self
 
-    def flatten_valid_tokens(self, token_embeddings, token_valid_mask):
-        valid_mask = token_valid_mask.unsqueeze(-1).float()
-        return (token_embeddings * valid_mask).flatten(start_dim=1)
-
     def pool_valid_tokens(self, token_embeddings, token_valid_mask):
-        valid_mask = token_valid_mask.unsqueeze(-1).float()
-        pooled = (token_embeddings * valid_mask).sum(dim=1)
-        return pooled / valid_mask.sum(dim=1).clamp_min(1.0)
+        valid_mask = token_valid_mask.to(
+            device=token_embeddings.device,
+            dtype=token_embeddings.dtype,
+        ).unsqueeze(-1)
+        summed = (token_embeddings * valid_mask).sum(dim=1)
+        denom = valid_mask.sum(dim=1).clamp_min(1.0)
+        return summed / denom
 
     def forward(self, token_inputs, token_channel_indices, token_time_indices, token_valid_mask):
         kwargs = {
@@ -256,8 +274,8 @@ class EEGDownstreamClassifier(nn.Module):
                 token_embeddings = self.backbone.extract_token_embeddings(**kwargs)
         else:
             token_embeddings = self.backbone.extract_token_embeddings(**kwargs)
-        flattened = self.flatten_valid_tokens(token_embeddings, token_valid_mask)
-        return self.head(flattened)
+        pooled = self.pool_valid_tokens(token_embeddings, token_valid_mask)
+        return self.head(pooled)
 
 
 def compute_shape_params(cfg):
@@ -380,7 +398,47 @@ def strip_module_prefix(state_dict):
     return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
 
 
-def build_backbone(cfg, shape_params, device, load_pretrained=True):
+def _checkpoint_state_dict(checkpoint):
+    if "model_state_dict" in checkpoint:
+        return checkpoint["model_state_dict"]
+    if "state_dict" in checkpoint:
+        return checkpoint["state_dict"]
+    return checkpoint
+
+
+def _audit_backbone_state_dict(backbone, state_dict):
+    target = backbone.state_dict()
+    state_dict = strip_module_prefix(state_dict)
+    matched = {}
+    unexpected = []
+    shape_mismatch = []
+    for key, value in state_dict.items():
+        if key not in target:
+            unexpected.append(key)
+        elif tuple(value.shape) != tuple(target[key].shape):
+            shape_mismatch.append({
+                "key": key,
+                "checkpoint_shape": list(value.shape),
+                "model_shape": list(target[key].shape),
+            })
+        else:
+            matched[key] = value
+    missing = sorted(set(target).difference(matched))
+    matched_parameter_count = sum(int(target[key].numel()) for key in matched)
+    total_parameter_count = sum(int(value.numel()) for value in target.values())
+    fraction = matched_parameter_count / max(total_parameter_count, 1)
+    return matched, {
+        "matched_key_count": len(matched),
+        "missing_keys": missing,
+        "unexpected_keys": sorted(unexpected),
+        "shape_mismatch_keys": shape_mismatch,
+        "matched_parameter_count": matched_parameter_count,
+        "total_parameter_count": total_parameter_count,
+        "matched_parameter_fraction": float(fraction),
+    }
+
+
+def build_backbone(cfg, shape_params, device, load_pretrained=True, minimum_match_fraction=0.99):
     backbone = EEGPretrainModel(
         input_dim=shape_params["patch_len"], d_model=cfg.model.d_model,
         n_heads=cfg.model.n_heads, depth=cfg.model.depth,
@@ -391,8 +449,10 @@ def build_backbone(cfg, shape_params, device, load_pretrained=True):
         frames_per_patch=shape_params["frames_per_patch"],
     ).to(device)
     report = {
-        "path": None, "sha256": None, "strict": False,
-        "missing_keys": [], "unexpected_keys": [], "random_init": True,
+        "checkpoint_path": None, "checkpoint_sha256": None, "strict": False,
+        "matched_key_count": 0, "missing_keys": [], "unexpected_keys": [],
+        "shape_mismatch_keys": [], "matched_parameter_fraction": 0.0,
+        "random_init": True,
     }
     if not load_pretrained:
         return backbone, report
@@ -404,24 +464,23 @@ def build_backbone(cfg, shape_params, device, load_pretrained=True):
     if not Path(ckpt_path).is_file():
         raise FileNotFoundError(ckpt_path)
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    elif "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-    state_dict = strip_module_prefix(state_dict)
-    missing_keys, unexpected_keys = backbone.load_state_dict(state_dict, strict=False)
+    matched, audit = _audit_backbone_state_dict(backbone, _checkpoint_state_dict(checkpoint))
     report = {
-        "path": str(Path(ckpt_path).resolve()),
-        "sha256": sha256_file(ckpt_path),
+        "checkpoint_path": str(Path(ckpt_path).resolve()),
+        "checkpoint_sha256": sha256_file(ckpt_path),
         "strict": False,
-        "missing_keys": list(missing_keys),
-        "unexpected_keys": list(unexpected_keys),
+        **audit,
         "random_init": False,
     }
-    if len(missing_keys) + len(unexpected_keys) > 8:
-        raise RuntimeError(f"Checkpoint mismatch is too large: {report}")
+    if report["matched_parameter_fraction"] < float(minimum_match_fraction):
+        raise RuntimeError(
+            "Pretrained backbone checkpoint matched only "
+            f"{report['matched_parameter_fraction']:.6%}; required >= {minimum_match_fraction:.2%}. "
+            f"Audit: {report}"
+        )
+    incompatible = backbone.load_state_dict(matched, strict=False)
+    if sorted(incompatible.missing_keys) != sorted(report["missing_keys"]):
+        raise RuntimeError("Internal checkpoint audit/load mismatch")
     return backbone, report
 
 
@@ -437,9 +496,28 @@ def build_downstream_model(cfg, backbone, device, shape_params):
         use_mlp_head=cfg.finetune.use_mlp_head,
         mlp_hidden_dim=cfg.finetune.mlp_hidden_dim,
         head_dropout=cfg.finetune.head_dropout,
-        num_tokens=shape_params["num_tokens"],
     ).to(device)
     return model, probe_layer_idx
+
+
+def load_downstream_checkpoint_strict(model, path, device):
+    """Load a pooled-head checkpoint and reject legacy flattened heads explicitly."""
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if "model_state_dict" not in payload:
+        raise RuntimeError("Downstream checkpoint has no model_state_dict")
+    state_dict = strip_module_prefix(payload["model_state_dict"])
+    target = model.state_dict()
+    mismatches = []
+    for key in sorted(set(state_dict).intersection(target)):
+        if tuple(state_dict[key].shape) != tuple(target[key].shape):
+            mismatches.append((key, tuple(state_dict[key].shape), tuple(target[key].shape)))
+    if mismatches:
+        legacy = [entry for entry in mismatches if entry[0].endswith("head.weight")]
+        detail = ", ".join(f"{key}: {old} != {new}" for key, old, new in mismatches)
+        prefix = "Legacy flattened downstream head is incompatible with masked-mean pooling. " if legacy else ""
+        raise RuntimeError(prefix + "Checkpoint shape mismatch: " + detail)
+    model.load_state_dict(state_dict, strict=True)
+    return payload
 
 
 def make_optimizer(cfg, model):
@@ -558,6 +636,49 @@ def validate_one_epoch(model, loader, criterion, device, task="sex_classificatio
     return run_epoch(model, loader, criterion, device, task, optimizer=None, smoke=smoke)
 
 
+@torch.no_grad()
+def evaluate_sex_test_once(model, loader, criterion, device, fold, checkpoint_path):
+    """Evaluate a selected fold checkpoint once and retain only test-window OOF rows."""
+    model.eval()
+    total_loss = 0.0
+    total_count = 0
+    rows = []
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        labels = get_labels_from_batch(batch, "sex_classification")
+        logits = _forward_outputs(model, batch, "sex_classification")
+        probabilities = torch.softmax(logits, dim=-1)
+        loss = criterion(logits, labels)
+        predictions = probabilities.argmax(dim=-1)
+        count = int(labels.numel())
+        total_loss += float(loss.item()) * count
+        total_count += count
+        for index in range(count):
+            label = int(labels[index].item())
+            prediction = int(predictions[index].item())
+            rows.append({
+                "fold": int(fold),
+                "sample_id": str(batch["sample_id"][index]),
+                "subject_id": str(batch["subject_id"][index]),
+                "sex": "female" if label == 0 else "male",
+                "true_label": label,
+                "prob_female": float(probabilities[index, 0].item()),
+                "prob_male": float(probabilities[index, 1].item()),
+                "predicted_label": prediction,
+                "predicted_sex": "female" if prediction == 0 else "male",
+                "num_valid_tokens": int(batch["token_valid_mask"][index].sum().item()),
+                "checkpoint_path": str(Path(checkpoint_path).resolve()),
+            })
+    if not rows:
+        raise RuntimeError(f"Fold {fold} test loader produced no rows")
+    metrics = binary_classification_metrics(
+        [row["true_label"] for row in rows],
+        [row["predicted_label"] for row in rows],
+    )
+    metrics.update({"loss": total_loss / max(total_count, 1), "num_samples": total_count})
+    return metrics, rows
+
+
 def save_downstream_checkpoint(path, model, cfg, shape_params, probe_layer_idx, epoch, metrics, checkpoint_report):
     payload = {
         "model_state_dict": model.state_dict(),
@@ -589,7 +710,16 @@ def _best_value(task, metrics):
     return -float(metrics["loss"])
 
 
-def run_one_checkpoint(cfg, shape_params, train_loader, val_loader, test_loader, device, checkpoint_report=None):
+def run_one_checkpoint(
+    cfg,
+    shape_params,
+    train_loader,
+    val_loader,
+    test_loader,
+    device,
+    checkpoint_report=None,
+    test_prediction_context=None,
+):
     backbone, loaded_report = build_backbone(cfg, shape_params, device, load_pretrained=not cfg.finetune.evaluate_only)
     checkpoint_report = checkpoint_report or loaded_report
     model, probe_layer_idx = build_downstream_model(cfg, backbone, device, shape_params)
@@ -599,10 +729,9 @@ def run_one_checkpoint(cfg, shape_params, train_loader, val_loader, test_loader,
         path = cfg.finetune.downstream_checkpoint
         if not path or not Path(path).is_file():
             raise FileNotFoundError(path or "--downstream-checkpoint is required for --evaluate")
-        payload = torch.load(path, map_location=device, weights_only=False)
-        model.load_state_dict(payload["model_state_dict"], strict=True)
+        load_downstream_checkpoint_strict(model, path, device)
         test_metrics = validate_one_epoch(model, test_loader, criterion, device, cfg.finetune.task)
-        return model, {"test": test_metrics}, probe_layer_idx, checkpoint_report
+        return model, {"test": test_metrics}, probe_layer_idx, checkpoint_report, []
 
     optimizer = make_optimizer(cfg, model)
     best_score = -float("inf")
@@ -622,13 +751,24 @@ def run_one_checkpoint(cfg, shape_params, train_loader, val_loader, test_loader,
             )
     if best_payload is None:
         raise RuntimeError("No best checkpoint was produced")
-    model.load_state_dict(best_payload["model_state_dict"], strict=True)
-    test_metrics = validate_one_epoch(model, test_loader, criterion, device, cfg.finetune.task)
+    load_downstream_checkpoint_strict(model, cfg.finetune.save_path, device)
+    if test_prediction_context is not None:
+        test_metrics, test_predictions = evaluate_sex_test_once(
+            model,
+            test_loader,
+            criterion,
+            device,
+            test_prediction_context["fold"],
+            cfg.finetune.save_path,
+        )
+    else:
+        test_metrics = validate_one_epoch(model, test_loader, criterion, device, cfg.finetune.task)
+        test_predictions = []
     best_payload["metrics"]["test"] = test_metrics
     temporary = cfg.finetune.save_path + ".tmp"
     torch.save(best_payload, temporary)
     os.replace(temporary, cfg.finetune.save_path)
-    return model, {"epochs": epoch_rows, "test": test_metrics}, probe_layer_idx, checkpoint_report
+    return model, {"epochs": epoch_rows, "test": test_metrics}, probe_layer_idx, checkpoint_report, test_predictions
 
 
 def run_smoke(cfg, shape_params, device):
@@ -657,6 +797,166 @@ def run_smoke(cfg, shape_params, device):
         "excluded": ([{"subject_id": "SUB5", "reason": "age_missing"}]
                      if cfg.finetune.task == "age_regression" else []),
     }, checkpoint_report
+
+
+def _limit_rows_per_subject(rows, maximum):
+    if maximum is None:
+        return list(rows)
+    counts = {}
+    selected = []
+    for row in rows:
+        subject = row["subject_id"]
+        if counts.get(subject, 0) >= int(maximum):
+            continue
+        counts[subject] = counts.get(subject, 0) + 1
+        selected.append(row)
+    return selected
+
+
+def run_sex_cv4(cfg, shape_params, device, run_dir):
+    """Run four isolated folds and create exact test-only OOF artifacts."""
+    if cfg.finetune.task != "sex_classification":
+        raise ValueError(f"{SEX_CV4_PROTOCOL} is only valid for sex_classification")
+    if cfg.finetune.folds != 4:
+        raise ValueError(f"{SEX_CV4_PROTOCOL} requires --folds 4")
+    if cfg.finetune.evaluate_only:
+        raise ValueError("CV training selects one validation checkpoint per fold; --evaluate is unsupported")
+    if not cfg.finetune.pretrained_ckpt_path:
+        raise ValueError("CV requires the real pretrained 50M --checkpoint; random initialization is forbidden")
+
+    dataset = load_downstream_dataset(cfg)
+    metadata_rows = dataset.get_subject_label_rows()
+    subject_labels = {}
+    for row in metadata_rows:
+        subject = row["subject_id"]
+        label = int(row["label"])
+        if subject in subject_labels and subject_labels[subject] != label:
+            raise ValueError(f"Inconsistent sex labels for subject {subject}")
+        subject_labels[subject] = label
+    split_payload = build_sex_stratified_subject_cv4(subject_labels, cfg.finetune.split_seed)
+    write_split_artifacts(run_dir, split_payload)
+
+    selected_rows = _limit_rows_per_subject(
+        metadata_rows,
+        cfg.finetune.smoke_max_samples_per_subject if cfg.finetune.smoke else None,
+    )
+    eligible_samples = {
+        row["sample_id"]: {"subject_id": row["subject_id"], "label": int(row["label"])}
+        for row in selected_rows
+    }
+    if len(eligible_samples) != len(selected_rows):
+        raise ValueError("sample_id must be unique in the eligible CV input")
+
+    oof_rows = []
+    per_fold_rows = []
+    checkpoint_reports = {}
+    subject_test_folds = {}
+    fold_results = []
+    head_input_dim = int(cfg.model.d_model)
+    head_parameter_count = head_input_dim * 2 + 2
+
+    for fold_info in split_payload["folds"]:
+        fold = int(fold_info["fold"])
+        fold_seed = int(cfg.finetune.seed) + fold
+        set_seed(fold_seed)
+        cfg_fold = copy.deepcopy(cfg)
+        cfg_fold.finetune.seed = fold_seed
+        fold_dir = Path(run_dir) / f"fold_{fold}"
+        checkpoint_dir = fold_dir / "checkpoints"
+        metrics_dir = fold_dir / "metrics"
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+        metrics_dir.mkdir(parents=True, exist_ok=False)
+        cfg_fold.finetune.run_dir = str(fold_dir.resolve())
+        cfg_fold.finetune.checkpoint_dir = str(checkpoint_dir.resolve())
+        cfg_fold.finetune.metrics_dir = str(metrics_dir.resolve())
+        cfg_fold.finetune.save_path = str((checkpoint_dir / "downstream_finetune.pt").resolve())
+
+        split_subjects = {
+            "train": set(fold_info["train_subjects"]),
+            "validation": set(fold_info["validation_subjects"]),
+            "test": set(fold_info["test_subjects"]),
+        }
+        indices_by_split = {
+            split_name: [row["index"] for row in selected_rows if row["subject_id"] in subjects]
+            for split_name, subjects in split_subjects.items()
+        }
+        if any(not values for values in indices_by_split.values()):
+            raise ValueError(f"Fold {fold} has an empty window split")
+        loaders = build_loaders(
+            BatchedSubset(dataset, indices_by_split["train"]),
+            BatchedSubset(dataset, indices_by_split["validation"]),
+            BatchedSubset(dataset, indices_by_split["test"]),
+            cfg_fold,
+            device,
+        )
+        model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
+            cfg_fold,
+            shape_params,
+            *loaders,
+            device,
+            test_prediction_context={"fold": fold},
+        )
+        del model
+        downstream_sha256 = sha256_file(cfg_fold.finetune.save_path)
+        checkpoint_reports[str(fold)] = checkpoint_report
+        checkpoint_reports[str(fold)]["fold_seed"] = fold_seed
+        checkpoint_reports[str(fold)]["selected_downstream_checkpoint_path"] = cfg_fold.finetune.save_path
+        checkpoint_reports[str(fold)]["selected_downstream_checkpoint_sha256"] = downstream_sha256
+        oof_rows.extend(predictions)
+        for subject in fold_info["test_subjects"]:
+            subject_test_folds[subject] = fold
+        test_metrics = metrics["test"]
+        per_fold_rows.append({
+            "fold": fold,
+            "fold_seed": fold_seed,
+            "num_windows": len(predictions),
+            "num_subjects": 2,
+            "loss": test_metrics["loss"],
+            "accuracy": test_metrics["accuracy"],
+            "balanced_accuracy": test_metrics["balanced_accuracy"],
+            "macro_f1": test_metrics["macro_f1"],
+            "confusion_matrix": json.dumps(test_metrics["confusion_matrix"]),
+            "checkpoint_path": cfg_fold.finetune.save_path,
+            "checkpoint_sha256": downstream_sha256,
+            "matched_key_count": checkpoint_report["matched_key_count"],
+            "matched_parameter_fraction": checkpoint_report["matched_parameter_fraction"],
+        })
+        fold_result = {
+            "fold": fold,
+            "fold_seed": fold_seed,
+            "split_subjects": {key: sorted(value) for key, value in split_subjects.items()},
+            "metrics": metrics,
+            "checkpoint_report": checkpoint_report,
+        }
+        json_dump(metrics_dir / "fold_result.json", fold_result)
+        fold_results.append(fold_result)
+
+    if set(subject_test_folds) != set(subject_labels):
+        raise RuntimeError("Not every subject received exactly one test fold")
+    summary = write_oof_artifacts(
+        run_dir,
+        split_payload,
+        oof_rows,
+        per_fold_rows,
+        eligible_samples,
+        checkpoint_reports,
+        head_input_dim,
+        head_parameter_count,
+    )
+    summary["smoke"] = bool(cfg.finetune.smoke)
+    summary["fold_seeds"] = [int(cfg.finetune.seed) + fold for fold in range(4)]
+    json_dump(Path(run_dir) / "sex_cv4_summary.json", summary)
+    return {
+        "metrics": {
+            "window": summary["window_metrics"],
+            "subject": summary["subject_metrics"],
+            "per_fold": per_fold_rows,
+        },
+        "sample_count": len(selected_rows),
+        "split_subjects": split_payload["folds"],
+        "excluded": [],
+        "fold_results": fold_results,
+    }, checkpoint_reports
 
 
 def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_before, source_after):
@@ -693,7 +993,11 @@ def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_
             "python": platform.python_version(), "torch": torch.__version__,
             "lance": lance.__version__, "pyarrow": pyarrow.__version__,
         },
-        "mask_application": "token embeddings multiplied by token_valid_mask before upstream flatten pooling",
+        "protocol": cfg.finetune.protocol,
+        "pooling": "masked_mean",
+        "head_input_dim": cfg.model.d_model,
+        "head_parameter_count": cfg.model.d_model * cfg.finetune.num_classes + cfg.finetune.num_classes,
+        "mask_application": "masked mean over token embeddings; invalid tokens are excluded from numerator and denominator",
         "scheduler": None,
     }
     json_dump(run_dir / "run_provenance.json", provenance)
@@ -706,10 +1010,16 @@ def main(argv=None):
         raise ValueError("--allow-random-init-smoke is only valid with --smoke")
     if args.smoke and args.evaluate:
         raise ValueError("Smoke mode performs a mechanical train step; do not combine with --evaluate")
-    if not args.smoke and not args.subject_split_manifest:
+    if args.protocol == SEX_CV4_PROTOCOL and args.task != "sex_classification":
+        raise ValueError(f"{SEX_CV4_PROTOCOL} is only valid for sex_classification")
+    if args.protocol == SEX_CV4_PROTOCOL and args.folds != 4:
+        raise ValueError(f"{SEX_CV4_PROTOCOL} requires --folds 4")
+    if args.protocol == SEX_CV4_PROTOCOL and args.allow_random_init_smoke:
+        raise ValueError("CV folds must all load the same real pretrained checkpoint")
+    if not args.smoke and args.protocol == "legacy_single_split" and not args.subject_split_manifest:
         raise ValueError("Full train/evaluation requires --subject-split-manifest")
-    if args.epochs <= 0 or args.batch_size <= 0 or args.smoke_max_samples <= 0:
-        raise ValueError("epochs, batch-size, and smoke-max-samples must be positive")
+    if min(args.epochs, args.batch_size, args.smoke_max_samples, args.smoke_max_samples_per_subject) <= 0:
+        raise ValueError("epochs, batch-size, and smoke sample limits must be positive")
 
     cfg = Config()
     apply_cli_overrides(cfg, args)
@@ -722,7 +1032,9 @@ def main(argv=None):
     schema = str(ds.schema)
     source_before = source_snapshot(cfg.data.lance_path)
 
-    if cfg.finetune.smoke:
+    if cfg.finetune.protocol == SEX_CV4_PROTOCOL:
+        result, checkpoint_report = run_sex_cv4(cfg, shape_params, device, run_dir)
+    elif cfg.finetune.smoke:
         result, checkpoint_report = run_smoke(cfg, shape_params, device)
     else:
         subject_lists, excluded = validate_subject_split_manifest(
@@ -730,7 +1042,7 @@ def main(argv=None):
         )
         train_set, val_set, test_set, subject_lists, excluded = build_train_val_test_split(None, cfg)
         loaders = build_loaders(train_set, val_set, test_set, cfg, device)
-        _, metrics, _, checkpoint_report = run_one_checkpoint(
+        _, metrics, _, checkpoint_report, _ = run_one_checkpoint(
             cfg, shape_params, *loaders, device
         )
         result = {

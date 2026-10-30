@@ -1,0 +1,24 @@
+{
+  "command": "D:\\miniconda\\python.exe -m pytest tests -q -p no:cacheprovider --basetemp D:\\repo\\华大\\.pytest_tmp_cv4_20261030",
+  "passed": 75,
+  "failed": 0,
+  "subtests_passed": 5,
+  "warnings": 2,
+  "covers_preprocessing": true,
+  "covers_tokenization": true,
+  "covers_age_regression": true,
+  "covers_masked_pooling": true,
+  "covers_cv4_and_oof": true,
+  "real_lance_component_smoke": {
+    "sample_count": 2,
+    "subjects": ["SUB1"],
+    "random_init_smoke_only": true,
+    "input_unchanged": true,
+    "metrics_not_statistically_meaningful": true
+  },
+  "formal_cv4_executed": false,
+  "formal_cv4_blockers_local": [
+    "formal 8-subject token Lance is on Tencent Cloud and is not present locally",
+    "real pretrained 50M checkpoint is not present locally"
+  ]
+}

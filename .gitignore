@@ -10,6 +10,7 @@ preprocessing_audit/
 audit_resting_state/
 model_tokens/
 model_tokens_smoke/
+/downstream_smoke/
 *.lance/
 *.lance
 
@@ -30,3 +31,5 @@ venv/
 *.log
 *.tmp
 ~$*
+
+*.pt

@@ -93,8 +93,11 @@ class FinetuneConfig:
     pretrained_ckpt_path: str = ""
     downstream_checkpoint: str = ""
     split_seed: int = 42
+    protocol: str = "legacy_single_split"
+    folds: int = 4
     smoke: bool = False
     smoke_max_samples: int = 4
+    smoke_max_samples_per_subject: int = 1
     allow_random_init_smoke: bool = False
     evaluate_only: bool = False
 
