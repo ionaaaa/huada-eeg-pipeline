@@ -101,6 +101,11 @@ class FinetuneConfig:
     smoke_max_samples_per_subject: int = 1
     allow_random_init_smoke: bool = False
     evaluate_only: bool = False
+    stage: str = ""
+    fold_index: int | None = None
+    sweep_candidate_id: str = ""
+    sweep_config_sha256: str = ""
+    sweep_args_json: str = ""
 
 
 @dataclass

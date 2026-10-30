@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "selection": {
+    "primary_metric": "best_validation_balanced_accuracy",
+    "primary_mode": "max",
+    "tie_breakers": [
+      {
+        "metric": "best_validation_loss",
+        "mode": "min"
+      },
+      {
+        "metric": "best_validation_macro_f1",
+        "mode": "max"
+      },
+      {
+        "metric": "candidate_id",
+        "mode": "asc"
+      }
+    ]
+  },
+  "search_spaces": [
+    {
+      "name": "mean",
+      "fixed_args": {
+        "--pooling": "mean"
+      },
+      "grid": {
+        "--head-lr": [
+          0.0003,
+          0.001
+        ],
+        "--weight-decay": [
+          0.0,
+          0.001
+        ]
+      }
+    },
+    {
+      "name": "flatten",
+      "fixed_args": {
+        "--pooling": "flatten"
+      },
+      "grid": {
+        "--head-lr": [
+          0.00003,
+          0.0001
+        ],
+        "--weight-decay": [
+          0.001,
+          0.01
+        ]
+      }
+    }
+  ]
+}

@@ -145,6 +145,11 @@ def parse_args(argv=None):
         default="legacy_single_split",
     )
     parser.add_argument("--folds", type=int, default=4)
+    parser.add_argument("--fold-index", type=int, choices=range(4))
+    parser.add_argument("--stage", choices=["search", "evaluate"])
+    parser.add_argument("--sweep-candidate-id")
+    parser.add_argument("--sweep-config-sha256")
+    parser.add_argument("--sweep-args-json")
     parser.add_argument("--pooling", choices=["mean", "flatten"], default=None)
     parser.add_argument("--head-lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
@@ -173,6 +178,11 @@ def apply_cli_overrides(cfg, args):
     cfg.finetune.split_seed = args.split_seed
     cfg.finetune.protocol = args.protocol
     cfg.finetune.folds = args.folds
+    cfg.finetune.fold_index = args.fold_index
+    cfg.finetune.stage = args.stage or ""
+    cfg.finetune.sweep_candidate_id = args.sweep_candidate_id or ""
+    cfg.finetune.sweep_config_sha256 = args.sweep_config_sha256 or ""
+    cfg.finetune.sweep_args_json = args.sweep_args_json or ""
     if args.pooling is not None:
         cfg.finetune.pooling = args.pooling
     if args.head_lr is not None:
@@ -183,7 +193,7 @@ def apply_cli_overrides(cfg, args):
     cfg.finetune.smoke_max_samples = args.smoke_max_samples
     cfg.finetune.smoke_max_samples_per_subject = args.smoke_max_samples_per_subject
     cfg.finetune.allow_random_init_smoke = args.allow_random_init_smoke
-    cfg.finetune.evaluate_only = args.evaluate
+    cfg.finetune.evaluate_only = bool(args.evaluate or args.stage == "evaluate")
     cfg.finetune.num_classes = 2 if args.task == "sex_classification" else 1
     cfg.finetune.metric_for_best = "val_acc" if args.task == "sex_classification" else "val_loss"
     validate_resolved_hyperparameters(cfg)
@@ -198,7 +208,7 @@ def validate_resolved_hyperparameters(cfg):
         raise ValueError("weight_decay must be >= 0")
 
 
-def setup_experiment_dir(cfg, overwrite=False):
+def setup_experiment_dir(cfg, overwrite=False, create_checkpoint_dir=True):
     run_dir = Path(cfg.finetune.output_root)
     if run_dir.exists():
         if not overwrite:
@@ -208,7 +218,8 @@ def setup_experiment_dir(cfg, overwrite=False):
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = run_dir / "checkpoints"
     metrics_dir = run_dir / "metrics"
-    checkpoint_dir.mkdir()
+    if create_checkpoint_dir:
+        checkpoint_dir.mkdir()
     metrics_dir.mkdir()
     cfg.finetune.run_dir = str(run_dir.resolve())
     cfg.finetune.checkpoint_dir = str(checkpoint_dir.resolve())
@@ -584,9 +595,14 @@ def model_training_metadata(cfg, model, shape_params, optimizer_report=None):
 
 
 def _checkpoint_head_input_dim(state_dict):
+    # ``model_state_dict`` contains both the downstream classifier head and the
+    # pretraining head nested under ``backbone.head``.  Suffix matching would
+    # therefore see both ``head.weight`` and e.g.
+    # ``backbone.head.head.0.weight`` in a real 50M checkpoint.  The downstream
+    # head is always the top-level module after ``module.`` has been stripped.
     candidates = [
-        value for key, value in state_dict.items()
-        if key.endswith("head.weight") or key.endswith("head.0.weight")
+        state_dict[key] for key in ("head.weight", "head.0.weight")
+        if key in state_dict
     ]
     if len(candidates) != 1 or candidates[0].ndim != 2:
         raise RuntimeError("Cannot uniquely determine downstream head input dimension")
@@ -654,6 +670,33 @@ def load_downstream_checkpoint_strict(model, path, device):
         "head_input_dim": actual_head_input_dim,
     }
     return payload
+
+
+def validate_sweep_checkpoint_metadata(payload, cfg):
+    """Reject evaluation when the selected checkpoint is not this candidate."""
+    expected = {
+        "sweep_candidate_id": cfg.finetune.sweep_candidate_id,
+        "sweep_config_sha256": cfg.finetune.sweep_config_sha256,
+        "sweep_args_json": cfg.finetune.sweep_args_json,
+    }
+    for key, value in expected.items():
+        if value and payload.get(key) != value:
+            raise RuntimeError(
+                f"Checkpoint {key} mismatch: {payload.get(key)!r} != {value!r}"
+            )
+    for key, expected_value in (
+        ("pooling", cfg.finetune.pooling),
+        ("head_lr", float(cfg.finetune.head_lr)),
+        ("weight_decay", float(cfg.finetune.weight_decay)),
+    ):
+        actual = payload.get(key)
+        if isinstance(expected_value, float):
+            matches = actual is not None and math.isclose(float(actual), expected_value)
+        else:
+            matches = actual == expected_value
+        if not matches:
+            raise RuntimeError(f"Checkpoint {key} mismatch: {actual!r} != {expected_value!r}")
+    return True
 
 
 def make_optimizer(cfg, model):
@@ -891,6 +934,9 @@ def save_downstream_checkpoint(
         "weight_decay": training_metadata["weight_decay"],
         "optimizer_name": training_metadata["optimizer_name"],
         "optimizer_param_groups": training_metadata["optimizer_param_groups"],
+        "sweep_candidate_id": cfg.finetune.sweep_candidate_id or None,
+        "sweep_config_sha256": cfg.finetune.sweep_config_sha256 or None,
+        "sweep_args_json": cfg.finetune.sweep_args_json or None,
         "upstream": {"url": UPSTREAM_URL, "branch": UPSTREAM_BRANCH, "commit": UPSTREAM_COMMIT},
     }
     temporary = str(path) + ".tmp"
@@ -915,6 +961,7 @@ def run_one_checkpoint(
     device,
     checkpoint_report=None,
     test_prediction_context=None,
+    search_only=False,
 ):
     backbone, loaded_report = build_backbone(cfg, shape_params, device, load_pretrained=not cfg.finetune.evaluate_only)
     checkpoint_report = checkpoint_report or loaded_report
@@ -925,9 +972,17 @@ def run_one_checkpoint(
         path = cfg.finetune.downstream_checkpoint
         if not path or not Path(path).is_file():
             raise FileNotFoundError(path or "--downstream-checkpoint is required for --evaluate")
-        load_downstream_checkpoint_strict(model, path, device)
-        test_metrics = validate_one_epoch(model, test_loader, criterion, device, cfg.finetune.task)
-        return model, {"test": test_metrics}, probe_layer_idx, checkpoint_report, []
+        payload = load_downstream_checkpoint_strict(model, path, device)
+        validate_sweep_checkpoint_metadata(payload, cfg)
+        if test_prediction_context is not None:
+            test_metrics, test_predictions = evaluate_sex_test_once(
+                model, test_loader, criterion, device,
+                test_prediction_context["fold"], path,
+            )
+        else:
+            test_metrics = validate_one_epoch(model, test_loader, criterion, device, cfg.finetune.task)
+            test_predictions = []
+        return model, {"test": test_metrics}, probe_layer_idx, checkpoint_report, test_predictions
 
     optimizer = make_optimizer(cfg, model)
     optimizer_report = optimizer_configuration(optimizer)
@@ -941,7 +996,11 @@ def run_one_checkpoint(
         val_metrics = validate_one_epoch(model, val_loader, criterion, device, cfg.finetune.task)
         epoch_metrics = {"epoch": epoch + 1, "train": train_metrics, "validation": val_metrics}
         epoch_rows.append(epoch_metrics)
-        score = _best_value(cfg.finetune.task, val_metrics)
+        score = (
+            float(val_metrics.get("balanced_accuracy", -float("inf")))
+            if search_only and cfg.finetune.task == "sex_classification"
+            else _best_value(cfg.finetune.task, val_metrics)
+        )
         if score > best_score:
             best_score = score
             best_payload = save_downstream_checkpoint(
@@ -950,6 +1009,13 @@ def run_one_checkpoint(
             )
     if best_payload is None:
         raise RuntimeError("No best checkpoint was produced")
+    if search_only:
+        return model, {
+            "epochs": epoch_rows,
+            "best_epoch": int(best_payload["epoch"]),
+            "best_validation": best_payload["metrics"]["validation"],
+            "training_metadata": training_metadata,
+        }, probe_layer_idx, checkpoint_report, []
     load_downstream_checkpoint_strict(model, cfg.finetune.save_path, device)
     if test_prediction_context is not None:
         test_metrics, test_predictions = evaluate_sex_test_once(
@@ -1017,6 +1083,158 @@ def _limit_rows_per_subject(rows, maximum):
         counts[subject] = counts.get(subject, 0) + 1
         selected.append(row)
     return selected
+
+
+def _atomic_json_dump(path, value):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    json_dump(temporary, value)
+    os.replace(temporary, path)
+
+
+def _write_prediction_csv(path, rows):
+    fields = [
+        "fold", "split", "sample_id", "subject_id", "sex", "true_label",
+        "prob_female", "prob_male", "predicted_label", "predicted_sex",
+        "num_valid_tokens", "checkpoint_path",
+    ]
+    with Path(path).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
+    """Run exactly one fold and one sweep stage without crossing split boundaries."""
+    if cfg.finetune.task != "sex_classification":
+        raise ValueError("CV4 sweep stages are only valid for sex_classification")
+    if cfg.finetune.fold_index is None or cfg.finetune.stage not in {"search", "evaluate"}:
+        raise ValueError("CV4 sweep requires --fold-index and --stage")
+    if not cfg.finetune.sweep_candidate_id or not cfg.finetune.sweep_config_sha256:
+        raise ValueError("CV4 sweep stages require candidate id and config hash metadata")
+
+    dataset = load_downstream_dataset(cfg)
+    metadata_rows = dataset.get_subject_label_rows()
+    subject_labels = {}
+    for row in metadata_rows:
+        subject = str(row["subject_id"])
+        label = int(row["label"])
+        if subject in subject_labels and subject_labels[subject] != label:
+            raise ValueError(f"Inconsistent sex labels for subject {subject}")
+        subject_labels[subject] = label
+    split_payload = build_sex_stratified_subject_cv4(subject_labels, cfg.finetune.split_seed)
+    fold = int(cfg.finetune.fold_index)
+    fold_info = split_payload["folds"][fold]
+    if int(fold_info["fold"]) != fold:
+        raise RuntimeError("CV4 fold ordering invariant failed")
+
+    rows = _limit_rows_per_subject(
+        metadata_rows,
+        cfg.finetune.smoke_max_samples_per_subject if cfg.finetune.smoke else None,
+    )
+    fold_seed = int(cfg.finetune.seed) + fold
+    cfg.finetune.seed = fold_seed
+    set_seed(fold_seed)
+
+    if cfg.finetune.stage == "search":
+        split_names = ("train", "validation")
+    else:
+        split_names = ("test",)
+    subjects_by_split = {
+        "train": set(fold_info["train_subjects"]),
+        "validation": set(fold_info["validation_subjects"]),
+        "test": set(fold_info["test_subjects"]),
+    }
+    datasets = {}
+    for split_name in split_names:
+        indices = [
+            row["index"] for row in rows
+            if str(row["subject_id"]) in subjects_by_split[split_name]
+        ]
+        if not indices:
+            raise ValueError(f"Fold {fold} has an empty {split_name} split")
+        datasets[split_name] = BatchedSubset(dataset, indices)
+
+    if cfg.finetune.stage == "search":
+        train_loader = _loader(datasets["train"], cfg, device, shuffle=True)
+        validation_loader = _loader(datasets["validation"], cfg, device, shuffle=False)
+        model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
+            cfg, shape_params, train_loader, validation_loader, None, device,
+            search_only=True,
+        )
+        del model
+        if predictions:
+            raise RuntimeError("Search stage unexpectedly produced test predictions")
+        validation = metrics["best_validation"]
+        checkpoint_path = Path(cfg.finetune.save_path).resolve()
+        summary = {
+            "status": "completed",
+            "stage": "search",
+            "fold": fold,
+            "fold_seed": fold_seed,
+            "candidate_id": cfg.finetune.sweep_candidate_id,
+            "candidate_config_sha256": cfg.finetune.sweep_config_sha256,
+            "normalized_cli_args": json.loads(cfg.finetune.sweep_args_json),
+            "train_subjects": sorted(subjects_by_split["train"]),
+            "validation_subjects": sorted(subjects_by_split["validation"]),
+            "best_epoch": int(metrics["best_epoch"]),
+            "best_validation_loss": float(validation["loss"]),
+            "best_validation_accuracy": float(validation["accuracy"]),
+            "best_validation_balanced_accuracy": float(validation["balanced_accuracy"]),
+            "best_validation_macro_f1": float(validation["macro_f1"]),
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": sha256_file(checkpoint_path),
+            "training_metadata": metrics["training_metadata"],
+            "test_accessed": False,
+        }
+        _atomic_json_dump(Path(run_dir) / "validation_summary.json", summary)
+        return {
+            "metrics": {"validation": validation},
+            "training_metadata": metrics["training_metadata"],
+            "sample_count": {
+                "train": len(datasets["train"]),
+                "validation": len(datasets["validation"]),
+            },
+            "split_subjects": {
+                "train": summary["train_subjects"],
+                "validation": summary["validation_subjects"],
+            },
+            "stage_summary": summary,
+        }, checkpoint_report
+
+    test_loader = _loader(datasets["test"], cfg, device, shuffle=False)
+    model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
+        cfg, shape_params, None, None, test_loader, device,
+        test_prediction_context={"fold": fold},
+    )
+    del model
+    for row in predictions:
+        row["split"] = "test"
+    if len(predictions) != len(datasets["test"]):
+        raise RuntimeError("Test prediction count does not match the fold test dataset")
+    _write_prediction_csv(Path(run_dir) / "test_predictions.csv", predictions)
+    test_summary = {
+        **metrics["test"],
+        "status": "evaluated",
+        "stage": "evaluate",
+        "fold": fold,
+        "fold_seed": fold_seed,
+        "candidate_id": cfg.finetune.sweep_candidate_id,
+        "candidate_config_sha256": cfg.finetune.sweep_config_sha256,
+        "normalized_cli_args": json.loads(cfg.finetune.sweep_args_json),
+        "test_subjects": sorted(subjects_by_split["test"]),
+        "test_prediction_count": len(predictions),
+        "checkpoint_path": str(Path(cfg.finetune.downstream_checkpoint).resolve()),
+        "checkpoint_sha256": sha256_file(cfg.finetune.downstream_checkpoint),
+        "evaluation_call_count": 1,
+    }
+    _atomic_json_dump(Path(run_dir) / "test_metrics.json", test_summary)
+    return {
+        "metrics": {"test": metrics["test"]},
+        "sample_count": {"test": len(datasets["test"])},
+        "split_subjects": {"test": test_summary["test_subjects"]},
+        "stage_summary": test_summary,
+    }, checkpoint_report
 
 
 def run_sex_cv4(cfg, shape_params, device, run_dir):
@@ -1264,6 +1482,18 @@ def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_
 
 def main(argv=None):
     args = parse_args(argv)
+    if (args.stage is None) != (args.fold_index is None):
+        raise ValueError("--stage and --fold-index must be provided together")
+    if args.stage and args.protocol != SEX_CV4_PROTOCOL:
+        raise ValueError("--stage is only valid with sex_stratified_subject_cv4")
+    if args.stage == "search" and args.downstream_checkpoint:
+        raise ValueError("Search stage must not receive --downstream-checkpoint")
+    if args.stage == "evaluate" and not args.downstream_checkpoint:
+        raise ValueError("Evaluate stage requires --downstream-checkpoint")
+    if args.stage and not all((
+        args.sweep_candidate_id, args.sweep_config_sha256, args.sweep_args_json,
+    )):
+        raise ValueError("Sweep stages require candidate id, config hash, and args JSON")
     if args.allow_random_init_smoke and not args.smoke:
         raise ValueError("--allow-random-init-smoke is only valid with --smoke")
     if args.smoke and args.evaluate:
@@ -1281,7 +1511,9 @@ def main(argv=None):
 
     cfg = Config()
     apply_cli_overrides(cfg, args)
-    run_dir = setup_experiment_dir(cfg, overwrite=args.overwrite)
+    run_dir = setup_experiment_dir(
+        cfg, overwrite=args.overwrite, create_checkpoint_dir=args.stage != "evaluate"
+    )
     set_seed(cfg.finetune.seed)
     device = torch.device(cfg.finetune.device)
     shape_params = compute_shape_params(cfg)
@@ -1290,7 +1522,11 @@ def main(argv=None):
     schema = str(ds.schema)
     source_before = source_snapshot(cfg.data.lance_path)
 
-    if cfg.finetune.protocol == SEX_CV4_PROTOCOL:
+    if cfg.finetune.protocol == SEX_CV4_PROTOCOL and cfg.finetune.stage:
+        result, checkpoint_report = run_sex_cv4_stage(
+            cfg, shape_params, device, run_dir
+        )
+    elif cfg.finetune.protocol == SEX_CV4_PROTOCOL:
         result, checkpoint_report = run_sex_cv4(cfg, shape_params, device, run_dir)
     elif cfg.finetune.smoke:
         result, checkpoint_report = run_smoke(cfg, shape_params, device)

@@ -73,6 +73,15 @@ class IdentityBackbone(nn.Module):
         return token_inputs * self.scale
 
 
+class BackboneWithPretrainingHead(IdentityBackbone):
+    """Mirrors the nested head keys present in a real 50M backbone checkpoint."""
+
+    def __init__(self, d_model=512):
+        super().__init__(d_model)
+        self.head = nn.Module()
+        self.head.head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU())
+
+
 def _model(pooling, num_tokens=640, freeze_backbone=False):
     return training.EEGDownstreamClassifier(
         IdentityBackbone(), 512, 2,
@@ -206,6 +215,29 @@ def test_checkpoint_pooling_mismatch_and_ambiguous_legacy_fail(tmp_path):
     torch.save({"model_state_dict": ambiguous_model.state_dict()}, ambiguous_path)
     with pytest.raises(RuntimeError, match="Cannot uniquely infer"):
         training.load_downstream_checkpoint_strict(ambiguous_model, ambiguous_path, torch.device("cpu"))
+
+
+def test_checkpoint_head_dimension_ignores_nested_pretraining_head(tmp_path):
+    cfg = Config()
+    cfg.finetune.pooling = "mean"
+    model = training.EEGDownstreamClassifier(
+        BackboneWithPretrainingHead(), 512, 2,
+        pooling="mean", num_tokens=640,
+    )
+    path = tmp_path / "realistic-backbone-head.pt"
+    _save_checkpoint(path, model, cfg)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert "head.weight" in payload["model_state_dict"]
+    assert "backbone.head.head.0.weight" in payload["model_state_dict"]
+    loaded = training.load_downstream_checkpoint_strict(
+        training.EEGDownstreamClassifier(
+            BackboneWithPretrainingHead(), 512, 2,
+            pooling="mean", num_tokens=640,
+        ),
+        path,
+        torch.device("cpu"),
+    )
+    assert loaded["_load_report"]["head_input_dim"] == 512
 
 
 def test_cloud_script_is_single_cv4_entry_with_explicit_hyperparameters():
