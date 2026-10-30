@@ -1,0 +1,22 @@
+[preprocessing]
+target_sfreq = 200.0
+window_seconds = 10.0
+hop_seconds = 10.0
+segment_samples = 2000
+
+bandpass_low = 0.3
+bandpass_high = 75.0
+notch_hz = 50.0
+
+unit_before_normalization = "uV"
+normalization = "clip_divide_200"
+normalization_detail = "x_uV / 200, then clip to [-1, 1]"
+
+[windowing]
+drop_incomplete_tail = true
+padding = false
+
+[source_expectations]
+format = "BDF"
+sampling_rate_hz = 500.0
+n_channels = 64

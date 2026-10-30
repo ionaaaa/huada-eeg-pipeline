@@ -1,0 +1,32 @@
+# 原始数据
+data/
+*.bdf
+*.edf
+
+# 处理产物
+preprocessed_common/
+preprocessed_common_smoke/
+preprocessing_audit/
+audit_resting_state/
+model_tokens/
+model_tokens_smoke/
+*.lance/
+*.lance
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# 环境与编辑器
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+
+# 临时文件和日志
+*.log
+*.tmp
+~$*
