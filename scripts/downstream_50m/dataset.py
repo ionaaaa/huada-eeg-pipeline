@@ -100,6 +100,19 @@ def collate_fn(batch):
     if isinstance(batch, dict):
         return batch
 
+    if "feature" in batch[0]:
+        out = {
+            "feature": torch.stack([x["feature"] for x in batch], dim=0),
+            "num_valid_tokens": torch.stack(
+                [x["num_valid_tokens"] for x in batch], dim=0
+            ),
+            "label": torch.stack([x["label"] for x in batch], dim=0),
+        }
+        for meta_key in ["sample_id", "subject_id", "recording_id", "label_name"]:
+            if meta_key in batch[0]:
+                out[meta_key] = [str(x[meta_key]) for x in batch]
+        return out
+
     out = {
         "token_inputs": torch.stack([x["token_inputs"] for x in batch], dim=0),
         "targets": torch.stack([x["targets"] for x in batch], dim=0),

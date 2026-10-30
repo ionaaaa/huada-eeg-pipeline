@@ -106,6 +106,13 @@ class FinetuneConfig:
     sweep_candidate_id: str = ""
     sweep_config_sha256: str = ""
     sweep_args_json: str = ""
+    feature_source: str = "online"
+    feature_cache_key: str = ""
+    feature_cache_path: str = ""
+    feature_cache_pooling: str = ""
+    feature_cache_reused: bool = False
+    train_log_every_epochs: int = 5
+    log_level: str = "INFO"
 
 
 @dataclass

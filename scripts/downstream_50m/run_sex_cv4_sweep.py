@@ -13,11 +13,22 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sex_cv4 import aggregate_subject_predictions, binary_classification_metrics
+from feature_cache import (
+    FLATTEN_CACHE_NAME,
+    MEAN_CACHE_NAME,
+    directory_size,
+    ensure_feature_cache,
+)
+from sex_cv4 import (
+    aggregate_subject_predictions, binary_classification_metrics,
+    build_sex_stratified_subject_cv4,
+)
+from run_logging import log_event, log_exception, setup_run_logging
 
 
 SCHEMA_VERSION = 1
@@ -27,6 +38,7 @@ PROTECTED_ARGS = {
     "--fold-index", "--stage", "--subject-split-manifest",
     "--downstream-checkpoint", "--evaluate", "--sweep-candidate-id",
     "--sweep-config-sha256", "--sweep-args-json",
+    "--feature-cache-path", "--feature-cache-key", "--feature-cache-reused",
 }
 ALLOWED_SELECTION_METRICS = {
     "best_validation_balanced_accuracy", "best_validation_loss",
@@ -266,6 +278,14 @@ def parse_args(argv=None):
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--feature-cache-root", type=Path, default=Path("downstream_feature_cache"))
+    parser.add_argument(
+        "--feature-cache-policy", choices=["auto", "require", "rebuild"], default="auto"
+    )
+    parser.add_argument("--feature-cache-batch-size", type=int, default=8)
+    parser.add_argument("--cache-log-every-batches", type=int, default=5)
+    parser.add_argument("--train-log-every-epochs", type=int, default=5)
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
@@ -273,9 +293,12 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def build_stage_command(options, candidate, fold, stage, output_dir, checkpoint=None):
+def build_stage_command(
+    options, candidate, fold, stage, output_dir, checkpoint=None,
+    feature_cache_info=None,
+):
     command = [
-        sys.executable, str(Path(options.trainer_script).resolve()),
+        sys.executable, "-u", str(Path(options.trainer_script).resolve()),
         "--input-lance", str(options.input_lance),
         "--task", "sex_classification",
         "--protocol", PROTOCOL,
@@ -294,7 +317,17 @@ def build_stage_command(options, candidate, fold, stage, output_dir, checkpoint=
         "--sweep-candidate-id", candidate["candidate_id"],
         "--sweep-config-sha256", candidate["config_sha256"],
         "--sweep-args-json", canonical_json(candidate["normalized_cli_args"]),
+        "--train-log-every-epochs", str(options.train_log_every_epochs),
+        "--log-level", options.log_level,
     ]
+    feature_cache_info = feature_cache_info or getattr(options, "feature_cache_info", None)
+    if feature_cache_info:
+        command.extend([
+            "--feature-cache-path", feature_cache_info["feature_cache_path"],
+            "--feature-cache-key", feature_cache_info["feature_cache_key"],
+        ])
+        if feature_cache_info.get("feature_cache_reused"):
+            command.append("--feature-cache-reused")
     if options.storage_options:
         command.extend(["--storage-options", str(options.storage_options)])
     if stage == "evaluate":
@@ -351,8 +384,28 @@ def _quarantine(path):
     os.replace(path, path.with_name(path.name + f".stale.{suffix}"))
 
 
-def _run_command(command, project_root, log_path, runner):
+def _run_command(command, project_root, log_path, runner, root_log_path=None):
     log_path = Path(log_path)
+    if runner is subprocess.run:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as child_log:
+            process = subprocess.Popen(
+                command, cwd=str(project_root), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                child_log.write(line)
+                child_log.flush()
+                if root_log_path is not None:
+                    with Path(root_log_path).open("a", encoding="utf-8") as root_log:
+                        root_log.write(line)
+                        root_log.flush()
+            return_code = process.wait()
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, command)
+        return
     try:
         result = runner(
             command, check=True, cwd=str(project_root), capture_output=True, text=True,
@@ -373,7 +426,7 @@ def _run_command(command, project_root, log_path, runner):
         )
 
 
-def _read_validation_summary(candidate_dir, candidate, fold):
+def _read_validation_summary(candidate_dir, candidate, fold, expected_cache_key=None):
     summary = json.loads(
         (Path(candidate_dir) / "validation_summary.json").read_text(encoding="utf-8")
     )
@@ -381,6 +434,15 @@ def _read_validation_summary(candidate_dir, candidate, fold):
         raise RuntimeError("Validation summary identity mismatch")
     if summary.get("test_accessed") is not False:
         raise RuntimeError("Candidate search did not attest test_accessed=false")
+    if expected_cache_key is not None:
+        if summary.get("feature_source") != "cache":
+            raise RuntimeError("Candidate did not use cached features")
+        if summary.get("feature_cache_key") != expected_cache_key:
+            raise RuntimeError("Candidate feature cache key mismatch")
+        if summary.get("backbone_forward_count") != 0:
+            raise RuntimeError("Candidate unexpectedly executed the backbone")
+        if summary.get("checkpoint_kind") != "cached_feature_head_only":
+            raise RuntimeError("Candidate did not save a head-only checkpoint")
     forbidden = [key for key in summary if key.startswith("test_") and key != "test_accessed"]
     if forbidden:
         raise RuntimeError(f"Validation summary contains test fields: {forbidden}")
@@ -402,6 +464,14 @@ def _fold_result_row(fold, candidate, summary):
         "best_validation_macro_f1": summary["best_validation_macro_f1"],
         "checkpoint_path": summary["checkpoint_path"],
         "checkpoint_sha256": summary["checkpoint_sha256"],
+        "feature_source": summary.get("feature_source"),
+        "feature_cache_key": summary.get("feature_cache_key"),
+        "feature_cache_path": summary.get("feature_cache_path"),
+        "feature_cache_pooling": summary.get("feature_cache_pooling"),
+        "feature_cache_reused": summary.get("feature_cache_reused"),
+        "feature_dim": summary.get("feature_dim"),
+        "backbone_forward_count": summary.get("backbone_forward_count"),
+        "checkpoint_kind": summary.get("checkpoint_kind"),
     }
     row.update({key: value for key, value in candidate.items() if key not in row})
     return row
@@ -534,7 +604,51 @@ def aggregate_oof(output_dir, selected_by_fold):
     return window_metrics, subject_metrics
 
 
-def run_sweep(options, runner=subprocess.run):
+def log_preflight_dataset(options, logger):
+    """Read only label metadata and log the exact fixed CV4 plan before cache/training."""
+    import lance
+    from lance_dataset import SEX_LABEL_MAPPING, load_storage_options
+
+    storage_options = load_storage_options(options.storage_options)
+    kwargs = {} if storage_options is None else {"storage_options": storage_options}
+    dataset = lance.dataset(str(options.input_lance), **kwargs)
+    rows = dataset.to_table(columns=["sample_id", "subject_id", "sex"]).to_pylist()
+    subject_labels = {}
+    window_sex = Counter()
+    subject_counts = Counter()
+    for row in rows:
+        subject = str(row["subject_id"])
+        sex = str(row["sex"]).strip().lower()
+        if sex not in SEX_LABEL_MAPPING:
+            raise ValueError(f"Unsupported sex label during preflight: {sex!r}")
+        label = SEX_LABEL_MAPPING[sex]
+        if subject in subject_labels and subject_labels[subject] != label:
+            raise ValueError(f"Inconsistent sex label for subject {subject}")
+        subject_labels[subject] = label
+        window_sex[sex] += 1
+        subject_counts[subject] += 1
+    folds = build_sex_stratified_subject_cv4(subject_labels, options.split_seed)["folds"]
+    log_event(
+        logger, "INFO", "preflight.dataset", "input cohort and labels validated",
+        input_windows=len(rows), subject_count=len(subject_labels),
+        window_sex_distribution=dict(window_sex),
+        subject_sex_distribution={
+            "female": sum(value == 0 for value in subject_labels.values()),
+            "male": sum(value == 1 for value in subject_labels.values()),
+        },
+    )
+    for fold_info in folds:
+        split_fields = {}
+        for split in ("train", "validation", "test"):
+            subjects = list(fold_info[f"{split}_subjects"])
+            split_fields[f"{split}_subjects"] = subjects
+            split_fields[f"{split}_samples"] = sum(subject_counts[s] for s in subjects)
+        log_event(logger, "INFO", "preflight.fold", "CV4 fold split validated",
+                  fold=int(fold_info["fold"]), **split_fields)
+
+
+def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache):
+    run_started = time.monotonic()
     config = load_sweep_config(options.sweep_config)
     candidates = expand_candidates(config)
     config_hash = sha256_json(config)
@@ -542,6 +656,23 @@ def run_sweep(options, runner=subprocess.run):
     if output_dir.exists() and any(output_dir.iterdir()) and not options.resume:
         raise FileExistsError(f"Refusing to reuse non-empty output without --resume: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_run_logging(output_dir, options.log_level, append=options.resume)
+    options.logger = logger
+    poolings = sorted({c["normalized_cli_args"].get("--pooling") for c in candidates})
+    head_lrs = sorted({c["normalized_cli_args"].get("--head-lr") for c in candidates})
+    weight_decays = sorted({c["normalized_cli_args"].get("--weight-decay") for c in candidates})
+    log_event(
+        logger, "INFO", "run.start", "starting 50M cached-feature CV4 sweep",
+        run_mode="dry-run" if options.dry_run else "cloud sweep",
+        input_lance=str(options.input_lance), checkpoint=str(options.checkpoint),
+        sweep_config=str(options.sweep_config), output_dir=str(output_dir),
+        feature_cache_root=str(options.feature_cache_root),
+        feature_cache_policy=options.feature_cache_policy, device=options.device,
+        epochs=options.epochs, batch_size=options.batch_size, seed=options.seed,
+        split_seed=options.split_seed, cache_batch_size=options.feature_cache_batch_size,
+        candidate_count=len(candidates), pooling_values=poolings,
+        head_lr_values=head_lrs, weight_decay_values=weight_decays,
+    )
     state_path = output_dir / "sweep_state.json"
     if options.resume and state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -560,11 +691,29 @@ def run_sweep(options, runner=subprocess.run):
 
     project_root = Path(__file__).resolve().parents[2]
     if options.dry_run:
+        log_event(logger, "INFO", "run.dry_run", "validated configuration; training and cache build disabled",
+                  candidate_count=len(candidates))
+        cache_plan = {
+            "feature_cache_root": str(Path(options.feature_cache_root).resolve()),
+            "feature_cache_policy": options.feature_cache_policy,
+            "action": "validate/reuse or build once before all folds and candidates",
+            "cache_key": "<resolved from Lance, checkpoint, backbone, probe and code fingerprints>",
+            "build_performed": False,
+        }
+        print("# feature cache plan: " + canonical_json(cache_plan))
+        dry_cache_info = {
+            "feature_cache_path": str(Path(options.feature_cache_root).resolve() / "<cache-key>"),
+            "feature_cache_key": "<cache-key>",
+            "feature_cache_reused": False,
+        }
         commands = []
         for fold in range(4):
             for candidate in candidates:
                 candidate_dir = output_dir / f"fold_{fold}" / "candidates" / candidate["candidate_id"]
-                command = build_stage_command(options, candidate, fold, "search", candidate_dir)
+                command = build_stage_command(
+                    options, candidate, fold, "search", candidate_dir,
+                    feature_cache_info=dry_cache_info,
+                )
                 commands.append(command)
                 print(subprocess.list2cmdline(command))
         evaluation_templates = [
@@ -584,15 +733,56 @@ def run_sweep(options, runner=subprocess.run):
             )
         atomic_write_json(output_dir / "dry_run_commands.json", commands)
         atomic_write_json(output_dir / "dry_run_plan.json", {
+            "feature_cache": cache_plan,
             "search_commands": commands,
             "evaluation_templates": evaluation_templates,
         })
         return {"dry_run": True, "candidate_count": len(candidates), "command_count": len(commands)}
 
+    if runner is subprocess.run:
+        for name, path in (
+            ("input Lance", options.input_lance), ("checkpoint", options.checkpoint),
+            ("sweep config", options.sweep_config),
+        ):
+            is_remote = "://" in str(path)
+            exists = is_remote or Path(path).exists()
+            log_event(logger, "INFO" if exists else "ERROR", "preflight.path",
+                      f"{name} path check", path=str(path), exists=exists,
+                      remote_uri=is_remote)
+            if not exists:
+                raise FileNotFoundError(path)
+    else:
+        log_event(logger, "INFO", "preflight.path", "path checks delegated to fixture runner")
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+        log_event(logger, "INFO", "preflight.cuda", "CUDA availability checked",
+                  requested_device=options.device, cuda_available=cuda_available)
+        if str(options.device).startswith("cuda") and not cuda_available:
+            raise RuntimeError("CUDA device requested but torch.cuda.is_available() is false")
+        if runner is subprocess.run:
+            log_preflight_dataset(options, logger)
+        feature_cache_info = cache_ensurer(options)
+    except Exception:
+        log_exception(logger, "run.failed", "preflight/cache stage failed",
+                      cache_path=str(options.feature_cache_root))
+        raise
+    options.feature_cache_info = feature_cache_info
+    cache_manifest = feature_cache_info["manifest"]
+    state["feature_cache"] = {
+        "key": feature_cache_info["feature_cache_key"],
+        "path": feature_cache_info["feature_cache_path"],
+        "policy": feature_cache_info["feature_cache_policy"],
+        "reused": feature_cache_info["feature_cache_reused"],
+    }
+    atomic_write_json(state_path, state)
+
     fold_rows = []
     selected_by_fold = {}
     search_complete = True
     for fold in range(4):
+        log_event(logger, "INFO", "search.fold", "starting fold candidate search; test is not used for selection",
+                  fold=fold, candidate_count=len(candidates), fold_seed=options.seed + fold)
         fold_state = state["folds"][str(fold)]
         completed_rows = []
         for candidate in candidates:
@@ -600,16 +790,30 @@ def run_sweep(options, runner=subprocess.run):
             entry = fold_state["candidates"][candidate_id]
             candidate_dir = output_dir / f"fold_{fold}" / "candidates" / candidate_id
             if options.resume and _candidate_complete(candidate_dir, candidate, entry):
-                summary = _read_validation_summary(candidate_dir, candidate, fold)
+                summary = _read_validation_summary(
+                    candidate_dir, candidate, fold, feature_cache_info["feature_cache_key"]
+                )
             else:
                 if candidate_dir.exists():
                     _quarantine(candidate_dir)
                 entry.update({"status": "running", "started_at": datetime.now(timezone.utc).isoformat()})
                 atomic_write_json(state_path, state)
                 command = build_stage_command(options, candidate, fold, "search", candidate_dir)
+                args = candidate["normalized_cli_args"]
+                log_event(
+                    logger, "INFO", "search.candidate", "starting candidate",
+                    fold=fold, candidate_id=candidate_id, pooling=args.get("--pooling"),
+                    head_lr=args.get("--head-lr"), weight_decay=args.get("--weight-decay"),
+                    feature_cache_path=feature_cache_info["feature_cache_path"],
+                    feature_source="cache", backbone_constructed=False,
+                    backbone_forward_count=0,
+                )
                 try:
-                    _run_command(command, project_root, candidate_dir / "train.log", runner)
-                    summary = _read_validation_summary(candidate_dir, candidate, fold)
+                    _run_command(command, project_root, candidate_dir / "train.log", runner,
+                                 output_dir / "run.log")
+                    summary = _read_validation_summary(
+                        candidate_dir, candidate, fold, feature_cache_info["feature_cache_key"]
+                    )
                     if not _candidate_complete(candidate_dir, candidate, {"status": "completed"}):
                         raise RuntimeError("Candidate completion artifacts failed validation")
                     entry.update({"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()})
@@ -617,6 +821,9 @@ def run_sweep(options, runner=subprocess.run):
                     entry.update({"status": "failed", "error": str(exc)})
                     search_complete = False
                     atomic_write_json(state_path, state)
+                    log_exception(logger, "search.candidate.failed", "candidate training failed",
+                                  fold=fold, candidate_id=candidate_id,
+                                  cache_path=feature_cache_info["feature_cache_path"])
                     if not options.continue_on_error:
                         raise
                     continue
@@ -627,6 +834,17 @@ def run_sweep(options, runner=subprocess.run):
         if len(completed_rows) != len(candidates):
             search_complete = False
         selected = select_candidate(completed_rows, config["selection"])
+        ranked = sorted(completed_rows, key=lambda row: selection_key(row, config["selection"]))
+        for rank, row in enumerate(ranked, start=1):
+            log_event(
+                logger, "INFO", "search.ranking", "validation-only candidate ranking",
+                fold=fold, candidate_id=row["candidate_id"], rank=rank,
+                pooling=row.get("pooling"), head_lr=row.get("head_lr"),
+                weight_decay=row.get("weight_decay"), best_epoch=row["best_epoch"],
+                validation_balanced_accuracy=row["best_validation_balanced_accuracy"],
+                validation_loss=row["best_validation_loss"],
+                validation_macro_f1=row["best_validation_macro_f1"],
+            )
         selected_candidate = next(
             candidate for candidate in candidates
             if candidate["candidate_id"] == selected["candidate_id"]
@@ -649,10 +867,23 @@ def run_sweep(options, runner=subprocess.run):
                 "validation balanced accuracy max; validation loss min; "
                 "validation macro F1 max; candidate_id asc"
             ),
+            "feature_source": "cache",
+            "feature_cache_key": feature_cache_info["feature_cache_key"],
+            "feature_cache_path": feature_cache_info["feature_cache_path"],
+            "feature_cache_pooling": selected_candidate["normalized_cli_args"].get("--pooling"),
+            "feature_cache_reused": feature_cache_info["feature_cache_reused"],
         }
         atomic_write_json(output_dir / f"fold_{fold}" / "selected_candidate.json", selected_payload)
         fold_state["selected_candidate_id"] = selected["candidate_id"]
         selected_by_fold[fold] = selected_payload
+        log_event(
+            logger, "INFO", "search.selected", "selected fold candidate using deterministic validation tie-breakers",
+            fold=fold, candidate_id=selected["candidate_id"],
+            pooling=selected_candidate["normalized_cli_args"].get("--pooling"),
+            head_lr=selected_candidate["normalized_cli_args"].get("--head-lr"),
+            weight_decay=selected_candidate["normalized_cli_args"].get("--weight-decay"),
+            selection_reason=selected_payload["selection_reason"],
+        )
         atomic_write_json(state_path, state)
 
     state["search_complete"] = search_complete
@@ -694,22 +925,50 @@ def run_sweep(options, runner=subprocess.run):
         command = build_stage_command(
             options, candidate, fold, "evaluate", test_dir, selected["checkpoint_path"]
         )
+        log_event(logger, "INFO", "test.start", "starting one-time test evaluation",
+                  fold=fold, candidate_id=selected["candidate_id"], evaluation_call_count=1)
         try:
-            _run_command(command, project_root, test_dir / "evaluate.log", runner)
+            _run_command(command, project_root, test_dir / "evaluate.log", runner,
+                         output_dir / "run.log")
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             if (
                 metrics.get("candidate_id") != selected["candidate_id"]
                 or metrics.get("candidate_config_sha256") != candidate["config_sha256"]
                 or metrics.get("evaluation_call_count") != 1
+                or metrics.get("feature_source") != "cache"
+                or metrics.get("feature_cache_key") != feature_cache_info["feature_cache_key"]
+                or metrics.get("backbone_forward_count") != 0
+                or metrics.get("checkpoint_kind") != "cached_feature_head_only"
                 or not predictions_path.is_file()
             ):
                 raise RuntimeError("Test evaluation artifacts failed identity validation")
             if sha256_file(selected["checkpoint_path"]) != selected["checkpoint_sha256"]:
                 raise RuntimeError(f"Fold {fold} evaluation modified the selected checkpoint")
             evaluation.update({"status": "evaluated", "completed_at": datetime.now(timezone.utc).isoformat()})
+            with predictions_path.open(encoding="utf-8-sig", newline="") as handle:
+                fold_prediction_rows = list(csv.DictReader(handle))
+            fold_subject_rows = aggregate_subject_predictions(fold_prediction_rows)
+            fold_subject_probability = binary_classification_metrics(
+                [int(row["true_label"]) for row in fold_subject_rows],
+                [int(row["probability_mean_pred_label"]) for row in fold_subject_rows],
+            )
+            fold_subject_majority = binary_classification_metrics(
+                [int(row["true_label"]) for row in fold_subject_rows],
+                [int(row["majority_vote_pred_label"]) for row in fold_subject_rows],
+            )
+            log_event(logger, "INFO", "test.complete", "one-time test evaluation completed",
+                      fold=fold, candidate_id=selected["candidate_id"],
+                      window_accuracy=metrics.get("accuracy"),
+                      window_balanced_accuracy=metrics.get("balanced_accuracy"),
+                      window_macro_f1=metrics.get("macro_f1"),
+                      subject_probability_mean=fold_subject_probability,
+                      subject_majority_vote=fold_subject_majority)
         except Exception as exc:
             evaluation.update({"status": "failed", "error": str(exc)})
             atomic_write_json(state_path, state)
+            log_exception(logger, "test.failed", "test evaluation failed",
+                          fold=fold, candidate_id=selected["candidate_id"],
+                          cache_path=feature_cache_info["feature_cache_path"])
             raise
         atomic_write_json(state_path, state)
 
@@ -719,6 +978,21 @@ def run_sweep(options, runner=subprocess.run):
     ):
         raise RuntimeError("Every fold must have exactly one test evaluation call")
     window_metrics, subject_metrics = aggregate_oof(output_dir, selected_by_fold)
+    log_event(
+        logger, "INFO", "oof.complete", "OOF aggregation and integrity checks completed",
+        selected_candidates={str(k): v["candidate_id"] for k, v in selected_by_fold.items()},
+        oof_windows=window_metrics["num_windows"], oof_subjects=window_metrics["num_subjects"],
+        sample_ids_unique=True, coverage_complete=window_metrics["coverage_complete"],
+        window_accuracy=window_metrics["accuracy"],
+        window_balanced_accuracy=window_metrics["balanced_accuracy"],
+        window_macro_f1=window_metrics["macro_f1"],
+        subject_probability_mean=subject_metrics["probability_mean"],
+        subject_majority_vote=subject_metrics["majority_vote"],
+        window_predictions_path=str(output_dir / "oof_window_predictions.csv"),
+        subject_predictions_path=str(output_dir / "oof_subject_predictions.csv"),
+        window_metrics_path=str(output_dir / "oof_window_metrics.json"),
+        subject_metrics_path=str(output_dir / "oof_subject_metrics.json"),
+    )
     summary = {
         "status": "completed",
         "local_code_validation": False,
@@ -736,6 +1010,26 @@ def run_sweep(options, runner=subprocess.run):
             str(fold): selected["candidate_id"] for fold, selected in selected_by_fold.items()
         },
         "per_fold_configs_may_differ": True,
+        "feature_cache_key": feature_cache_info["feature_cache_key"],
+        "feature_cache_path": feature_cache_info["feature_cache_path"],
+        "feature_cache_policy": feature_cache_info["feature_cache_policy"],
+        "feature_cache_reused": feature_cache_info["feature_cache_reused"],
+        "cache_build_seconds": feature_cache_info["cache_build_seconds"],
+        "cache_mean_size_bytes": directory_size(
+            Path(feature_cache_info["feature_cache_path"]) / MEAN_CACHE_NAME
+        ),
+        "cache_flatten_size_bytes": directory_size(
+            Path(feature_cache_info["feature_cache_path"]) / FLATTEN_CACHE_NAME
+        ),
+        "cache_row_count": cache_manifest["mean_row_count"],
+        "cache_dtype": cache_manifest["dtype"],
+        "cache_parity_passed": cache_manifest["parity_passed"],
+        "backbone_forward_count_during_cache_build": cache_manifest["backbone_forward_count"],
+        "backbone_processed_window_count": cache_manifest["backbone_processed_window_count"],
+        "source_window_count": cache_manifest["source_window_count"],
+        "backbone_forward_count_during_candidate_training": 0,
+        "backbone_forward_count_during_test_evaluation": 0,
+        "candidate_checkpoint_kind": "cached_feature_head_only",
     }
     atomic_write_json(output_dir / "sweep_summary.json", summary)
     report = [
@@ -745,9 +1039,15 @@ def run_sweep(options, runner=subprocess.run):
         "- test evaluations per fold: exactly 1",
         f"- OOF windows: {window_metrics['num_windows']}",
         "- each fold may select different pooling, head learning rate, and weight decay",
+        "- feature cache is a label-free, parameter-free, per-sample deterministic transform",
+        "- subject-level train/validation/test isolation remains at head training time",
+        "- cached mode is invalid for backbone finetuning, LoRA/adapters, fitted feature scaling, probe search, or augmentation",
     ]
     (output_dir / "sweep_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     atomic_write_json(state_path, state)
+    log_event(logger, "INFO", "run.complete", "sweep completed successfully",
+              output_dir=str(output_dir), elapsed_seconds=round(time.monotonic() - run_started, 1),
+              sweep_summary=str(output_dir / "sweep_summary.json"))
     return summary
 
 
@@ -755,6 +1055,13 @@ def main(argv=None):
     options = parse_args(argv)
     if options.epochs <= 0 or options.batch_size <= 0 or options.num_workers < 0:
         raise ValueError("epochs/batch-size must be positive and num-workers non-negative")
+    if min(options.feature_cache_batch_size, options.cache_log_every_batches,
+           options.train_log_every_epochs) <= 0:
+        raise ValueError("cache batch/log intervals and train log interval must be positive")
+    if options.mode != "linear_probe":
+        raise ValueError("Frozen feature cache sweep requires --mode linear_probe")
+    if options.resume and options.feature_cache_policy == "rebuild":
+        raise ValueError("--resume cannot be combined with feature-cache-policy rebuild")
     result = run_sweep(options)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

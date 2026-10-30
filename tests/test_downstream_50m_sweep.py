@@ -39,6 +39,26 @@ def _options(tmp_path, *extra):
     ])
 
 
+def _fake_cache_info(tmp_path):
+    cache_path = tmp_path / "fake_feature_cache" / ("c" * 64)
+    for name in ("mean_features.lance", "flatten_features.lance"):
+        path = cache_path / name
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "data.bin").write_bytes(b"cache")
+    return {
+        "feature_cache_key": "c" * 64,
+        "feature_cache_path": str(cache_path),
+        "feature_cache_policy": "auto",
+        "feature_cache_reused": True,
+        "cache_build_seconds": 0.0,
+        "manifest": {
+            "mean_row_count": 8, "dtype": "float32", "parity_passed": True,
+            "backbone_forward_count": 1, "backbone_processed_window_count": 8,
+            "source_window_count": 8,
+        },
+    }
+
+
 def test_current_config_expands_eight_unique_candidates_four_per_space():
     candidates = sweep.expand_candidates(_config())
     assert len(candidates) == 8
@@ -295,6 +315,12 @@ def _fake_runner_factory(fail_search_once=False):
                 "best_validation_macro_f1": 0.5,
                 "checkpoint_path": str(checkpoint.resolve()),
                 "checkpoint_sha256": sweep.sha256_file(checkpoint),
+                "feature_source": "cache", "feature_cache_key": "c" * 64,
+                "feature_cache_path": str(output.parent),
+                "feature_cache_pooling": json.loads(args_json)["--pooling"],
+                "feature_cache_reused": True, "feature_dim": 512,
+                "backbone_forward_count": 0,
+                "checkpoint_kind": "cached_feature_head_only",
                 "test_accessed": False,
             }
             sweep.atomic_write_json(output / "validation_summary.json", summary)
@@ -316,6 +342,9 @@ def _fake_runner_factory(fail_search_once=False):
                 "status": "evaluated", "fold": fold, "candidate_id": candidate_id,
                 "candidate_config_sha256": config_hash,
                 "test_prediction_count": 2, "evaluation_call_count": 1,
+                "feature_source": "cache", "feature_cache_key": "c" * 64,
+                "backbone_forward_count": 0,
+                "checkpoint_kind": "cached_feature_head_only",
             })
         return SimpleNamespace(stdout="mock ok\n", stderr="")
 
@@ -325,10 +354,25 @@ def _fake_runner_factory(fail_search_once=False):
 def test_end_to_end_mock_trainer_search_evaluate_once_resume_and_oof(tmp_path):
     options = _options(tmp_path)
     runner, calls = _fake_runner_factory()
-    summary = sweep.run_sweep(options, runner=runner)
+    cache_info = _fake_cache_info(tmp_path)
+    summary = sweep.run_sweep(
+        options, runner=runner, cache_ensurer=lambda options: cache_info
+    )
     assert len([call for call in calls if call[call.index("--stage") + 1] == "search"]) == 32
     assert len([call for call in calls if call[call.index("--stage") + 1] == "evaluate"]) == 4
+    assert {
+        call[call.index("--feature-cache-key") + 1] for call in calls
+    } == {"c" * 64}
+    assert {
+        call[call.index("--feature-cache-path") + 1] for call in calls
+    } == {cache_info["feature_cache_path"]}
+    search_calls = [call for call in calls if call[call.index("--stage") + 1] == "search"]
+    assert sum(call[call.index("--pooling") + 1] == "mean" for call in search_calls) == 16
+    assert sum(call[call.index("--pooling") + 1] == "flatten" for call in search_calls) == 16
     assert summary["test_evaluation_calls"] == {str(fold): 1 for fold in range(4)}
+    assert summary["backbone_forward_count_during_candidate_training"] == 0
+    assert summary["backbone_forward_count_during_test_evaluation"] == 0
+    assert summary["candidate_checkpoint_kind"] == "cached_feature_head_only"
     assert summary["window_metrics"]["accuracy"] == pytest.approx(1.0)
     assert summary["subject_metrics"]["probability_mean"]["accuracy"] == pytest.approx(1.0)
     with (Path(options.output_dir) / "oof_window_predictions.csv").open(encoding="utf-8-sig") as handle:
@@ -337,10 +381,20 @@ def test_end_to_end_mock_trainer_search_evaluate_once_resume_and_oof(tmp_path):
     assert len({row["sample_id"] for row in rows}) == 8
     assert all(row["split"] == "test" for row in rows)
     assert all(row["selected_candidate_args_json"] for row in rows)
+    run_log = (Path(options.output_dir) / "run.log").read_text(encoding="utf-8")
+    assert "feature_source=cache" in run_log
+    assert "backbone_forward_count=0" in run_log
+    assert "search.ranking" in run_log
+    assert "starting one-time test evaluation" in run_log
+    assert "oof.complete" in run_log
+    assert "subject_probability_mean=" in run_log
+    assert "subject_majority_vote=" in run_log
 
     resume = _options(tmp_path, "--resume")
     no_call_runner = lambda *args, **kwargs: pytest.fail("completed resume should not run commands")
-    resumed = sweep.run_sweep(resume, runner=no_call_runner)
+    resumed = sweep.run_sweep(
+        resume, runner=no_call_runner, cache_ensurer=lambda options: cache_info
+    )
     assert resumed["test_evaluation_calls"] == {str(fold): 1 for fold in range(4)}
 
 
@@ -386,7 +440,10 @@ def test_failed_candidate_stops_by_default_and_continue_on_error_is_explicit(tmp
     options = _options(tmp_path)
     runner, _ = _fake_runner_factory(fail_search_once=True)
     with pytest.raises(subprocess.CalledProcessError):
-        sweep.run_sweep(options, runner=runner)
+        sweep.run_sweep(
+            options, runner=runner,
+            cache_ensurer=lambda options: _fake_cache_info(tmp_path),
+        )
     state = json.loads((Path(options.output_dir) / "sweep_state.json").read_text())
     statuses = [entry["status"] for entry in state["folds"]["0"]["candidates"].values()]
     assert statuses.count("failed") == 1
@@ -394,7 +451,10 @@ def test_failed_candidate_stops_by_default_and_continue_on_error_is_explicit(tmp
     other = tmp_path / "other"
     options = _options(other, "--continue-on-error")
     runner, _ = _fake_runner_factory(fail_search_once=True)
-    summary = sweep.run_sweep(options, runner=runner)
+    summary = sweep.run_sweep(
+        options, runner=runner,
+        cache_ensurer=lambda options: _fake_cache_info(other),
+    )
     assert summary["search_complete"] is False
 
 
@@ -409,6 +469,8 @@ def test_dry_run_writes_manifest_and_commands_without_starting_training(tmp_path
     assert len(json.loads((output / "dry_run_commands.json").read_text())) == 32
     plan = json.loads((output / "dry_run_plan.json").read_text())
     assert len(plan["evaluation_templates"]) == 4
+    assert plan["feature_cache"]["build_performed"] is False
+    assert all("--feature-cache-key" in command for command in plan["search_commands"])
     assert not list(output.rglob("*.pt"))
 
 
@@ -439,6 +501,13 @@ def test_cloud_sweep_script_is_sequential_new_timestamp_and_has_no_legacy_flow()
         assert marker not in script
     for path in (
         "/opt/ml/input", "huada_model_tokens_8sub.lance", "pretrain_checkpoint_4.pt",
-        "50m_sex_cv4_sweep.json", "downstream_outputs",
+        "50m_sex_cv4_sweep.json", "downstream_outputs", "downstream_feature_cache",
     ):
         assert path in script
+    for option in (
+        "--feature-cache-root", "--feature-cache-policy", "--feature-cache-batch-size",
+        "--cache-log-every-batches", "--train-log-every-epochs", "--log-level",
+    ):
+        assert option in script
+    assert "export PYTHONUNBUFFERED=1" in script
+    assert '"$PYTHON_BIN" -u scripts/downstream_50m/run_sex_cv4_sweep.py' in script

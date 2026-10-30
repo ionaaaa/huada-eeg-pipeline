@@ -18,6 +18,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from torch.utils.data import DataLoader
 
 from configs import Config
 from dataset import collate_fn
+from feature_cache import CachedFeatureDataset
 from lance_dataset import (
     LanceEEGPretrainDataset,
     SEX_LABEL_MAPPING,
@@ -40,6 +42,7 @@ from lance_dataset import (
 )
 from model import EEGPretrainModel
 from prefetch_loader import PrefetchLoader
+from run_logging import get_run_logger, log_event, log_exception, setup_run_logging
 from sex_cv4 import (
     PROTOCOL as SEX_CV4_PROTOCOL,
     build_sex_stratified_subject_cv4,
@@ -150,6 +153,11 @@ def parse_args(argv=None):
     parser.add_argument("--sweep-candidate-id")
     parser.add_argument("--sweep-config-sha256")
     parser.add_argument("--sweep-args-json")
+    parser.add_argument("--feature-cache-path", type=Path)
+    parser.add_argument("--feature-cache-key")
+    parser.add_argument("--feature-cache-reused", action="store_true")
+    parser.add_argument("--train-log-every-epochs", type=int, default=5)
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     parser.add_argument("--pooling", choices=["mean", "flatten"], default=None)
     parser.add_argument("--head-lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
@@ -183,6 +191,15 @@ def apply_cli_overrides(cfg, args):
     cfg.finetune.sweep_candidate_id = args.sweep_candidate_id or ""
     cfg.finetune.sweep_config_sha256 = args.sweep_config_sha256 or ""
     cfg.finetune.sweep_args_json = args.sweep_args_json or ""
+    cfg.finetune.feature_source = "cache" if args.feature_cache_path else "online"
+    cfg.finetune.feature_cache_path = (
+        "" if args.feature_cache_path is None else str(args.feature_cache_path)
+    )
+    cfg.finetune.feature_cache_key = args.feature_cache_key or ""
+    cfg.finetune.feature_cache_pooling = args.pooling or cfg.finetune.pooling
+    cfg.finetune.feature_cache_reused = bool(args.feature_cache_reused)
+    cfg.finetune.train_log_every_epochs = args.train_log_every_epochs
+    cfg.finetune.log_level = args.log_level
     if args.pooling is not None:
         cfg.finetune.pooling = args.pooling
     if args.head_lr is not None:
@@ -206,6 +223,11 @@ def validate_resolved_hyperparameters(cfg):
         raise ValueError("head_lr must be > 0")
     if cfg.finetune.weight_decay < 0:
         raise ValueError("weight_decay must be >= 0")
+    if cfg.finetune.feature_source == "cache":
+        if cfg.finetune.mode != "linear_probe":
+            raise ValueError("Feature cache is only valid for frozen linear_probe mode")
+        if not cfg.finetune.feature_cache_key or not cfg.finetune.feature_cache_path:
+            raise ValueError("Cached feature mode requires cache path and key")
 
 
 def setup_experiment_dir(cfg, overwrite=False, create_checkpoint_dir=True):
@@ -331,7 +353,42 @@ class EEGDownstreamClassifier(nn.Module):
         else:
             token_embeddings = self.backbone.extract_token_embeddings(**kwargs)
         features = self.extract_features(token_embeddings, token_valid_mask)
+        return self.classify_features(features)
+
+    def classify_features(self, features):
         return self.head(features)
+
+
+class CachedFeatureClassifier(nn.Module):
+    """Downstream head with no backbone object or backbone parameters."""
+
+    def __init__(
+        self, input_dim, num_classes, pooling, use_mlp_head=False,
+        mlp_hidden_dim=512, head_dropout=0.0,
+    ):
+        super().__init__()
+        self.pooling = str(pooling)
+        self.head_input_dim = int(input_dim)
+        self.d_model = int(input_dim)
+        self.num_tokens = None
+        if use_mlp_head:
+            self.head = nn.Sequential(
+                nn.Linear(input_dim, mlp_hidden_dim), nn.GELU(),
+                nn.Dropout(head_dropout), nn.Linear(mlp_hidden_dim, num_classes),
+            )
+        else:
+            self.head = nn.Linear(input_dim, num_classes)
+
+    def classify_features(self, features):
+        if features.ndim != 2 or int(features.shape[1]) != self.head_input_dim:
+            raise ValueError(
+                f"Cached feature shape {tuple(features.shape)} does not match "
+                f"head input dimension {self.head_input_dim}"
+            )
+        return self.head(features)
+
+    def forward(self, features):
+        return self.classify_features(features)
 
 
 def compute_shape_params(cfg):
@@ -391,6 +448,17 @@ def compute_probe_layer_idx(depth, probe_layer_ratio):
 
 
 def load_downstream_dataset(cfg, split=None, max_samples=None):
+    if cfg.finetune.feature_source == "cache":
+        if split is not None or max_samples is not None:
+            raise ValueError("Cached CV dataset is split only by the existing CV4 metadata path")
+        return CachedFeatureDataset(
+            cache_dir=cfg.finetune.feature_cache_path,
+            pooling=cfg.finetune.pooling,
+            input_lance=cfg.data.lance_path,
+            task=cfg.finetune.task,
+            storage_options=load_storage_options(cfg.data.storage_options_path),
+            expected_cache_key=cfg.finetune.feature_cache_key,
+        )
     return LanceEEGPretrainDataset(
         lance_path=cfg.data.lance_path,
         storage_options=load_storage_options(cfg.data.storage_options_path),
@@ -561,6 +629,17 @@ def build_backbone(cfg, shape_params, device, load_pretrained=True, minimum_matc
 def build_downstream_model(cfg, backbone, device, shape_params):
     freeze_backbone = cfg.finetune.mode == "linear_probe"
     probe_layer_idx = compute_probe_layer_idx(cfg.model.depth, cfg.finetune.probe_layer_ratio)
+    if cfg.finetune.feature_source == "cache":
+        input_dim, _ = resolved_head_dimensions(cfg, shape_params)
+        model = CachedFeatureClassifier(
+            input_dim=input_dim,
+            num_classes=cfg.finetune.num_classes,
+            pooling=cfg.finetune.pooling,
+            use_mlp_head=cfg.finetune.use_mlp_head,
+            mlp_hidden_dim=cfg.finetune.mlp_hidden_dim,
+            head_dropout=cfg.finetune.head_dropout,
+        ).to(device)
+        return model, probe_layer_idx
     model = EEGDownstreamClassifier(
         backbone=backbone,
         d_model=cfg.model.d_model,
@@ -582,6 +661,15 @@ def head_parameter_count(model):
 
 def model_training_metadata(cfg, model, shape_params, optimizer_report=None):
     return {
+        "feature_source": cfg.finetune.feature_source,
+        "feature_cache_key": cfg.finetune.feature_cache_key or None,
+        "feature_cache_path": cfg.finetune.feature_cache_path or None,
+        "feature_cache_pooling": (
+            cfg.finetune.pooling if cfg.finetune.feature_source == "cache" else None
+        ),
+        "feature_cache_reused": bool(cfg.finetune.feature_cache_reused),
+        "feature_dim": int(model.head_input_dim),
+        "backbone_forward_count": 0 if cfg.finetune.feature_source == "cache" else None,
         "pooling": model.pooling,
         "head_lr": float(cfg.finetune.head_lr),
         "weight_decay": float(cfg.finetune.weight_decay),
@@ -627,6 +715,27 @@ def _infer_checkpoint_pooling(model, head_input_dim):
 def load_downstream_checkpoint_strict(model, path, device):
     """Load a downstream checkpoint with explicit/inferred pooling compatibility checks."""
     payload = torch.load(path, map_location=device, weights_only=False)
+    if payload.get("checkpoint_kind") == "cached_feature_head_only":
+        if "head_state_dict" not in payload or "backbone_state_dict" in payload:
+            raise RuntimeError("Invalid cached-feature head-only checkpoint contents")
+        checkpoint_pooling = payload.get("pooling")
+        checkpoint_dim = int(payload.get("head_input_dim", -1))
+        if checkpoint_pooling != model.pooling:
+            raise RuntimeError(
+                f"Checkpoint pooling {checkpoint_pooling!r} does not match requested pooling {model.pooling!r}"
+            )
+        if checkpoint_dim != model.head_input_dim:
+            raise RuntimeError(
+                f"Checkpoint head_input_dim {checkpoint_dim} does not match model {model.head_input_dim}"
+            )
+        model.head.load_state_dict(strip_module_prefix(payload["head_state_dict"]), strict=True)
+        payload["_load_report"] = {
+            "pooling": checkpoint_pooling,
+            "pooling_inferred": False,
+            "head_input_dim": checkpoint_dim,
+            "checkpoint_kind": "cached_feature_head_only",
+        }
+        return payload
     if "model_state_dict" not in payload:
         raise RuntimeError("Downstream checkpoint has no model_state_dict")
     state_dict = strip_module_prefix(payload["model_state_dict"])
@@ -696,6 +805,16 @@ def validate_sweep_checkpoint_metadata(payload, cfg):
             matches = actual == expected_value
         if not matches:
             raise RuntimeError(f"Checkpoint {key} mismatch: {actual!r} != {expected_value!r}")
+    if cfg.finetune.feature_source == "cache":
+        if payload.get("checkpoint_kind") != "cached_feature_head_only":
+            raise RuntimeError("Cached evaluation requires a head-only checkpoint")
+        if payload.get("feature_cache_key") != cfg.finetune.feature_cache_key:
+            raise RuntimeError("Checkpoint feature_cache_key mismatch")
+        if payload.get("feature_cache_pooling") != cfg.finetune.pooling:
+            raise RuntimeError("Checkpoint feature_cache_pooling mismatch")
+        expected_dim, _ = resolved_head_dimensions(cfg, compute_shape_params(cfg))
+        if int(payload.get("feature_dim", -1)) != expected_dim:
+            raise RuntimeError("Checkpoint feature_dim mismatch")
     return True
 
 
@@ -814,12 +933,15 @@ def compute_metrics(task, targets, predictions, average_loss, smoke=False):
 
 
 def _forward_outputs(model, batch, task):
-    logits = model(
-        token_inputs=batch["token_inputs"],
-        token_channel_indices=batch["token_channel_indices"],
-        token_time_indices=batch["token_time_indices"],
-        token_valid_mask=batch["token_valid_mask"],
-    )
+    if "feature" in batch:
+        logits = model.classify_features(batch["feature"])
+    else:
+        logits = model(
+            token_inputs=batch["token_inputs"],
+            token_channel_indices=batch["token_channel_indices"],
+            token_time_indices=batch["token_time_indices"],
+            token_valid_mask=batch["token_valid_mask"],
+        )
     return logits if task == "sex_classification" else logits.view(-1)
 
 
@@ -894,7 +1016,11 @@ def evaluate_sex_test_once(model, loader, criterion, device, fold, checkpoint_pa
                 "prob_male": float(probabilities[index, 1].item()),
                 "predicted_label": prediction,
                 "predicted_sex": "female" if prediction == 0 else "male",
-                "num_valid_tokens": int(batch["token_valid_mask"][index].sum().item()),
+                "num_valid_tokens": int(
+                    batch["num_valid_tokens"][index].item()
+                    if "feature" in batch
+                    else batch["token_valid_mask"][index].sum().item()
+                ),
                 "checkpoint_path": str(Path(checkpoint_path).resolve()),
             })
     if not rows:
@@ -913,10 +1039,9 @@ def save_downstream_checkpoint(
 ):
     training_metadata = model_training_metadata(cfg, model, shape_params, optimizer_report)
     payload = {
-        "model_state_dict": model.state_dict(),
         "head_state_dict": model.head.state_dict(),
-        "backbone_state_dict": model.backbone.state_dict(),
         "pretrained_ckpt_path": cfg.finetune.pretrained_ckpt_path or None,
+        "pretrained_checkpoint_sha256": checkpoint_report.get("checkpoint_sha256"),
         "pretrained_checkpoint_report": checkpoint_report,
         "probe_layer_idx": probe_layer_idx,
         "probe_layer_ratio": cfg.finetune.probe_layer_ratio,
@@ -934,11 +1059,27 @@ def save_downstream_checkpoint(
         "weight_decay": training_metadata["weight_decay"],
         "optimizer_name": training_metadata["optimizer_name"],
         "optimizer_param_groups": training_metadata["optimizer_param_groups"],
+        "checkpoint_kind": (
+            "cached_feature_head_only"
+            if cfg.finetune.feature_source == "cache"
+            else "full_downstream_model"
+        ),
+        "feature_source": cfg.finetune.feature_source,
+        "feature_cache_key": cfg.finetune.feature_cache_key or None,
+        "feature_cache_path": cfg.finetune.feature_cache_path or None,
+        "feature_cache_pooling": (
+            cfg.finetune.pooling if cfg.finetune.feature_source == "cache" else None
+        ),
+        "feature_dim": training_metadata["feature_dim"],
+        "fold": cfg.finetune.fold_index,
         "sweep_candidate_id": cfg.finetune.sweep_candidate_id or None,
         "sweep_config_sha256": cfg.finetune.sweep_config_sha256 or None,
         "sweep_args_json": cfg.finetune.sweep_args_json or None,
         "upstream": {"url": UPSTREAM_URL, "branch": UPSTREAM_BRANCH, "commit": UPSTREAM_COMMIT},
     }
+    if cfg.finetune.feature_source != "cache":
+        payload["model_state_dict"] = model.state_dict()
+        payload["backbone_state_dict"] = model.backbone.state_dict()
     temporary = str(path) + ".tmp"
     torch.save(payload, temporary)
     os.replace(temporary, path)
@@ -963,15 +1104,48 @@ def run_one_checkpoint(
     test_prediction_context=None,
     search_only=False,
 ):
-    backbone, loaded_report = build_backbone(cfg, shape_params, device, load_pretrained=not cfg.finetune.evaluate_only)
+    logger = get_run_logger()
+    fold = cfg.finetune.fold_index
+    candidate_id = cfg.finetune.sweep_candidate_id or None
+    if cfg.finetune.feature_source == "cache":
+        cache_manifest = json.loads(
+            (Path(cfg.finetune.feature_cache_path) / "cache_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        backbone = None
+        loaded_report = {
+            "checkpoint_path": cache_manifest.get("pretrained_checkpoint"),
+            "checkpoint_sha256": cache_manifest.get("pretrained_checkpoint_sha256"),
+            "matched_key_count": cache_manifest.get("checkpoint_matched_key_count"),
+            "matched_parameter_fraction": cache_manifest.get(
+                "checkpoint_matched_parameter_fraction"
+            ),
+            "feature_source": "cache",
+            "feature_cache_key": cfg.finetune.feature_cache_key,
+            "backbone_forward_count": 0,
+        }
+    else:
+        backbone, loaded_report = build_backbone(
+            cfg, shape_params, device,
+            load_pretrained=not cfg.finetune.evaluate_only,
+        )
     checkpoint_report = checkpoint_report or loaded_report
     model, probe_layer_idx = build_downstream_model(cfg, backbone, device, shape_params)
     criterion = make_criterion(cfg.finetune.task)
+    log_event(
+        logger, "INFO", "candidate.model", "downstream model ready",
+        fold=fold, candidate_id=candidate_id, feature_source=cfg.finetune.feature_source,
+        pooling=cfg.finetune.pooling, feature_cache_path=cfg.finetune.feature_cache_path or None,
+        backbone_constructed=backbone is not None, backbone_forward_count=0,
+    )
 
     if cfg.finetune.evaluate_only:
         path = cfg.finetune.downstream_checkpoint
         if not path or not Path(path).is_file():
             raise FileNotFoundError(path or "--downstream-checkpoint is required for --evaluate")
+        log_event(logger, "INFO", "test.evaluate", "loading selected head checkpoint for one-time test",
+                  fold=fold, candidate_id=candidate_id, checkpoint=str(path))
         payload = load_downstream_checkpoint_strict(model, path, device)
         validate_sweep_checkpoint_metadata(payload, cfg)
         if test_prediction_context is not None:
@@ -982,15 +1156,25 @@ def run_one_checkpoint(
         else:
             test_metrics = validate_one_epoch(model, test_loader, criterion, device, cfg.finetune.task)
             test_predictions = []
-        return model, {"test": test_metrics}, probe_layer_idx, checkpoint_report, test_predictions
+        return model, {
+            "test": test_metrics,
+            "training_metadata": model_training_metadata(cfg, model, shape_params),
+        }, probe_layer_idx, checkpoint_report, test_predictions
 
     optimizer = make_optimizer(cfg, model)
     optimizer_report = optimizer_configuration(optimizer)
     training_metadata = model_training_metadata(cfg, model, shape_params, optimizer_report)
     print(json.dumps({"resolved_downstream": training_metadata}, ensure_ascii=False))
+    log_event(
+        logger, "INFO", "candidate.optimizer", "optimizer configuration resolved",
+        fold=fold, candidate_id=candidate_id, optimizer=optimizer_report.get("optimizer_name"),
+        learning_rate=cfg.finetune.head_lr, weight_decay=cfg.finetune.weight_decay,
+        param_groups=optimizer_report.get("param_groups"),
+    )
     best_score = -float("inf")
     best_payload = None
     epoch_rows = []
+    training_started = time.monotonic()
     for epoch in range(cfg.finetune.num_epochs):
         train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, device, cfg.finetune.task)
         val_metrics = validate_one_epoch(model, val_loader, criterion, device, cfg.finetune.task)
@@ -1001,11 +1185,34 @@ def run_one_checkpoint(
             if search_only and cfg.finetune.task == "sex_classification"
             else _best_value(cfg.finetune.task, val_metrics)
         )
-        if score > best_score:
+        updated_best = score > best_score
+        if updated_best:
             best_score = score
             best_payload = save_downstream_checkpoint(
                 cfg.finetune.save_path, model, cfg, shape_params, probe_layer_idx,
                 epoch + 1, epoch_metrics, checkpoint_report, optimizer_report,
+            )
+        epoch_number = epoch + 1
+        if (
+            epoch_number == 1 or epoch_number == cfg.finetune.num_epochs
+            or epoch_number % max(1, cfg.finetune.train_log_every_epochs) == 0
+            or updated_best
+        ):
+            elapsed = time.monotonic() - training_started
+            eta = elapsed / epoch_number * (cfg.finetune.num_epochs - epoch_number)
+            log_event(
+                logger, "INFO", "candidate.epoch", "candidate training progress",
+                fold=fold, candidate_id=candidate_id,
+                epoch=f"{epoch_number}/{cfg.finetune.num_epochs}",
+                train_loss=train_metrics.get("loss"), validation_loss=val_metrics.get("loss"),
+                validation_accuracy=val_metrics.get("accuracy"),
+                validation_balanced_accuracy=val_metrics.get("balanced_accuracy"),
+                validation_macro_f1=val_metrics.get("macro_f1"),
+                best_epoch=None if best_payload is None else best_payload["epoch"],
+                best_checkpoint_updated=updated_best,
+                elapsed_seconds=round(elapsed, 1), eta_seconds=round(eta, 1),
+                optimizer_learning_rate=cfg.finetune.head_lr,
+                optimizer_weight_decay=cfg.finetune.weight_decay,
             )
     if best_payload is None:
         raise RuntimeError("No best checkpoint was produced")
@@ -1145,6 +1352,20 @@ def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
         "validation": set(fold_info["validation_subjects"]),
         "test": set(fold_info["test_subjects"]),
     }
+    sample_counts = {
+        split: sum(str(row["subject_id"]) in subjects for row in rows)
+        for split, subjects in subjects_by_split.items()
+    }
+    log_event(
+        get_run_logger(), "INFO", "fold.start", "starting isolated CV4 fold stage",
+        fold=fold, candidate_id=cfg.finetune.sweep_candidate_id,
+        run_stage=cfg.finetune.stage, train_subjects=sorted(subjects_by_split["train"]),
+        validation_subjects=sorted(subjects_by_split["validation"]),
+        test_subjects=sorted(subjects_by_split["test"]),
+        train_samples=sample_counts["train"], validation_samples=sample_counts["validation"],
+        test_samples=sample_counts["test"],
+        test_used_for_candidate_selection=False,
+    )
     datasets = {}
     for split_name in split_names:
         indices = [
@@ -1158,6 +1379,15 @@ def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
     if cfg.finetune.stage == "search":
         train_loader = _loader(datasets["train"], cfg, device, shuffle=True)
         validation_loader = _loader(datasets["validation"], cfg, device, shuffle=False)
+        log_event(
+            get_run_logger(), "INFO", "candidate.start", "starting cached-feature head training",
+            fold=fold, candidate_id=cfg.finetune.sweep_candidate_id,
+            pooling=cfg.finetune.pooling, head_lr=cfg.finetune.head_lr,
+            weight_decay=cfg.finetune.weight_decay,
+            feature_cache_path=cfg.finetune.feature_cache_path,
+            train_samples=len(datasets["train"]), validation_samples=len(datasets["validation"]),
+            feature_source="cache", backbone_constructed=False, backbone_forward_count=0,
+        )
         model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
             cfg, shape_params, train_loader, validation_loader, None, device,
             search_only=True,
@@ -1185,6 +1415,18 @@ def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
             "checkpoint_path": str(checkpoint_path),
             "checkpoint_sha256": sha256_file(checkpoint_path),
             "training_metadata": metrics["training_metadata"],
+            "feature_source": metrics["training_metadata"].get("feature_source", "online"),
+            "feature_cache_key": metrics["training_metadata"].get("feature_cache_key"),
+            "feature_cache_path": metrics["training_metadata"].get("feature_cache_path"),
+            "feature_cache_pooling": metrics["training_metadata"].get("feature_cache_pooling"),
+            "feature_cache_reused": metrics["training_metadata"].get("feature_cache_reused", False),
+            "feature_dim": metrics["training_metadata"].get("feature_dim"),
+            "backbone_forward_count": metrics["training_metadata"].get("backbone_forward_count"),
+            "checkpoint_kind": (
+                "cached_feature_head_only"
+                if cfg.finetune.feature_source == "cache"
+                else "full_downstream_model"
+            ),
             "test_accessed": False,
         }
         _atomic_json_dump(Path(run_dir) / "validation_summary.json", summary)
@@ -1203,6 +1445,9 @@ def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
         }, checkpoint_report
 
     test_loader = _loader(datasets["test"], cfg, device, shuffle=False)
+    log_event(get_run_logger(), "INFO", "test.start", "starting one-time test evaluation",
+              fold=fold, candidate_id=cfg.finetune.sweep_candidate_id,
+              test_samples=len(datasets["test"]), backbone_forward_count=0)
     model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
         cfg, shape_params, None, None, test_loader, device,
         test_prediction_context={"fold": fold},
@@ -1227,10 +1472,30 @@ def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
         "checkpoint_path": str(Path(cfg.finetune.downstream_checkpoint).resolve()),
         "checkpoint_sha256": sha256_file(cfg.finetune.downstream_checkpoint),
         "evaluation_call_count": 1,
+        "feature_source": metrics.get("training_metadata", {}).get("feature_source", "online"),
+        "feature_cache_key": metrics.get("training_metadata", {}).get("feature_cache_key"),
+        "feature_cache_path": metrics.get("training_metadata", {}).get("feature_cache_path"),
+        "feature_cache_pooling": metrics.get("training_metadata", {}).get("feature_cache_pooling"),
+        "feature_dim": metrics.get("training_metadata", {}).get("feature_dim"),
+        "backbone_forward_count": metrics.get("training_metadata", {}).get("backbone_forward_count"),
+        "checkpoint_kind": (
+            "cached_feature_head_only"
+            if cfg.finetune.feature_source == "cache"
+            else "full_downstream_model"
+        ),
     }
     _atomic_json_dump(Path(run_dir) / "test_metrics.json", test_summary)
+    log_event(
+        get_run_logger(), "INFO", "test.complete", "test evaluation metrics saved",
+        fold=fold, candidate_id=cfg.finetune.sweep_candidate_id,
+        accuracy=test_summary.get("accuracy"),
+        balanced_accuracy=test_summary.get("balanced_accuracy"),
+        macro_f1=test_summary.get("macro_f1"),
+        prediction_count=len(predictions),
+    )
     return {
         "metrics": {"test": metrics["test"]},
+        "training_metadata": metrics.get("training_metadata"),
         "sample_count": {"test": len(datasets["test"])},
         "split_subjects": {"test": test_summary["test_subjects"]},
         "stage_summary": test_summary,
@@ -1407,6 +1672,15 @@ def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_
     shape_params = compute_shape_params(cfg)
     resolved_input_dim, resolved_parameter_count = resolved_head_dimensions(cfg, shape_params)
     training_metadata = result.get("training_metadata") or {
+        "feature_source": cfg.finetune.feature_source,
+        "feature_cache_key": cfg.finetune.feature_cache_key or None,
+        "feature_cache_path": cfg.finetune.feature_cache_path or None,
+        "feature_cache_pooling": (
+            cfg.finetune.pooling if cfg.finetune.feature_source == "cache" else None
+        ),
+        "feature_cache_reused": bool(cfg.finetune.feature_cache_reused),
+        "feature_dim": resolved_input_dim,
+        "backbone_forward_count": 0 if cfg.finetune.feature_source == "cache" else None,
         "pooling": cfg.finetune.pooling,
         "head_lr": float(cfg.finetune.head_lr),
         "weight_decay": float(cfg.finetune.weight_decay),
@@ -1452,6 +1726,12 @@ def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_
             "lance": lance.__version__, "pyarrow": pyarrow.__version__,
         },
         "protocol": cfg.finetune.protocol,
+        "feature_source": training_metadata["feature_source"],
+        "feature_cache_key": training_metadata["feature_cache_key"],
+        "feature_cache_path": training_metadata["feature_cache_path"],
+        "feature_cache_pooling": training_metadata["feature_cache_pooling"],
+        "feature_dim": training_metadata["feature_dim"],
+        "backbone_forward_count": training_metadata["backbone_forward_count"],
         "pooling": training_metadata["pooling"],
         "head_lr": training_metadata["head_lr"],
         "weight_decay": training_metadata["weight_decay"],
@@ -1508,11 +1788,22 @@ def main(argv=None):
         raise ValueError("Full train/evaluation requires --subject-split-manifest")
     if min(args.epochs, args.batch_size, args.smoke_max_samples, args.smoke_max_samples_per_subject) <= 0:
         raise ValueError("epochs, batch-size, and smoke sample limits must be positive")
+    if args.train_log_every_epochs <= 0:
+        raise ValueError("train-log-every-epochs must be positive")
 
     cfg = Config()
     apply_cli_overrides(cfg, args)
     run_dir = setup_experiment_dir(
         cfg, overwrite=args.overwrite, create_checkpoint_dir=args.stage != "evaluate"
+    )
+    logger = setup_run_logging(run_dir, args.log_level, append=False)
+    log_event(
+        logger, "INFO", "trainer.start", "starting downstream trainer stage",
+        run_stage=args.stage or "full", fold=args.fold_index,
+        candidate_id=args.sweep_candidate_id, input_lance=args.input_lance,
+        checkpoint=str(args.checkpoint) if args.checkpoint else None,
+        output_dir=str(run_dir), device=args.device, epochs=args.epochs,
+        batch_size=args.batch_size, seed=args.seed,
     )
     set_seed(cfg.finetune.seed)
     device = torch.device(cfg.finetune.device)
@@ -1563,4 +1854,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        log_exception(get_run_logger(), "trainer.failed", "downstream trainer failed")
+        raise
