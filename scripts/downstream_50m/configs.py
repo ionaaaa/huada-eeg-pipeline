@@ -86,6 +86,7 @@ class FinetuneConfig:
     mlp_hidden_dim: int = 2048
     head_dropout: float = 0.2
     metric_for_best: str = "val_acc"
+    pooling: str = "mean"
 
     # Huada adapters. Full runs require an explicit subject split manifest.
     task: str = "sex_classification"

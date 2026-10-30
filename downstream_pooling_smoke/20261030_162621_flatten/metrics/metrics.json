@@ -1,0 +1,54 @@
+{
+  "excluded": [],
+  "metrics": {
+    "epoch": 1,
+    "smoke": true,
+    "train": {
+      "accuracy": 1.0,
+      "balanced_accuracy": null,
+      "confusion_matrix": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          2
+        ]
+      ],
+      "loss": 0.23209767043590546,
+      "macro_f1": null,
+      "metrics_not_statistically_meaningful": true,
+      "num_samples": 2
+    }
+  },
+  "sample_count": 2,
+  "split_subjects": {
+    "test": [],
+    "train": [
+      "SUB1"
+    ],
+    "validation": []
+  },
+  "subjects": [
+    "SUB1"
+  ],
+  "training_metadata": {
+    "d_model": 512,
+    "head_input_dim": 327680,
+    "head_lr": 0.0001,
+    "head_parameter_count": 655362,
+    "num_tokens": 640,
+    "optimizer_name": "SGD",
+    "optimizer_param_groups": [
+      {
+        "learning_rate": 0.0001,
+        "param_group_name": "head",
+        "parameter_count": 655362,
+        "weight_decay": 0.001
+      }
+    ],
+    "pooling": "flatten",
+    "weight_decay": 0.001
+  }
+}

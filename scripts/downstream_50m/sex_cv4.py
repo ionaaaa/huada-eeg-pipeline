@@ -283,6 +283,7 @@ def write_oof_artifacts(
     checkpoint_report_by_fold,
     head_input_dim,
     head_parameter_count,
+    training_metadata,
 ):
     output_dir = Path(output_dir)
     subject_test_folds = {
@@ -316,6 +317,8 @@ def write_oof_artifacts(
         "fold", "fold_seed", "num_windows", "num_subjects", "loss", "accuracy",
         "balanced_accuracy", "macro_f1", "confusion_matrix", "checkpoint_path",
         "checkpoint_sha256", "matched_key_count", "matched_parameter_fraction",
+        "pooling", "head_lr", "weight_decay", "optimizer_name",
+        "head_input_dim", "head_parameter_count",
     ]
     _write_csv(output_dir / "sex_cv4_per_fold_metrics.csv", per_fold_rows, per_fold_fields)
 
@@ -350,9 +353,14 @@ def write_oof_artifacts(
         "split_seed": split_payload["split_seed"],
         "num_subjects": len(subject_rows),
         "num_windows": len(window_rows),
-        "pooling": "masked_mean",
+        "pooling": training_metadata["pooling"],
+        "head_lr": float(training_metadata["head_lr"]),
+        "weight_decay": float(training_metadata["weight_decay"]),
+        "optimizer_name": training_metadata["optimizer_name"],
         "head_input_dim": int(head_input_dim),
         "head_parameter_count": int(head_parameter_count),
+        "num_tokens": int(training_metadata["num_tokens"]),
+        "d_model": int(training_metadata["d_model"]),
         "window_metrics": window_metrics,
         "subject_metrics": subject_metrics,
         "checkpoint_reports": checkpoint_report_by_fold,
@@ -366,7 +374,10 @@ def write_oof_artifacts(
         f"- folds: 4",
         f"- subjects: {len(subject_rows)}",
         f"- windows: {len(window_rows)}",
-        "- pooling: masked mean",
+        f"- pooling: {training_metadata['pooling']}",
+        f"- head_lr: {training_metadata['head_lr']}",
+        f"- weight_decay: {training_metadata['weight_decay']}",
+        f"- optimizer: {training_metadata['optimizer_name']}",
         f"- head: {head_input_dim} -> 2 ({head_parameter_count} parameters)", "",
         "Window-level 指标以窗口为统计单位；subject-level 指标以 8 名被试为统计单位。",
         "本任务以 subject-level OOF 结果为更重要结果。8 名被试仍是极小样本 pilot，",

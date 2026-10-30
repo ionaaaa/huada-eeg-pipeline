@@ -164,7 +164,7 @@ def test_masked_mean_pooling_contract():
     assert torch.allclose(pooled[0], embeddings[0].mean(dim=0))
     assert torch.allclose(pooled[1], embeddings[1, :3].mean(dim=0))
     assert pooled.shape == (2, 3)
-    assert not hasattr(model, "flatten_valid_tokens")
+    assert hasattr(model, "flatten_valid_tokens")
 
 
 def test_masked_values_and_all_false_mask_are_safe():
@@ -272,13 +272,15 @@ def test_small_sample_metrics_are_marked_unreliable():
     assert regression["r2_reliable"] is False
 
 
-def test_head_dimension_parameter_count_and_legacy_checkpoint_rejection(tmp_path):
+def test_head_dimension_parameter_count_and_pooling_checkpoint_rejection(tmp_path):
     model = EEGDownstreamClassifier(TinyBackbone(input_dim=4, d_model=512), 512, 2)
     assert model.head.in_features == 512
     assert sum(parameter.numel() for parameter in model.head.parameters()) == 1026
-    legacy_state = model.state_dict()
-    legacy_state["head.weight"] = torch.zeros(2, 640 * 512)
-    path = tmp_path / "legacy_flatten.pt"
-    torch.save({"model_state_dict": legacy_state}, path)
-    with pytest.raises(RuntimeError, match="Legacy flattened downstream head"):
+    path = tmp_path / "flatten.pt"
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "pooling": "flatten",
+        "head_input_dim": 512,
+    }, path)
+    with pytest.raises(RuntimeError, match="does not match requested pooling"):
         load_downstream_checkpoint_strict(model, path, torch.device("cpu"))

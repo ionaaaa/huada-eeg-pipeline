@@ -166,6 +166,10 @@ def test_write_oof_artifacts_has_all_required_files(tmp_path):
         tmp_path, payload, rows, per_fold, eligible,
         {str(index): {"matched_parameter_fraction": 1.0} for index in range(4)},
         512, 1026,
+        {
+            "pooling": "mean", "head_lr": 1e-3, "weight_decay": 1e-3,
+            "optimizer_name": "SGD", "num_tokens": 640, "d_model": 512,
+        },
     )
     required = {
         "sex_cv4_oof_window_predictions.csv", "sex_cv4_oof_subject_predictions.csv",
@@ -271,7 +275,15 @@ def test_cv4_orchestration_smoke_writes_fold_checkpoints_and_oof(monkeypatch, tm
             "matched_key_count": 100, "missing_keys": [], "unexpected_keys": [],
             "shape_mismatch_keys": [], "matched_parameter_fraction": 1.0,
         }
-        return object(), {"epochs": [], "test": metrics}, 8, report, predictions
+        training_metadata = {
+            "pooling": "mean", "head_lr": 1e-3, "weight_decay": 1e-3,
+            "optimizer_name": "SGD", "optimizer_param_groups": [],
+            "head_input_dim": 512, "head_parameter_count": 1026,
+            "num_tokens": 640, "d_model": 512,
+        }
+        return object(), {
+            "epochs": [], "test": metrics, "training_metadata": training_metadata,
+        }, 8, report, predictions
 
     monkeypatch.setattr(training, "run_one_checkpoint", fake_run)
     cfg = Config()
@@ -293,4 +305,4 @@ def test_cv4_orchestration_smoke_writes_fold_checkpoints_and_oof(monkeypatch, tm
         rows = list(csv.DictReader(handle))
     assert len(rows) == 8
     assert len({row["sample_id"] for row in rows}) == 8
-    assert json.loads((tmp_path / "sex_cv4_summary.json").read_text(encoding="utf-8"))["pooling"] == "masked_mean"
+    assert json.loads((tmp_path / "sex_cv4_summary.json").read_text(encoding="utf-8"))["pooling"] == "mean"

@@ -145,6 +145,9 @@ def parse_args(argv=None):
         default="legacy_single_split",
     )
     parser.add_argument("--folds", type=int, default=4)
+    parser.add_argument("--pooling", choices=["mean", "flatten"], default=None)
+    parser.add_argument("--head-lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--smoke-max-samples", type=int, default=4)
     parser.add_argument("--smoke-max-samples-per-subject", type=int, default=1)
@@ -170,6 +173,12 @@ def apply_cli_overrides(cfg, args):
     cfg.finetune.split_seed = args.split_seed
     cfg.finetune.protocol = args.protocol
     cfg.finetune.folds = args.folds
+    if args.pooling is not None:
+        cfg.finetune.pooling = args.pooling
+    if args.head_lr is not None:
+        cfg.finetune.head_lr = args.head_lr
+    if args.weight_decay is not None:
+        cfg.finetune.weight_decay = args.weight_decay
     cfg.finetune.smoke = args.smoke
     cfg.finetune.smoke_max_samples = args.smoke_max_samples
     cfg.finetune.smoke_max_samples_per_subject = args.smoke_max_samples_per_subject
@@ -177,6 +186,16 @@ def apply_cli_overrides(cfg, args):
     cfg.finetune.evaluate_only = args.evaluate
     cfg.finetune.num_classes = 2 if args.task == "sex_classification" else 1
     cfg.finetune.metric_for_best = "val_acc" if args.task == "sex_classification" else "val_loss"
+    validate_resolved_hyperparameters(cfg)
+
+
+def validate_resolved_hyperparameters(cfg):
+    if cfg.finetune.pooling not in {"mean", "flatten"}:
+        raise ValueError(f"Unsupported pooling: {cfg.finetune.pooling!r}")
+    if cfg.finetune.head_lr <= 0:
+        raise ValueError("head_lr must be > 0")
+    if cfg.finetune.weight_decay < 0:
+        raise ValueError("weight_decay must be >= 0")
 
 
 def setup_experiment_dir(cfg, overwrite=False):
@@ -230,14 +249,26 @@ class EEGDownstreamClassifier(nn.Module):
         use_mlp_head=False,
         mlp_hidden_dim=512,
         head_dropout=0.0,
+        pooling="mean",
+        num_tokens=None,
     ):
         super().__init__()
         self.backbone = backbone
         self.probe_layer_idx = probe_layer_idx
         self.freeze_backbone = freeze_backbone
+        self.pooling = str(pooling)
+        self.d_model = int(d_model)
+        self.num_tokens = None if num_tokens is None else int(num_tokens)
         for parameter in self.backbone.parameters():
             parameter.requires_grad = not freeze_backbone
-        head_input_dim = d_model
+        if self.pooling == "mean":
+            head_input_dim = self.d_model
+        elif self.pooling == "flatten":
+            if self.num_tokens is None or self.num_tokens <= 0:
+                raise ValueError("flatten pooling requires a positive num_tokens")
+            head_input_dim = self.num_tokens * self.d_model
+        else:
+            raise ValueError(f"Unsupported pooling: {self.pooling!r}")
         self.head_input_dim = int(head_input_dim)
         if use_mlp_head:
             self.head = nn.Sequential(
@@ -262,6 +293,20 @@ class EEGDownstreamClassifier(nn.Module):
         denom = valid_mask.sum(dim=1).clamp_min(1.0)
         return summed / denom
 
+    def flatten_valid_tokens(self, token_embeddings, token_valid_mask):
+        valid_mask = token_valid_mask.to(
+            device=token_embeddings.device,
+            dtype=token_embeddings.dtype,
+        ).unsqueeze(-1)
+        return (token_embeddings * valid_mask).flatten(start_dim=1)
+
+    def extract_features(self, token_embeddings, token_valid_mask):
+        if self.pooling == "mean":
+            return self.pool_valid_tokens(token_embeddings, token_valid_mask)
+        if self.pooling == "flatten":
+            return self.flatten_valid_tokens(token_embeddings, token_valid_mask)
+        raise ValueError(f"Unsupported pooling: {self.pooling!r}")
+
     def forward(self, token_inputs, token_channel_indices, token_time_indices, token_valid_mask):
         kwargs = {
             "token_inputs": token_inputs,
@@ -274,8 +319,8 @@ class EEGDownstreamClassifier(nn.Module):
                 token_embeddings = self.backbone.extract_token_embeddings(**kwargs)
         else:
             token_embeddings = self.backbone.extract_token_embeddings(**kwargs)
-        pooled = self.pool_valid_tokens(token_embeddings, token_valid_mask)
-        return self.head(pooled)
+        features = self.extract_features(token_embeddings, token_valid_mask)
+        return self.head(features)
 
 
 def compute_shape_params(cfg):
@@ -292,6 +337,24 @@ def compute_shape_params(cfg):
         "frames_per_patch": int(round(cfg.data.patch_seconds / cfg.data.target_frame_seconds)),
         "n_bands": len(cfg.data.band_defs),
     }
+
+
+def resolved_head_dimensions(cfg, shape_params):
+    if cfg.finetune.pooling == "mean":
+        input_dim = int(cfg.model.d_model)
+    elif cfg.finetune.pooling == "flatten":
+        input_dim = int(shape_params["num_tokens"]) * int(cfg.model.d_model)
+    else:
+        raise ValueError(f"Unsupported pooling: {cfg.finetune.pooling!r}")
+    if cfg.finetune.use_mlp_head:
+        parameter_count = (
+            input_dim * cfg.finetune.mlp_hidden_dim + cfg.finetune.mlp_hidden_dim
+            + cfg.finetune.mlp_hidden_dim * cfg.finetune.num_classes
+            + cfg.finetune.num_classes
+        )
+    else:
+        parameter_count = input_dim * cfg.finetune.num_classes + cfg.finetune.num_classes
+    return input_dim, int(parameter_count)
 
 
 def move_batch_to_device(batch, device):
@@ -496,40 +559,162 @@ def build_downstream_model(cfg, backbone, device, shape_params):
         use_mlp_head=cfg.finetune.use_mlp_head,
         mlp_hidden_dim=cfg.finetune.mlp_hidden_dim,
         head_dropout=cfg.finetune.head_dropout,
+        pooling=cfg.finetune.pooling,
+        num_tokens=shape_params["num_tokens"],
     ).to(device)
     return model, probe_layer_idx
 
 
+def head_parameter_count(model):
+    return sum(int(parameter.numel()) for parameter in model.head.parameters())
+
+
+def model_training_metadata(cfg, model, shape_params, optimizer_report=None):
+    return {
+        "pooling": model.pooling,
+        "head_lr": float(cfg.finetune.head_lr),
+        "weight_decay": float(cfg.finetune.weight_decay),
+        "optimizer_name": None if optimizer_report is None else optimizer_report["optimizer_name"],
+        "optimizer_param_groups": [] if optimizer_report is None else optimizer_report["param_groups"],
+        "head_input_dim": int(model.head_input_dim),
+        "head_parameter_count": head_parameter_count(model),
+        "num_tokens": int(shape_params["num_tokens"]),
+        "d_model": int(cfg.model.d_model),
+    }
+
+
+def _checkpoint_head_input_dim(state_dict):
+    candidates = [
+        value for key, value in state_dict.items()
+        if key.endswith("head.weight") or key.endswith("head.0.weight")
+    ]
+    if len(candidates) != 1 or candidates[0].ndim != 2:
+        raise RuntimeError("Cannot uniquely determine downstream head input dimension")
+    return int(candidates[0].shape[1])
+
+
+def _infer_checkpoint_pooling(model, head_input_dim):
+    candidates = []
+    if head_input_dim == model.d_model:
+        candidates.append("mean")
+    if model.num_tokens is not None and head_input_dim == model.num_tokens * model.d_model:
+        candidates.append("flatten")
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Cannot uniquely infer checkpoint pooling from head input dimension "
+            f"{head_input_dim}; expected mean={model.d_model}, "
+            f"flatten={model.num_tokens}*{model.d_model}"
+        )
+    return candidates[0]
+
+
 def load_downstream_checkpoint_strict(model, path, device):
-    """Load a pooled-head checkpoint and reject legacy flattened heads explicitly."""
+    """Load a downstream checkpoint with explicit/inferred pooling compatibility checks."""
     payload = torch.load(path, map_location=device, weights_only=False)
     if "model_state_dict" not in payload:
         raise RuntimeError("Downstream checkpoint has no model_state_dict")
     state_dict = strip_module_prefix(payload["model_state_dict"])
+    actual_head_input_dim = _checkpoint_head_input_dim(state_dict)
+    checkpoint_pooling = payload.get("pooling")
+    pooling_inferred = checkpoint_pooling is None
+    if pooling_inferred:
+        checkpoint_pooling = _infer_checkpoint_pooling(model, actual_head_input_dim)
+        print(
+            "Legacy downstream checkpoint has no pooling metadata; inferred "
+            f"pooling={checkpoint_pooling!r} from head_input_dim={actual_head_input_dim}."
+        )
+    elif checkpoint_pooling not in {"mean", "flatten"}:
+        raise RuntimeError(f"Invalid checkpoint pooling metadata: {checkpoint_pooling!r}")
+    metadata_head_input_dim = payload.get("head_input_dim")
+    if metadata_head_input_dim is not None and int(metadata_head_input_dim) != actual_head_input_dim:
+        raise RuntimeError(
+            "Checkpoint head_input_dim metadata does not match head weight shape: "
+            f"{metadata_head_input_dim} != {actual_head_input_dim}"
+        )
+    if checkpoint_pooling != model.pooling:
+        raise RuntimeError(
+            f"Checkpoint pooling {checkpoint_pooling!r} does not match requested pooling {model.pooling!r}"
+        )
+    if actual_head_input_dim != model.head_input_dim:
+        raise RuntimeError(
+            f"Checkpoint head_input_dim {actual_head_input_dim} does not match model {model.head_input_dim}"
+        )
     target = model.state_dict()
     mismatches = []
     for key in sorted(set(state_dict).intersection(target)):
         if tuple(state_dict[key].shape) != tuple(target[key].shape):
             mismatches.append((key, tuple(state_dict[key].shape), tuple(target[key].shape)))
     if mismatches:
-        legacy = [entry for entry in mismatches if entry[0].endswith("head.weight")]
         detail = ", ".join(f"{key}: {old} != {new}" for key, old, new in mismatches)
-        prefix = "Legacy flattened downstream head is incompatible with masked-mean pooling. " if legacy else ""
-        raise RuntimeError(prefix + "Checkpoint shape mismatch: " + detail)
+        raise RuntimeError("Checkpoint shape mismatch: " + detail)
     model.load_state_dict(state_dict, strict=True)
+    payload["_load_report"] = {
+        "pooling": checkpoint_pooling,
+        "pooling_inferred": pooling_inferred,
+        "head_input_dim": actual_head_input_dim,
+    }
     return payload
 
 
 def make_optimizer(cfg, model):
     if cfg.finetune.mode == "finetune":
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             [
-                {"params": model.backbone.parameters(), "lr": cfg.finetune.backbone_lr},
-                {"params": model.head.parameters(), "lr": cfg.finetune.head_lr},
+                {
+                    "params": model.backbone.parameters(), "name": "backbone",
+                    "lr": cfg.finetune.backbone_lr, "weight_decay": cfg.finetune.weight_decay,
+                },
+                {
+                    "params": model.head.parameters(), "name": "head",
+                    "lr": cfg.finetune.head_lr, "weight_decay": cfg.finetune.weight_decay,
+                },
             ],
             weight_decay=cfg.finetune.weight_decay,
         )
-    return torch.optim.SGD(model.head.parameters(), lr=cfg.finetune.head_lr)
+    else:
+        optimizer = torch.optim.SGD(
+            [{
+                "params": model.head.parameters(), "name": "head",
+                "lr": cfg.finetune.head_lr, "weight_decay": cfg.finetune.weight_decay,
+            }],
+            lr=cfg.finetune.head_lr,
+            weight_decay=cfg.finetune.weight_decay,
+        )
+    validate_optimizer_configuration(cfg, optimizer)
+    return optimizer
+
+
+def optimizer_configuration(optimizer):
+    return {
+        "optimizer_name": optimizer.__class__.__name__,
+        "param_groups": [
+            {
+                "param_group_name": str(group.get("name", f"group_{index}")),
+                "learning_rate": float(group["lr"]),
+                "weight_decay": float(group["weight_decay"]),
+                "parameter_count": sum(int(parameter.numel()) for parameter in group["params"]),
+            }
+            for index, group in enumerate(optimizer.param_groups)
+        ],
+    }
+
+
+def validate_optimizer_configuration(cfg, optimizer):
+    report = optimizer_configuration(optimizer)
+    groups = {group["param_group_name"]: group for group in report["param_groups"]}
+    if "head" not in groups:
+        raise RuntimeError("Optimizer has no named head parameter group")
+    head = groups["head"]
+    if not math.isclose(head["learning_rate"], float(cfg.finetune.head_lr)):
+        raise RuntimeError("Optimizer head learning rate does not match resolved head_lr")
+    if not math.isclose(head["weight_decay"], float(cfg.finetune.weight_decay)):
+        raise RuntimeError("Optimizer head weight decay does not match resolved weight_decay")
+    if cfg.finetune.mode == "finetune":
+        if "backbone" not in groups:
+            raise RuntimeError("Finetune optimizer has no named backbone parameter group")
+        if not math.isclose(groups["backbone"]["learning_rate"], float(cfg.finetune.backbone_lr)):
+            raise RuntimeError("Optimizer backbone learning rate does not match backbone_lr")
+    return report
 
 
 def make_criterion(task):
@@ -679,7 +864,11 @@ def evaluate_sex_test_once(model, loader, criterion, device, fold, checkpoint_pa
     return metrics, rows
 
 
-def save_downstream_checkpoint(path, model, cfg, shape_params, probe_layer_idx, epoch, metrics, checkpoint_report):
+def save_downstream_checkpoint(
+    path, model, cfg, shape_params, probe_layer_idx, epoch, metrics,
+    checkpoint_report, optimizer_report,
+):
+    training_metadata = model_training_metadata(cfg, model, shape_params, optimizer_report)
     payload = {
         "model_state_dict": model.state_dict(),
         "head_state_dict": model.head.state_dict(),
@@ -695,6 +884,13 @@ def save_downstream_checkpoint(path, model, cfg, shape_params, probe_layer_idx, 
         "shape_params": shape_params,
         "epoch": epoch,
         "metrics": metrics,
+        "pooling": training_metadata["pooling"],
+        "head_input_dim": training_metadata["head_input_dim"],
+        "head_parameter_count": training_metadata["head_parameter_count"],
+        "head_lr": training_metadata["head_lr"],
+        "weight_decay": training_metadata["weight_decay"],
+        "optimizer_name": training_metadata["optimizer_name"],
+        "optimizer_param_groups": training_metadata["optimizer_param_groups"],
         "upstream": {"url": UPSTREAM_URL, "branch": UPSTREAM_BRANCH, "commit": UPSTREAM_COMMIT},
     }
     temporary = str(path) + ".tmp"
@@ -734,6 +930,9 @@ def run_one_checkpoint(
         return model, {"test": test_metrics}, probe_layer_idx, checkpoint_report, []
 
     optimizer = make_optimizer(cfg, model)
+    optimizer_report = optimizer_configuration(optimizer)
+    training_metadata = model_training_metadata(cfg, model, shape_params, optimizer_report)
+    print(json.dumps({"resolved_downstream": training_metadata}, ensure_ascii=False))
     best_score = -float("inf")
     best_payload = None
     epoch_rows = []
@@ -747,7 +946,7 @@ def run_one_checkpoint(
             best_score = score
             best_payload = save_downstream_checkpoint(
                 cfg.finetune.save_path, model, cfg, shape_params, probe_layer_idx,
-                epoch + 1, epoch_metrics, checkpoint_report,
+                epoch + 1, epoch_metrics, checkpoint_report, optimizer_report,
             )
     if best_payload is None:
         raise RuntimeError("No best checkpoint was produced")
@@ -768,7 +967,10 @@ def run_one_checkpoint(
     temporary = cfg.finetune.save_path + ".tmp"
     torch.save(best_payload, temporary)
     os.replace(temporary, cfg.finetune.save_path)
-    return model, {"epochs": epoch_rows, "test": test_metrics}, probe_layer_idx, checkpoint_report, test_predictions
+    return model, {
+        "epochs": epoch_rows, "test": test_metrics,
+        "training_metadata": training_metadata,
+    }, probe_layer_idx, checkpoint_report, test_predictions
 
 
 def run_smoke(cfg, shape_params, device):
@@ -780,6 +982,9 @@ def run_smoke(cfg, shape_params, device):
     model, probe_layer_idx = build_downstream_model(cfg, backbone, device, shape_params)
     criterion = make_criterion(cfg.finetune.task)
     optimizer = make_optimizer(cfg, model)
+    optimizer_report = optimizer_configuration(optimizer)
+    training_metadata = model_training_metadata(cfg, model, shape_params, optimizer_report)
+    print(json.dumps({"resolved_downstream": training_metadata}, ensure_ascii=False))
     metrics = run_epoch(
         model, loader, criterion, device, cfg.finetune.task, optimizer=optimizer, smoke=True
     )
@@ -787,7 +992,7 @@ def run_smoke(cfg, shape_params, device):
     checkpoint_metrics = {"epoch": 1, "train": metrics, "smoke": True}
     save_downstream_checkpoint(
         cfg.finetune.save_path, model, cfg, shape_params, probe_layer_idx,
-        1, checkpoint_metrics, checkpoint_report,
+        1, checkpoint_metrics, checkpoint_report, optimizer_report,
     )
     return {
         "metrics": checkpoint_metrics,
@@ -795,7 +1000,8 @@ def run_smoke(cfg, shape_params, device):
         "subjects": subjects,
         "split_subjects": {"train": subjects, "validation": [], "test": []},
         "excluded": ([{"subject_id": "SUB5", "reason": "age_missing"}]
-                     if cfg.finetune.task == "age_regression" else []),
+                      if cfg.finetune.task == "age_regression" else []),
+        "training_metadata": training_metadata,
     }, checkpoint_report
 
 
@@ -852,8 +1058,7 @@ def run_sex_cv4(cfg, shape_params, device, run_dir):
     checkpoint_reports = {}
     subject_test_folds = {}
     fold_results = []
-    head_input_dim = int(cfg.model.d_model)
-    head_parameter_count = head_input_dim * 2 + 2
+    head_input_dim, expected_head_parameter_count = resolved_head_dimensions(cfg, shape_params)
 
     for fold_info in split_payload["folds"]:
         fold = int(fold_info["fold"])
@@ -906,6 +1111,11 @@ def run_sex_cv4(cfg, shape_params, device, run_dir):
         for subject in fold_info["test_subjects"]:
             subject_test_folds[subject] = fold
         test_metrics = metrics["test"]
+        training_metadata = metrics["training_metadata"]
+        if training_metadata["head_input_dim"] != head_input_dim:
+            raise RuntimeError("Fold head_input_dim does not match resolved pooling")
+        if training_metadata["head_parameter_count"] != expected_head_parameter_count:
+            raise RuntimeError("Fold head parameter count does not match resolved configuration")
         per_fold_rows.append({
             "fold": fold,
             "fold_seed": fold_seed,
@@ -920,6 +1130,12 @@ def run_sex_cv4(cfg, shape_params, device, run_dir):
             "checkpoint_sha256": downstream_sha256,
             "matched_key_count": checkpoint_report["matched_key_count"],
             "matched_parameter_fraction": checkpoint_report["matched_parameter_fraction"],
+            "pooling": training_metadata["pooling"],
+            "head_lr": training_metadata["head_lr"],
+            "weight_decay": training_metadata["weight_decay"],
+            "optimizer_name": training_metadata["optimizer_name"],
+            "head_input_dim": training_metadata["head_input_dim"],
+            "head_parameter_count": training_metadata["head_parameter_count"],
         })
         fold_result = {
             "fold": fold,
@@ -927,6 +1143,7 @@ def run_sex_cv4(cfg, shape_params, device, run_dir):
             "split_subjects": {key: sorted(value) for key, value in split_subjects.items()},
             "metrics": metrics,
             "checkpoint_report": checkpoint_report,
+            "training_metadata": training_metadata,
         }
         json_dump(metrics_dir / "fold_result.json", fold_result)
         fold_results.append(fold_result)
@@ -941,7 +1158,15 @@ def run_sex_cv4(cfg, shape_params, device, run_dir):
         eligible_samples,
         checkpoint_reports,
         head_input_dim,
-        head_parameter_count,
+        expected_head_parameter_count,
+        {
+            "pooling": cfg.finetune.pooling,
+            "head_lr": float(cfg.finetune.head_lr),
+            "weight_decay": float(cfg.finetune.weight_decay),
+            "optimizer_name": "SGD" if cfg.finetune.mode == "linear_probe" else "AdamW",
+            "num_tokens": int(shape_params["num_tokens"]),
+            "d_model": int(cfg.model.d_model),
+        },
     )
     summary["smoke"] = bool(cfg.finetune.smoke)
     summary["fold_seeds"] = [int(cfg.finetune.seed) + fold for fold in range(4)]
@@ -956,10 +1181,24 @@ def run_sex_cv4(cfg, shape_params, device, run_dir):
         "split_subjects": split_payload["folds"],
         "excluded": [],
         "fold_results": fold_results,
+        "training_metadata": fold_results[0]["training_metadata"],
     }, checkpoint_reports
 
 
 def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_before, source_after):
+    shape_params = compute_shape_params(cfg)
+    resolved_input_dim, resolved_parameter_count = resolved_head_dimensions(cfg, shape_params)
+    training_metadata = result.get("training_metadata") or {
+        "pooling": cfg.finetune.pooling,
+        "head_lr": float(cfg.finetune.head_lr),
+        "weight_decay": float(cfg.finetune.weight_decay),
+        "optimizer_name": None,
+        "optimizer_param_groups": [],
+        "head_input_dim": resolved_input_dim,
+        "head_parameter_count": resolved_parameter_count,
+        "num_tokens": shape_params["num_tokens"],
+        "d_model": cfg.model.d_model,
+    }
     config_payload = {
         "config": asdict(cfg),
         "cli_args": vars(args),
@@ -970,6 +1209,7 @@ def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_
         if config_payload["cli_args"].get(key) is not None:
             config_payload["cli_args"][key] = str(config_payload["cli_args"][key])
     json_dump(run_dir / "experiment_config.json", config_payload)
+    json_dump(run_dir / "config.json", config_payload)
     json_dump(run_dir / "metrics" / "metrics.json", result)
     provenance = {
         "created_at": datetime.now().astimezone().isoformat(),
@@ -994,13 +1234,31 @@ def write_outputs(run_dir, cfg, args, result, checkpoint_report, schema, source_
             "lance": lance.__version__, "pyarrow": pyarrow.__version__,
         },
         "protocol": cfg.finetune.protocol,
-        "pooling": "masked_mean",
-        "head_input_dim": cfg.model.d_model,
-        "head_parameter_count": cfg.model.d_model * cfg.finetune.num_classes + cfg.finetune.num_classes,
-        "mask_application": "masked mean over token embeddings; invalid tokens are excluded from numerator and denominator",
+        "pooling": training_metadata["pooling"],
+        "head_lr": training_metadata["head_lr"],
+        "weight_decay": training_metadata["weight_decay"],
+        "optimizer_name": training_metadata["optimizer_name"],
+        "optimizer_param_groups": training_metadata["optimizer_param_groups"],
+        "head_input_dim": training_metadata["head_input_dim"],
+        "head_parameter_count": training_metadata["head_parameter_count"],
+        "num_tokens": training_metadata["num_tokens"],
+        "d_model": training_metadata["d_model"],
+        "mask_application": (
+            "masked mean excludes invalid tokens from numerator and denominator"
+            if cfg.finetune.pooling == "mean"
+            else "masked flatten zeros invalid token embeddings before preserving token order"
+        ),
         "scheduler": None,
     }
     json_dump(run_dir / "run_provenance.json", provenance)
+    json_dump(run_dir / "processing_provenance.json", provenance)
+    json_dump(run_dir / "summary.json", {
+        "task": cfg.finetune.task,
+        "protocol": cfg.finetune.protocol,
+        "smoke": bool(cfg.finetune.smoke),
+        **training_metadata,
+        "metrics": result.get("metrics"),
+    })
     return provenance
 
 
@@ -1047,6 +1305,7 @@ def main(argv=None):
         )
         result = {
             "metrics": metrics,
+            "training_metadata": metrics.get("training_metadata"),
             "sample_count": {
                 "train": len(train_set), "validation": len(val_set), "test": len(test_set)
             },

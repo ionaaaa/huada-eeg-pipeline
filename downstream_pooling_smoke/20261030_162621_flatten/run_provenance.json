@@ -1,0 +1,125 @@
+{
+  "actual_command": "D:\\miniconda\\python.exe D:\\repo\\华大\\scripts\\downstream_50m\\largeScale_fineTune.py --input-lance D:\\repo\\华大\\model_tokens_smoke\\20261030_134527\\huada_model_tokens.lance --task sex_classification --protocol legacy_single_split --pooling flatten --head-lr 1e-4 --weight-decay 1e-3 --output-dir D:\\repo\\华大\\downstream_pooling_smoke\\20261030_162621_flatten --device cpu --mode linear_probe --epochs 1 --batch-size 2 --seed 42 --split-seed 42 --smoke --smoke-max-samples 2 --allow-random-init-smoke",
+  "checkpoint": {
+    "checkpoint_path": null,
+    "checkpoint_sha256": null,
+    "matched_key_count": 0,
+    "matched_parameter_fraction": 0.0,
+    "missing_keys": [],
+    "random_init": true,
+    "shape_mismatch_keys": [],
+    "strict": false,
+    "unexpected_keys": []
+  },
+  "created_at": "2026-10-30T16:26:28.434580+08:00",
+  "d_model": 512,
+  "excluded": [],
+  "head_input_dim": 327680,
+  "head_lr": 0.0001,
+  "head_parameter_count": 655362,
+  "input_lance": "D:\\repo\\华大\\model_tokens_smoke\\20261030_134527\\huada_model_tokens.lance",
+  "input_lance_schema": "num_tokens: int64 not null\npatch_len: int64 not null\nn_bands: int64 not null\nframes_per_patch: int64 not null\nn_channels: int64 not null\nnum_patches: int64 not null\ntoken_inputs: fixed_size_list<item: float>[64000] not null\n  child 0, item: float\ntargets: fixed_size_list<item: float>[16000] not null\n  child 0, item: float\ntoken_channel_indices: fixed_size_list<item: int64>[640] not null\n  child 0, item: int64\ntoken_time_indices: fixed_size_list<item: int64>[640] not null\n  child 0, item: int64\ntoken_valid_mask: fixed_size_list<item: float>[640] not null\n  child 0, item: float\nchannel_valid_mask: fixed_size_list<item: float>[64] not null\n  child 0, item: float\nsample_id: string not null\nsubject_id: string not null\nsource_path: string not null\nrecording_id: string not null\nwindow_index: int64 not null\nstart_time: double not null\nqc_pass: bool not null\nage: int64\nsex: string not null\nvalid_channel_count: int64 not null\nsource_sfreq: float not null\nmodel_sfreq: float not null\nmodel_preprocessing_version: string not null\nsource_preprocessing_config_hash: string not null",
+  "input_snapshot_after": {
+    "files": [
+      {
+        "mtime_ns": 1793339129232475500,
+        "path": "_transactions/0-116addba-76aa-48ed-8740-5f2399595017.txn",
+        "size": 1309
+      },
+      {
+        "mtime_ns": 1793339129232475500,
+        "path": "_versions/18446744073709551614.manifest",
+        "size": 2695
+      },
+      {
+        "mtime_ns": 1793339129234475300,
+        "path": "_versions/latest_version_hint.json",
+        "size": 13
+      },
+      {
+        "mtime_ns": 1793339129231475900,
+        "path": "data/011110011100111010011100f0363c4599ad73101dee95d6c4.lance",
+        "size": 1338092
+      }
+    ],
+    "manifest_sha256": "8a76a1a63e4c0aedf7019d5e83b61eaaa04381f4dddb0aa23be37dacea6fe286"
+  },
+  "input_snapshot_before": {
+    "files": [
+      {
+        "mtime_ns": 1793339129232475500,
+        "path": "_transactions/0-116addba-76aa-48ed-8740-5f2399595017.txn",
+        "size": 1309
+      },
+      {
+        "mtime_ns": 1793339129232475500,
+        "path": "_versions/18446744073709551614.manifest",
+        "size": 2695
+      },
+      {
+        "mtime_ns": 1793339129234475300,
+        "path": "_versions/latest_version_hint.json",
+        "size": 13
+      },
+      {
+        "mtime_ns": 1793339129231475900,
+        "path": "data/011110011100111010011100f0363c4599ad73101dee95d6c4.lance",
+        "size": 1338092
+      }
+    ],
+    "manifest_sha256": "8a76a1a63e4c0aedf7019d5e83b61eaaa04381f4dddb0aa23be37dacea6fe286"
+  },
+  "input_unchanged": true,
+  "label_mapping": {
+    "female": 0,
+    "male": 1
+  },
+  "mask_application": "masked flatten zeros invalid token embeddings before preserving token order",
+  "model_config": {
+    "d_model": 512,
+    "depth": 12,
+    "dropout": 0.1,
+    "mlp_ratio": 4.0,
+    "n_heads": 8
+  },
+  "num_tokens": 640,
+  "optimizer_name": "SGD",
+  "optimizer_param_groups": [
+    {
+      "learning_rate": 0.0001,
+      "param_group_name": "head",
+      "parameter_count": 655362,
+      "weight_decay": 0.001
+    }
+  ],
+  "pooling": "flatten",
+  "project_git": {
+    "branch": "main",
+    "commit": "6c8a5676cb6d841e6fdcce35125d998ef94197ed",
+    "dirty": true
+  },
+  "protocol": "legacy_single_split",
+  "scheduler": null,
+  "smoke": true,
+  "split_seed": 42,
+  "split_subjects": {
+    "test": [],
+    "train": [
+      "SUB1"
+    ],
+    "validation": []
+  },
+  "task": "sex_classification",
+  "upstream_50m": {
+    "branch": "main",
+    "commit": "0f102b10ac885df759f1d7052a36669c7412c5e6",
+    "url": "https://github.com/ionaaaa/50M_Model"
+  },
+  "versions": {
+    "lance": "13.0.0",
+    "pyarrow": "25.0.1",
+    "python": "3.14.7",
+    "torch": "2.11.0+cu128"
+  },
+  "weight_decay": 0.001
+}
