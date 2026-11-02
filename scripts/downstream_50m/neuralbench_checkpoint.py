@@ -1,4 +1,4 @@
-"""Fail-closed loader for the authoritative NeuralBench sex checkpoint.
+"""Fail-closed loaders for authoritative NeuralBench full checkpoints.
 
 The source checkpoint is a Lightning checkpoint whose model tensors live below
 ``state_dict``.  Mapping is intentionally exact: suffix matching and partial
@@ -19,11 +19,15 @@ import torch
 DEFAULT_NEURALBENCH_SEX_SHA256 = (
     "56284992271d8cf0245bb6cc28f6098daf569d1188923196bfdd3d090a60342f"
 )
+DEFAULT_NEURALBENCH_HBN_AGE_SHA256 = (
+    "a3438f5b13af4bb3a146e1c84f6ebdba22477d74046170825b98b2ef1be98b1d"
+)
 SOURCE_BACKBONE_PREFIX = "model.wrapped_model.backbone."
 SOURCE_PROBE_WEIGHT = "model.probe.weight"
 SOURCE_PROBE_BIAS = "model.probe.bias"
 ALLOWED_IGNORED_STATE_KEYS = frozenset({"loss.weight"})
 KEY_REMAP_VERSION = "neuralbench-sex-explicit-v1"
+AGE_KEY_REMAP_VERSION = "neuralbench-hbn-age-explicit-v1"
 
 
 class NeuralBenchCheckpointError(RuntimeError):
@@ -84,8 +88,12 @@ def safe_load_neuralbench_checkpoint(
 
 
 def _component(source_key: str) -> str:
+    return _component_for_probe(source_key, "downstream_sex_probe")
+
+
+def _component_for_probe(source_key: str, probe_component: str) -> str:
     if source_key in (SOURCE_PROBE_WEIGHT, SOURCE_PROBE_BIAS):
-        return "downstream_sex_probe"
+        return probe_component
     if source_key == "loss.weight":
         return "loss_class_weight_buffer"
     if source_key.startswith(SOURCE_BACKBONE_PREFIX):
@@ -129,21 +137,95 @@ def remap_neuralbench_sex_checkpoint(
     downstream sex head.
     """
 
+    mapped, mapping_rows, summary = _remap_neuralbench_checkpoint(
+        source_state,
+        target_state,
+        probe_weight_shape=(2, 512),
+        probe_bias_shape=(2,),
+        probe_name="sex",
+        probe_component="downstream_sex_probe",
+        key_remap_version=KEY_REMAP_VERSION,
+        allowed_ignored_state_keys=ALLOWED_IGNORED_STATE_KEYS,
+        expected_backbone_tensor_count=None,
+        require_all_float_tensors_finite=False,
+    )
+    # Preserve the established sex zero-shot summary schema exactly.
+    for field in (
+        "source_backbone_tensor_count",
+        "source_probe_tensor_count",
+        "all_float_tensors_finite",
+    ):
+        summary.pop(field, None)
+    return mapped, mapping_rows, summary
+
+
+def remap_neuralbench_hbn_age_checkpoint(
+    source_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+    *,
+    expected_backbone_tensor_count: int = 154,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], dict[str, Any]]:
+    """Strictly map the audited HBN age full-finetune checkpoint.
+
+    The age source has exactly 154 backbone tensors and two exact regression
+    probe tensors.  Unlike the sex source, it has no allowed class-weight
+    buffer or other ignored state.
+    """
+
+    return _remap_neuralbench_checkpoint(
+        source_state,
+        target_state,
+        probe_weight_shape=(1, 512),
+        probe_bias_shape=(1,),
+        probe_name="age",
+        probe_component="downstream_age_probe",
+        key_remap_version=AGE_KEY_REMAP_VERSION,
+        allowed_ignored_state_keys=frozenset(),
+        expected_backbone_tensor_count=int(expected_backbone_tensor_count),
+        require_all_float_tensors_finite=True,
+    )
+
+
+def _remap_neuralbench_checkpoint(
+    source_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+    *,
+    probe_weight_shape: tuple[int, ...],
+    probe_bias_shape: tuple[int, ...],
+    probe_name: str,
+    probe_component: str,
+    key_remap_version: str,
+    allowed_ignored_state_keys: frozenset[str],
+    expected_backbone_tensor_count: int | None,
+    require_all_float_tensors_finite: bool,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], dict[str, Any]]:
+    """Shared exact remap engine; task wrappers define the probe contract."""
+
     source = {str(key): value for key, value in source_state.items()}
     target = {str(key): value for key, value in target_state.items()}
     required_probe = {SOURCE_PROBE_WEIGHT, SOURCE_PROBE_BIAS}
     missing_probe = sorted(required_probe.difference(source))
     if missing_probe:
         raise NeuralBenchCheckpointError(
-            "Checkpoint is missing required sex probe keys: " + ", ".join(missing_probe)
+            f"Checkpoint is missing required {probe_name} probe keys: " + ", ".join(missing_probe)
         )
-    if tuple(source[SOURCE_PROBE_WEIGHT].shape) != (2, 512):
-        raise NeuralBenchCheckpointError("model.probe.weight must have shape [2,512]")
-    if tuple(source[SOURCE_PROBE_BIAS].shape) != (2,):
-        raise NeuralBenchCheckpointError("model.probe.bias must have shape [2]")
+    if tuple(source[SOURCE_PROBE_WEIGHT].shape) != probe_weight_shape:
+        shape = "[" + ",".join(str(value) for value in probe_weight_shape) + "]"
+        raise NeuralBenchCheckpointError(f"model.probe.weight must have shape {shape}")
+    if tuple(source[SOURCE_PROBE_BIAS].shape) != probe_bias_shape:
+        shape = "[" + ",".join(str(value) for value in probe_bias_shape) + "]"
+        raise NeuralBenchCheckpointError(f"model.probe.bias must have shape {shape}")
     backbone_keys = [key for key in source if key.startswith(SOURCE_BACKBONE_PREFIX)]
     if not backbone_keys:
         raise NeuralBenchCheckpointError("Checkpoint contains no NeuralBench backbone tensors")
+    if (
+        expected_backbone_tensor_count is not None
+        and len(backbone_keys) != expected_backbone_tensor_count
+    ):
+        raise NeuralBenchCheckpointError(
+            "NeuralBench backbone tensor count mismatch: "
+            f"expected={expected_backbone_tensor_count}, actual={len(backbone_keys)}"
+        )
 
     mapped: dict[str, torch.Tensor] = {}
     rows: list[dict[str, Any]] = []
@@ -153,12 +235,19 @@ def remap_neuralbench_sex_checkpoint(
     }
     for source_key in sorted(source):
         source_tensor = source[source_key]
-        component = _component(source_key)
+        component = _component_for_probe(source_key, probe_component)
         target_key = _target_key(source_key)
         target_tensor = target.get(target_key) if target_key is not None else None
         status = "matched"
         reason = "explicit key remap; exact shape and dtype"
-        if source_key in ALLOWED_IGNORED_STATE_KEYS:
+        if (
+            require_all_float_tensors_finite
+            and (source_tensor.is_floating_point() or source_tensor.is_complex())
+            and not torch.isfinite(source_tensor).all().item()
+        ):
+            status, reason = "non_finite", "source floating tensor contains non-finite values"
+            failures.append(f"{source_key}: {reason}")
+        elif source_key in allowed_ignored_state_keys:
             if tuple(source_tensor.shape) != (2,) or not source_tensor.dtype.is_floating_point:
                 status, reason = "invalid_ignored", "loss.weight must be floating point with shape [2]"
                 failures.append(f"{source_key}: {reason}")
@@ -236,7 +325,10 @@ def remap_neuralbench_sex_checkpoint(
     full = stats("full_backbone", full_target_keys)
     probe = stats("probe", probe_target_keys)
     summary = {
-        "key_remap_version": KEY_REMAP_VERSION,
+        "key_remap_version": key_remap_version,
+        "source_backbone_tensor_count": len(backbone_keys),
+        "source_probe_tensor_count": sum(key in source for key in required_probe),
+        "all_float_tensors_finite": not any(row["status"] == "non_finite" for row in rows),
         "core_backbone": core,
         "full_backbone": full,
         "probe": probe,
@@ -246,9 +338,9 @@ def remap_neuralbench_sex_checkpoint(
         "full_backbone_parameter_match_fraction": full["parameter_match_fraction"],
         "probe_key_match_fraction": probe["key_match_fraction"],
         "probe_parameter_match_fraction": probe["parameter_match_fraction"],
-        "ignored_source_keys": sorted(key for key in source if key in ALLOWED_IGNORED_STATE_KEYS),
+        "ignored_source_keys": sorted(key for key in source if key in allowed_ignored_state_keys),
         "unexplained_source_keys": sorted(
-            key for key in source if _target_key(key) is None and key not in ALLOWED_IGNORED_STATE_KEYS
+            key for key in source if _target_key(key) is None and key not in allowed_ignored_state_keys
         ),
         "missing_target_keys": missing_targets,
     }
@@ -291,6 +383,46 @@ def load_neuralbench_sex_model_state(
             raise NeuralBenchCheckpointError(f"Loaded model tensor differs from checkpoint for key {key}")
     summary["all_model_state_tensors_from_checkpoint"] = True
     summary["random_materialized_parameter_count"] = 0
+    return checkpoint, file_info, rows, summary
+
+
+def load_neuralbench_hbn_age_model_state(
+    model: torch.nn.Module,
+    checkpoint_path: str | Path,
+    expected_sha256: str,
+    *,
+    expected_backbone_tensor_count: int = 154,
+) -> tuple[Mapping[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Safely load and strictly populate an HBN age zero-shot model."""
+
+    checkpoint, file_info = safe_load_neuralbench_checkpoint(checkpoint_path, expected_sha256)
+    mapped, rows, summary = remap_neuralbench_hbn_age_checkpoint(
+        checkpoint["state_dict"],
+        model.state_dict(),
+        expected_backbone_tensor_count=expected_backbone_tensor_count,
+    )
+    try:
+        incompatible = model.load_state_dict(mapped, strict=True, assign=True)
+    except TypeError as exc:  # pragma: no cover - guards unsupported old PyTorch
+        raise NeuralBenchCheckpointError("PyTorch with load_state_dict(assign=True) is required") from exc
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise NeuralBenchCheckpointError("Strict model load reported incompatible keys")
+    loaded = model.state_dict()
+    for key, source_tensor in mapped.items():
+        value = loaded[key].detach().cpu()
+        if (
+            value.dtype != source_tensor.dtype
+            or value.shape != source_tensor.shape
+            or not torch.equal(value, source_tensor)
+        ):
+            raise NeuralBenchCheckpointError(
+                f"Loaded model tensor differs from checkpoint for key {key}"
+            )
+    summary["all_model_state_tensors_from_checkpoint"] = True
+    summary["random_materialized_parameter_count"] = 0
+    summary["age_probe_parameter_count"] = int(
+        mapped["head.weight"].numel() + mapped["head.bias"].numel()
+    )
     return checkpoint, file_info, rows, summary
 
 

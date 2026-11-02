@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import logging
 import math
 import os
-import subprocess
 import sys
 import time
 import traceback
@@ -32,7 +30,6 @@ try:  # package import in tests
     from .dataset import collate_fn
     from .lance_dataset import LanceEEGPretrainDataset
     from .largeScale_fineTune import EEGDownstreamClassifier
-    from .model import EEGPretrainModel
     from .neuralbench_checkpoint import (
         DEFAULT_NEURALBENCH_SEX_SHA256,
         KEY_REMAP_VERSION,
@@ -40,18 +37,33 @@ try:  # package import in tests
         verify_checkpoint_sha256,
         write_checkpoint_key_mapping,
     )
+    from .neuralbench_zero_shot_common import (
+        build_meta_zero_shot_model as _build_common_meta_model,
+        cuda_allocated_mb as _cuda_allocated_mb,
+        git_info as _git_info,
+        model_state_fingerprint,
+        path_content_fingerprint,
+        sample_id_fingerprint,
+    )
     from .sex_cv4 import aggregate_subject_predictions, binary_classification_metrics
 except ImportError:  # direct ``python scripts/...py`` execution
     from dataset import collate_fn
     from lance_dataset import LanceEEGPretrainDataset
     from largeScale_fineTune import EEGDownstreamClassifier
-    from model import EEGPretrainModel
     from neuralbench_checkpoint import (
         DEFAULT_NEURALBENCH_SEX_SHA256,
         KEY_REMAP_VERSION,
         load_neuralbench_sex_model_state,
         verify_checkpoint_sha256,
         write_checkpoint_key_mapping,
+    )
+    from neuralbench_zero_shot_common import (
+        build_meta_zero_shot_model as _build_common_meta_model,
+        cuda_allocated_mb as _cuda_allocated_mb,
+        git_info as _git_info,
+        model_state_fingerprint,
+        path_content_fingerprint,
+        sample_id_fingerprint,
     )
     from sex_cv4 import aggregate_subject_predictions, binary_classification_metrics
 
@@ -204,88 +216,9 @@ def build_meta_zero_shot_model() -> EEGDownstreamClassifier:
     """Create structure on ``meta`` so no random parameter value is materialized."""
 
     assert_authoritative_contract()
-    with torch.device("meta"):
-        backbone = EEGPretrainModel(
-            input_dim=100,
-            d_model=FEATURE_DIM,
-            n_heads=8,
-            depth=12,
-            mlp_ratio=4.0,
-            dropout=0.1,
-            n_channels=64,
-            n_time_patches=10,
-            n_bands=5,
-            frames_per_patch=5,
-            objective="timefreq",
-        )
-        model = EEGDownstreamClassifier(
-            backbone=backbone,
-            d_model=FEATURE_DIM,
-            num_classes=NUM_CLASSES,
-            probe_layer_idx=PROBE_LAYER_IDX,
-            freeze_backbone=False,
-            use_mlp_head=False,
-            head_dropout=0.0,
-            pooling=POOLING,
-            num_tokens=640,
-        )
+    model = _build_common_meta_model(NUM_CLASSES)
     assert_authoritative_contract(model)
     return model
-
-
-def model_state_fingerprint(model: torch.nn.Module) -> str:
-    digest = hashlib.sha256()
-    for key, tensor in sorted(model.state_dict().items()):
-        value = tensor.detach().cpu().contiguous()
-        digest.update(key.encode("utf-8"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
-
-
-def path_content_fingerprint(path: str | Path) -> str:
-    """Hash a Lance file or directory without following external paths."""
-
-    root = Path(path)
-    if not root.exists():
-        raise FileNotFoundError(f"Input Lance does not exist: {root}")
-    files = [root] if root.is_file() else sorted(item for item in root.rglob("*") if item.is_file())
-    digest = hashlib.sha256()
-    for item in files:
-        relative = item.name if root.is_file() else item.relative_to(root).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(str(item.stat().st_size).encode("ascii"))
-        with item.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    return digest.hexdigest()
-
-
-def sample_id_fingerprint(sample_ids: Sequence[str]) -> str:
-    digest = hashlib.sha256()
-    for sample_id in sample_ids:
-        digest.update(str(sample_id).encode("utf-8"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def _git_info(root: Path) -> dict[str, Any]:
-    def command(*parts: str) -> str:
-        result = subprocess.run(
-            ["git", *parts], cwd=root, check=True, capture_output=True, text=True
-        )
-        return result.stdout.strip()
-    try:
-        return {"commit": command("rev-parse", "HEAD"), "dirty": bool(command("status", "--porcelain"))}
-    except (OSError, subprocess.CalledProcessError):
-        return {"commit": None, "dirty": None}
-
-
-def _cuda_allocated_mb(device: torch.device) -> float:
-    if device.type != "cuda":
-        return 0.0
-    return float(torch.cuda.memory_allocated(device) / (1024 * 1024))
 
 
 def run_zero_shot_inference(
