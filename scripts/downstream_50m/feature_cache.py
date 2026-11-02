@@ -95,6 +95,18 @@ def masked_pool_both(token_embeddings, token_valid_mask):
     return mean_features, flatten_features
 
 
+def masked_mean_pool(token_embeddings, token_valid_mask):
+    """The shared masked-mean representation, always materialized as float32."""
+    embeddings = token_embeddings.to(dtype=torch.float32)
+    valid_mask = token_valid_mask.to(
+        device=embeddings.device, dtype=embeddings.dtype,
+    ).unsqueeze(-1)
+    result = (embeddings * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp_min(1.0)
+    if not torch.isfinite(result).all():
+        raise RuntimeError("Mean feature pooling produced NaN or Inf")
+    return result
+
+
 class TokenFeatureSourceDataset(Dataset):
     """Label-free token reader used only while building the frozen cache."""
 
@@ -254,6 +266,9 @@ def build_cache_identity(
     *, input_fingerprint, input_row_count, sample_id_fingerprint,
     checkpoint_sha256, model_config, shape_params, probe_layer_idx,
     probe_layer_ratio, model_code_sha256, git_commit,
+    requested_poolings=None, checkpoint_remap_version=None,
+    feature_dim=None, feature_extraction_code_sha256=None,
+    source_checkpoint_kind=None,
 ):
     """Only frozen feature-producing inputs belong in this identity."""
     identity = {
@@ -276,6 +291,18 @@ def build_cache_identity(
         "token_valid_mask_semantics_version": MASK_SEMANTICS_VERSION,
         "cache_dtype": CACHE_DTYPE,
     }
+    # Optional representation-specific fields keep legacy cache identities
+    # stable while allowing stricter identities for external checkpoints.
+    if requested_poolings is not None:
+        identity["requested_poolings"] = sorted(str(value) for value in requested_poolings)
+    if checkpoint_remap_version is not None:
+        identity["checkpoint_remap_version"] = str(checkpoint_remap_version)
+    if feature_dim is not None:
+        identity["feature_dim"] = int(feature_dim)
+    if feature_extraction_code_sha256 is not None:
+        identity["feature_extraction_code_sha256"] = str(feature_extraction_code_sha256)
+    if source_checkpoint_kind is not None:
+        identity["source_checkpoint_kind"] = str(source_checkpoint_kind)
     return identity, sha256_json(identity)
 
 
@@ -380,12 +407,77 @@ def _parity_report(parity_ids, online_mean, online_flatten, mean_path, flatten_p
     }
 
 
+def _tensor_summary(value):
+    array = np.asarray(value, dtype=np.float32)
+    return {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+    }
+
+
+def _mean_source_probe_parity_report(parity_ids, online_mean, mean_path, source_probe):
+    """Compare online/cached mean features through the authoritative source probe."""
+    cached_mean = _read_features_by_sample(mean_path, parity_ids)
+    records = []
+    feature_diffs = []
+    logit_diffs = []
+    source_probe = source_probe.cpu().eval()
+    with torch.inference_mode():
+        for sample_id in parity_ids:
+            online = torch.from_numpy(online_mean[sample_id]).float()
+            cached = torch.from_numpy(cached_mean[sample_id]).float()
+            if not torch.allclose(online, cached, atol=1e-5, rtol=1e-5):
+                raise RuntimeError(f"Mean feature parity failed for {sample_id}")
+            online_logits = source_probe(online)
+            cached_logits = source_probe(cached)
+            if not torch.allclose(online_logits, cached_logits, atol=1e-5, rtol=1e-5):
+                raise RuntimeError(f"Source-probe logit parity failed for {sample_id}")
+            feature_diff = float((online - cached).abs().max().item())
+            logit_diff = float((online_logits - cached_logits).abs().max().item())
+            feature_diffs.append(feature_diff)
+            logit_diffs.append(logit_diff)
+            records.append({
+                "sample_id": sample_id,
+                "online_feature": _tensor_summary(online.numpy()),
+                "cached_feature": _tensor_summary(cached.numpy()),
+                "feature_max_abs_diff": feature_diff,
+                "online_logits": online_logits.tolist(),
+                "cached_logits": cached_logits.tolist(),
+                "logits_max_abs_diff": logit_diff,
+                "parity_passed": True,
+            })
+    return {
+        "parity_sample_ids": list(parity_ids),
+        "mean_max_abs_diff": max(feature_diffs, default=0.0),
+        "mean_logits_max_abs_diff": max(logit_diffs, default=0.0),
+        "parity_records": records,
+        "parity_head_source": "neuralbench_source_probe",
+        "parity_atol": 1e-5,
+        "parity_rtol": 1e-5,
+        "parity_passed": True,
+    }
+
+
 def build_feature_cache(
     *, source_dataset, backbone, probe_layer_idx, output_dir, batch_size,
     device, expected_num_tokens, d_model, manifest_base, logger=None,
-    log_every_batches=5,
+    log_every_batches=5, requested_poolings=None, parity_head=None,
 ):
-    """Stream source windows once and write mean+flatten from each same output batch."""
+    """Stream source windows once and write only explicitly requested poolings.
+
+    The backward-compatible default remains mean+flatten.  A caller may request
+    ``("mean",)`` with an authoritative ``parity_head`` to avoid ever creating
+    a flatten cache.
+    """
+    requested_poolings = (
+        ("mean", "flatten")
+        if requested_poolings is None else tuple(requested_poolings)
+    )
+    if not requested_poolings or set(requested_poolings).difference({"mean", "flatten"}):
+        raise ValueError("requested_poolings must contain mean and/or flatten")
+    if len(set(requested_poolings)) != len(requested_poolings):
+        raise ValueError("requested_poolings contains duplicates")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     mean_path = output_dir / MEAN_CACHE_NAME
@@ -403,7 +495,10 @@ def build_feature_cache(
         logger, "INFO", "cache.extract", "starting single feature extraction pass",
         total_rows=total_rows, total_batches=total_batches, batch_size=int(batch_size),
         inference_mode=True, backbone_eval=True,
-        detail="mean and flatten derived from the same backbone batch output",
+        requested_poolings=list(requested_poolings),
+        detail=("mean and flatten derived from the same backbone batch output"
+                if set(requested_poolings) == {"mean", "flatten"}
+                else "mean-only feature extraction"),
     )
     processed = 0
     backbone_forward_count = 0
@@ -422,39 +517,53 @@ def build_feature_cache(
                 return_layer_idx=probe_layer_idx,
             )
             backbone_forward_count += 1
-            mean_features, flatten_features = masked_pool_both(embeddings, valid_mask)
-            if mean_features.shape[1] != d_model:
-                raise RuntimeError("Mean feature dimension mismatch")
-            if flatten_features.shape[1] != expected_num_tokens * d_model:
-                raise RuntimeError("Flatten feature dimension mismatch")
-            invalid = ~valid_mask.bool()
-            flattened_by_token = flatten_features.reshape(
-                flatten_features.shape[0], expected_num_tokens, d_model
-            )
-            if torch.count_nonzero(flattened_by_token[invalid]).item() != 0:
-                raise RuntimeError("Invalid token values are not exactly zero in flatten features")
-            mean_np = mean_features.cpu().numpy().astype(np.float32, copy=False)
-            flatten_np = flatten_features.cpu().numpy().astype(np.float32, copy=False)
+            mean_features = flatten_features = None
+            if set(requested_poolings) == {"mean", "flatten"}:
+                mean_features, flatten_features = masked_pool_both(embeddings, valid_mask)
+            else:
+                if "mean" in requested_poolings:
+                    mean_features = masked_mean_pool(embeddings, valid_mask)
+                if "flatten" in requested_poolings:
+                    valid = valid_mask.to(embeddings.device, embeddings.dtype).unsqueeze(-1)
+                    flatten_features = (embeddings.float() * valid).flatten(start_dim=1)
+            mean_np = flatten_np = None
+            if mean_features is not None:
+                if mean_features.shape[1] != d_model:
+                    raise RuntimeError("Mean feature dimension mismatch")
+                mean_np = mean_features.cpu().numpy().astype(np.float32, copy=False)
+            if flatten_features is not None:
+                if flatten_features.shape[1] != expected_num_tokens * d_model:
+                    raise RuntimeError("Flatten feature dimension mismatch")
+                invalid = ~valid_mask.bool()
+                flattened_by_token = flatten_features.reshape(
+                    flatten_features.shape[0], expected_num_tokens, d_model
+                )
+                if torch.count_nonzero(flattened_by_token[invalid]).item() != 0:
+                    raise RuntimeError("Invalid token values are not exactly zero in flatten features")
+                flatten_np = flatten_features.cpu().numpy().astype(np.float32, copy=False)
             counts = valid_mask.sum(dim=1).cpu().numpy().astype(np.int32)
-            _write_feature_batch(
-                mean_path,
-                feature_rows_to_table(
-                    batch["sample_id"], batch["subject_id"], batch["recording_id"],
-                    mean_np, counts,
-                ),
-                first,
-            )
-            _write_feature_batch(
-                flatten_path,
-                feature_rows_to_table(
-                    batch["sample_id"], batch["subject_id"], batch["recording_id"],
-                    flatten_np, counts,
-                ),
-                first,
-            )
+            if mean_np is not None:
+                _write_feature_batch(
+                    mean_path,
+                    feature_rows_to_table(
+                        batch["sample_id"], batch["subject_id"], batch["recording_id"],
+                        mean_np, counts,
+                    ),
+                    first,
+                )
+            if flatten_np is not None:
+                _write_feature_batch(
+                    flatten_path,
+                    feature_rows_to_table(
+                        batch["sample_id"], batch["subject_id"], batch["recording_id"],
+                        flatten_np, counts,
+                    ),
+                    first,
+                )
             for index, sample_id in enumerate(batch["sample_id"]):
-                if sample_id in parity_ids:
+                if sample_id in parity_ids and mean_np is not None:
                     online_mean[sample_id] = mean_np[index].copy()
+                if sample_id in parity_ids and flatten_np is not None:
                     online_flatten[sample_id] = flatten_np[index].copy()
             processed += len(batch["sample_id"])
             first = False
@@ -485,17 +594,24 @@ def build_feature_cache(
         raise RuntimeError("Backbone processed window count does not match source window count")
     expected_ids = [str(row["sample_id"]) for row in source_dataset.metadata]
     log_event(logger, "INFO", "cache.validate", "validating schema, row count, unique IDs and finite values")
-    mean_schema = _validate_feature_lance(mean_path, d_model, processed, expected_ids)
-    flatten_schema = _validate_feature_lance(
-        flatten_path, expected_num_tokens * d_model, processed, expected_ids
+    mean_schema = (
+        _validate_feature_lance(mean_path, d_model, processed, expected_ids)
+        if "mean" in requested_poolings else None
+    )
+    flatten_schema = (
+        _validate_feature_lance(flatten_path, expected_num_tokens * d_model, processed, expected_ids)
+        if "flatten" in requested_poolings else None
     )
     log_event(
         logger, "INFO", "cache.parity", "validating online/cache feature and logits parity",
         parity_sample_ids=parity_ids, atol=1e-5, rtol=1e-5,
     )
-    parity = _parity_report(
-        parity_ids, online_mean, online_flatten, mean_path, flatten_path
-    )
+    if requested_poolings == ("mean",) and parity_head is not None:
+        parity = _mean_source_probe_parity_report(parity_ids, online_mean, mean_path, parity_head)
+    elif set(requested_poolings) == {"mean", "flatten"}:
+        parity = _parity_report(parity_ids, online_mean, online_flatten, mean_path, flatten_path)
+    else:
+        raise ValueError("A parity implementation is required for the requested poolings")
     manifest = {
         **manifest_base,
         "status": "completed",
@@ -503,11 +619,12 @@ def build_feature_cache(
         "source_window_count": len(source_dataset),
         "backbone_processed_window_count": processed,
         "backbone_forward_count": backbone_forward_count,
-        "mean_feature_dim": d_model,
-        "flatten_feature_dim": expected_num_tokens * d_model,
+        "requested_poolings": list(requested_poolings),
+        "mean_feature_dim": d_model if "mean" in requested_poolings else None,
+        "flatten_feature_dim": expected_num_tokens * d_model if "flatten" in requested_poolings else None,
         "dtype": CACHE_DTYPE,
-        "mean_row_count": processed,
-        "flatten_row_count": processed,
+        "mean_row_count": processed if "mean" in requested_poolings else 0,
+        "flatten_row_count": processed if "flatten" in requested_poolings else 0,
         "mean_schema": mean_schema,
         "flatten_schema": flatten_schema,
         "mask_validation_passed": True,
@@ -520,8 +637,10 @@ def build_feature_cache(
     )
     log_event(
         logger, "INFO", "cache.validate", "cache validation passed",
-        success_marker=str(output_dir / SUCCESS_NAME), mean_rows=processed,
-        flatten_rows=processed, sample_ids_unique=True, finite_values=True,
+        success_marker=str(output_dir / SUCCESS_NAME),
+        mean_rows=processed if "mean" in requested_poolings else 0,
+        flatten_rows=processed if "flatten" in requested_poolings else 0,
+        sample_ids_unique=True, finite_values=True,
         flatten_invalid_tokens_zero=True,
     )
     return manifest
@@ -566,19 +685,29 @@ def validate_feature_cache(
     expected_ids = manifest.get("sample_ids")
     if not isinstance(expected_ids, list):
         raise ValueError("Feature cache manifest has no sample_ids integrity list")
-    _validate_feature_lance(
-        cache_dir / MEAN_CACHE_NAME, int(manifest["mean_feature_dim"]), row_count, expected_ids
-    )
-    _validate_feature_lance(
-        cache_dir / FLATTEN_CACHE_NAME,
-        int(manifest["flatten_feature_dim"]), row_count, expected_ids,
-    )
+    requested_poolings = tuple(manifest.get("requested_poolings", ("mean", "flatten")))
+    if not requested_poolings or set(requested_poolings).difference({"mean", "flatten"}):
+        raise ValueError("Feature cache manifest has invalid requested_poolings")
+    if "mean" in requested_poolings:
+        _validate_feature_lance(
+            cache_dir / MEAN_CACHE_NAME, int(manifest["mean_feature_dim"]), row_count, expected_ids
+        )
+    elif (cache_dir / MEAN_CACHE_NAME).exists():
+        raise ValueError("Unrequested mean cache is present")
+    if "flatten" in requested_poolings:
+        _validate_feature_lance(
+            cache_dir / FLATTEN_CACHE_NAME,
+            int(manifest["flatten_feature_dim"]), row_count, expected_ids,
+        )
+    elif (cache_dir / FLATTEN_CACHE_NAME).exists():
+        raise ValueError("Unrequested flatten cache is present")
     log_event(
         logger, "INFO", "cache.validate", "existing cache integrity validation passed",
         success=True, manifest=True, schema=True, row_count=row_count,
         sample_ids_unique=True, finite_values=True,
-        mean_feature_dim=manifest["mean_feature_dim"],
-        flatten_feature_dim=manifest["flatten_feature_dim"],
+        requested_poolings=list(requested_poolings),
+        mean_feature_dim=manifest.get("mean_feature_dim"),
+        flatten_feature_dim=manifest.get("flatten_feature_dim"),
     )
     return manifest
 
@@ -880,6 +1009,11 @@ class CachedFeatureDataset(Dataset):
         self.manifest = validate_cache_manifest(
             self.cache_dir, expected_key=expected_cache_key
         )
+        requested_poolings = tuple(
+            self.manifest.get("requested_poolings", ("mean", "flatten"))
+        )
+        if pooling not in requested_poolings:
+            raise ValueError(f"Requested pooling {pooling!r} is absent from feature cache")
         cache_name = MEAN_CACHE_NAME if pooling == "mean" else FLATTEN_CACHE_NAME
         self.ds = lance.dataset(str(self.cache_dir / cache_name))
         expected_dim = int(
