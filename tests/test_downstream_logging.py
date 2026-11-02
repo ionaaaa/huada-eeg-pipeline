@@ -73,6 +73,10 @@ def test_cache_hit_explicitly_logs_extraction_skipped(tmp_path, monkeypatch, cap
         cache, "resolve_cache_policy",
         lambda *args, **kwargs: (hit_path, manifest, True),
     )
+    monkeypatch.setattr(
+        training, "build_backbone",
+        lambda *args, **kwargs: pytest.fail("cache hit reconstructed the backbone"),
+    )
     logger = setup_run_logging(tmp_path / "logs", "INFO", append=False)
     options = SimpleNamespace(
         storage_options=None, input_lance="fixture.lance", checkpoint=checkpoint,

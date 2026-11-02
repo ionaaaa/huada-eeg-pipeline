@@ -381,6 +381,13 @@ def test_end_to_end_mock_trainer_search_evaluate_once_resume_and_oof(tmp_path):
     assert len({row["sample_id"] for row in rows}) == 8
     assert all(row["split"] == "test" for row in rows)
     assert all(row["selected_candidate_args_json"] for row in rows)
+    first_candidate = sweep.expand_candidates(_config())[0]["candidate_id"]
+    fold_zero = Path(options.output_dir) / "fold_0"
+    assert (fold_zero / "runner_logs" / f"{first_candidate}.train.log").is_file()
+    selected_id = summary["selected_candidates"]["0"]
+    assert (fold_zero / "runner_logs" / f"{selected_id}.evaluate.log").is_file()
+    assert not (fold_zero / "candidates" / first_candidate / "train.log").exists()
+    assert not (fold_zero / "test" / "evaluate.log").exists()
     run_log = (Path(options.output_dir) / "run.log").read_text(encoding="utf-8")
     assert "feature_source=cache" in run_log
     assert "backbone_forward_count=0" in run_log
@@ -415,6 +422,77 @@ def test_candidate_completion_requires_hash_status_and_checkpoint(tmp_path):
     changed = dict(candidate, config_sha256="b" * 64)
     assert not sweep._candidate_complete(directory, changed, {"status": "completed"})
     assert not sweep._candidate_complete(directory, candidate, {"status": "failed"})
+
+
+def test_run_command_creates_external_log_parent_but_not_trainer_output(tmp_path):
+    candidate_dir = tmp_path / "fold_0" / "candidates" / "candidate-a"
+    runner_log = tmp_path / "fold_0" / "runner_logs" / "candidate-a.train.log"
+
+    def runner(command, check, cwd, capture_output, text):
+        assert runner_log.parent.is_dir()
+        assert not candidate_dir.exists()
+        cfg = Config()
+        cfg.finetune.output_root = str(candidate_dir)
+        training.setup_experiment_dir(cfg)
+        return SimpleNamespace(stdout="train.start\ntrain.epoch | epoch=1/1\n", stderr="")
+
+    sweep._run_command(["fixture-trainer"], PROJECT, runner_log, runner)
+    assert candidate_dir.is_dir()
+    assert "train.epoch" in runner_log.read_text(encoding="utf-8")
+
+
+def test_resume_refuses_incomplete_candidate_without_move_or_overwrite(tmp_path):
+    options = _options(tmp_path, "--resume")
+    config = _config()
+    candidates = sweep.expand_candidates(config)
+    state = sweep._initial_state(sweep.sha256_json(config), candidates)
+    candidate = candidates[0]
+    state["folds"]["0"]["candidates"][candidate["candidate_id"]]["status"] = "running"
+    output = Path(options.output_dir)
+    output.mkdir(parents=True)
+    sweep.atomic_write_json(output / "sweep_state.json", state)
+    candidate_dir = output / "fold_0" / "candidates" / candidate["candidate_id"]
+    candidate_dir.mkdir(parents=True)
+    marker = candidate_dir / "partial.marker"
+    marker.write_text("preserve", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="incomplete or incompatible candidate"):
+        sweep.run_sweep(
+            options,
+            runner=lambda *args, **kwargs: pytest.fail("incomplete candidate was launched"),
+            cache_ensurer=lambda options: _fake_cache_info(tmp_path),
+        )
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert candidate_dir.is_dir()
+    assert not list(candidate_dir.parent.glob(candidate_dir.name + ".stale.*"))
+    assert not (output / "fold_0" / "runner_logs").exists()
+
+
+def test_resume_refuses_incomplete_evaluation_without_move_or_overwrite(tmp_path):
+    options = _options(tmp_path)
+    runner, _ = _fake_runner_factory()
+    cache_info = _fake_cache_info(tmp_path)
+    sweep.run_sweep(options, runner=runner, cache_ensurer=lambda options: cache_info)
+
+    output = Path(options.output_dir)
+    state_path = output / "sweep_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["folds"]["0"]["evaluation"] = {"status": "pending", "call_count": 0}
+    sweep.atomic_write_json(state_path, state)
+    test_dir = output / "fold_0" / "test"
+    marker = test_dir / "preserve.marker"
+    marker.write_text("preserve", encoding="utf-8")
+
+    resume = _options(tmp_path, "--resume")
+    with pytest.raises(FileExistsError, match="incomplete test output"):
+        sweep.run_sweep(
+            resume,
+            runner=lambda *args, **kwargs: pytest.fail("incomplete evaluation was launched"),
+            cache_ensurer=lambda options: cache_info,
+        )
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert test_dir.is_dir()
+    assert not list(test_dir.parent.glob(test_dir.name + ".stale.*"))
 
 
 def test_evaluate_checkpoint_metadata_must_match_selected_candidate():
@@ -472,6 +550,8 @@ def test_dry_run_writes_manifest_and_commands_without_starting_training(tmp_path
     assert plan["feature_cache"]["build_performed"] is False
     assert all("--feature-cache-key" in command for command in plan["search_commands"])
     assert not list(output.rglob("*.pt"))
+    assert not list(output.glob("fold_*"))
+    assert not list(output.rglob("runner_logs"))
 
 
 def test_atomic_state_writer_uses_os_replace(monkeypatch, tmp_path):

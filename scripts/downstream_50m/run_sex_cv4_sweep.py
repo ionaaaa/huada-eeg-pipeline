@@ -378,18 +378,13 @@ def _candidate_complete(candidate_dir, candidate, state_entry):
         return False
 
 
-def _quarantine(path):
-    path = Path(path)
-    if not path.exists():
-        return
-    suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    os.replace(path, path.with_name(path.name + f".stale.{suffix}"))
-
-
 def _run_command(command, project_root, log_path, runner, root_log_path=None):
     log_path = Path(log_path)
+    # The runner owns only its external log directory.  In particular, this
+    # must never be the trainer's --output-dir (or a child of it), because the
+    # trainer deliberately requires exclusive creation of that directory.
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     if runner is subprocess.run:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w", encoding="utf-8") as child_log:
             process = subprocess.Popen(
                 command, cwd=str(project_root), stdout=subprocess.PIPE,
@@ -413,14 +408,12 @@ def _run_command(command, project_root, log_path, runner, root_log_path=None):
             command, check=True, cwd=str(project_root), capture_output=True, text=True,
         )
     except subprocess.CalledProcessError as exc:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
             (getattr(exc, "stdout", "") or "") + (getattr(exc, "stderr", "") or ""),
             encoding="utf-8",
         )
         raise
     else:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
             (getattr(result, "stdout", "") or "")
             + (getattr(result, "stderr", "") or ""),
@@ -796,13 +789,34 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
             candidate_id = candidate["candidate_id"]
             entry = fold_state["candidates"][candidate_id]
             candidate_dir = output_dir / f"fold_{fold}" / "candidates" / candidate_id
+            runner_log = (
+                output_dir / f"fold_{fold}" / "runner_logs" / f"{candidate_id}.train.log"
+            )
             if options.resume and _candidate_complete(candidate_dir, candidate, entry):
+                log_event(
+                    logger, "INFO", "search.candidate.resume",
+                    "reusing completed candidate",
+                    fold=fold, candidate_id=candidate_id,
+                    candidate_dir=str(candidate_dir), candidate_dir_exists=True,
+                    resume_decision="reuse_completed", runner_log_path=str(runner_log),
+                )
                 summary = _read_validation_summary(
                     candidate_dir, candidate, fold, feature_cache_info["feature_cache_key"]
                 )
             else:
                 if candidate_dir.exists():
-                    _quarantine(candidate_dir)
+                    log_event(
+                        logger, "ERROR", "search.candidate.resume",
+                        "candidate output directory exists but is not safely reusable",
+                        fold=fold, candidate_id=candidate_id,
+                        candidate_dir=str(candidate_dir), candidate_dir_exists=True,
+                        resume_decision="refuse_incomplete_no_overwrite",
+                        runner_log_path=str(runner_log),
+                    )
+                    raise FileExistsError(
+                        "Refusing to overwrite incomplete or incompatible candidate "
+                        f"output directory: {candidate_dir}"
+                    )
                 entry.update({"status": "running", "started_at": datetime.now(timezone.utc).isoformat()})
                 atomic_write_json(state_path, state)
                 command = build_stage_command(options, candidate, fold, "search", candidate_dir)
@@ -813,10 +827,25 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
                     head_lr=args.get("--head-lr"), weight_decay=args.get("--weight-decay"),
                     feature_cache_path=feature_cache_info["feature_cache_path"],
                     feature_source="cache", backbone_constructed=False,
-                    backbone_forward_count=0,
+                    backbone_forward_count=0, candidate_dir=str(candidate_dir),
+                    candidate_dir_exists=False, resume_decision="start_new",
+                    runner_log_path=str(runner_log),
+                )
+                log_event(
+                    logger, "INFO", "search.candidate",
+                    "candidate output directory ownership delegated to trainer",
+                    fold=fold, candidate_id=candidate_id,
+                    candidate_dir=str(candidate_dir), candidate_dir_exists=False,
+                    runner_log_path=str(runner_log),
+                )
+                log_event(
+                    logger, "INFO", "train.start", "launching candidate trainer process",
+                    fold=fold, candidate_id=candidate_id,
+                    candidate_dir=str(candidate_dir), candidate_dir_exists=False,
+                    runner_log_path=str(runner_log),
                 )
                 try:
-                    _run_command(command, project_root, candidate_dir / "train.log", runner,
+                    _run_command(command, project_root, runner_log, runner,
                                  output_dir / "run.log")
                     summary = _read_validation_summary(
                         candidate_dir, candidate, fold, feature_cache_info["feature_cache_key"]
@@ -900,6 +929,10 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
     for fold, selected in sorted(selected_by_fold.items()):
         evaluation = state["folds"][str(fold)]["evaluation"]
         test_dir = output_dir / f"fold_{fold}" / "test"
+        evaluation_runner_log = (
+            output_dir / f"fold_{fold}" / "runner_logs"
+            / f"{selected['candidate_id']}.evaluate.log"
+        )
         metrics_path = test_dir / "test_metrics.json"
         predictions_path = test_dir / "test_predictions.csv"
         valid_existing = False
@@ -915,13 +948,30 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
             except (OSError, ValueError):
                 valid_existing = False
         if valid_existing:
+            log_event(
+                logger, "INFO", "test.resume", "reusing completed one-time test evaluation",
+                fold=fold, candidate_id=selected["candidate_id"],
+                test_dir=str(test_dir), test_dir_exists=True,
+                resume_decision="reuse_evaluated",
+                runner_log_path=str(evaluation_runner_log),
+            )
             continue
         if int(evaluation.get("call_count", 0)) != 0:
             raise RuntimeError(
                 f"Fold {fold} test was already invoked; refusing a second evaluation"
             )
         if test_dir.exists():
-            _quarantine(test_dir)
+            log_event(
+                logger, "ERROR", "test.resume",
+                "test output directory exists but is not safely reusable",
+                fold=fold, candidate_id=selected["candidate_id"],
+                test_dir=str(test_dir), test_dir_exists=True,
+                resume_decision="refuse_incomplete_no_overwrite",
+                runner_log_path=str(evaluation_runner_log),
+            )
+            raise FileExistsError(
+                f"Refusing to overwrite incomplete test output directory: {test_dir}"
+            )
         evaluation.update({"status": "running", "call_count": 1})
         atomic_write_json(state_path, state)
         candidate = next(
@@ -933,9 +983,11 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
             options, candidate, fold, "evaluate", test_dir, selected["checkpoint_path"]
         )
         log_event(logger, "INFO", "test.start", "starting one-time test evaluation",
-                  fold=fold, candidate_id=selected["candidate_id"], evaluation_call_count=1)
+                  fold=fold, candidate_id=selected["candidate_id"], evaluation_call_count=1,
+                  test_dir=str(test_dir), test_dir_exists=False,
+                  resume_decision="start_new", runner_log_path=str(evaluation_runner_log))
         try:
-            _run_command(command, project_root, test_dir / "evaluate.log", runner,
+            _run_command(command, project_root, evaluation_runner_log, runner,
                          output_dir / "run.log")
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             if (

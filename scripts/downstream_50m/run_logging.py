@@ -10,6 +10,11 @@ from pathlib import Path
 
 
 LOGGER_NAME = "huada.downstream_50m"
+STAGE_ALIASES = {
+    # Public log naming can evolve without changing feature-producing modules,
+    # whose file hashes intentionally participate in the frozen cache key.
+    "candidate.epoch": "train.epoch",
+}
 
 
 class _StageFilter(logging.Filter):
@@ -92,6 +97,7 @@ def get_run_logger():
 def log_event(logger, level, stage, message, **fields):
     if logger is None:
         return
+    stage = STAGE_ALIASES.get(stage, stage)
     event = {
         "stage": stage,
         "fold": fields.get("fold"),

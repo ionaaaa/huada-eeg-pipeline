@@ -444,7 +444,11 @@ def test_cached_training_never_builds_backbone_and_saves_head_only(
     cfg.finetune.num_epochs = 1
     cfg.finetune.head_lr = 0.001
     cfg.finetune.weight_decay = 0.123
-    cfg.finetune.save_path = str(tmp_path / "head-only.pt")
+    candidate_dir = tmp_path / "candidate_output"
+    cfg.finetune.output_root = str(candidate_dir)
+    training.setup_experiment_dir(cfg)
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        training.setup_experiment_dir(cfg)
     cfg.finetune.sweep_candidate_id = "candidate"
     cfg.finetune.sweep_config_sha256 = "s" * 64
     cfg.finetune.sweep_args_json = '{"--pooling":"mean"}'
@@ -461,7 +465,7 @@ def test_cached_training_never_builds_backbone_and_saves_head_only(
          "recording_id": "", "label_name": "male"},
     ]
     loader = DataLoader(samples, batch_size=2, collate_fn=collate_fn)
-    setup_run_logging(tmp_path / "training_logs", "INFO", append=False)
+    setup_run_logging(candidate_dir, "INFO", append=False)
     shape = training.compute_shape_params(cfg)
     _, metrics, _, _, predictions = training.run_one_checkpoint(
         cfg, shape, loader, loader, None, torch.device("cpu"), search_only=True,
@@ -474,8 +478,8 @@ def test_cached_training_never_builds_backbone_and_saves_head_only(
     assert "model_state_dict" not in checkpoint
     assert "backbone_state_dict" not in checkpoint
     assert checkpoint["feature_cache_key"] == manifest["cache_key"]
-    training_log = (tmp_path / "training_logs" / "run.log").read_text(encoding="utf-8")
-    assert "candidate.epoch" in training_log
+    training_log = (candidate_dir / "run.log").read_text(encoding="utf-8")
+    assert "train.epoch" in training_log
     assert "backbone_forward_count=0" in training_log
     assert "optimizer_weight_decay=0.123" in training_log
     assert "best_checkpoint_updated=True" in training_log
