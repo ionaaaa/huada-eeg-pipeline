@@ -3,7 +3,7 @@
 The backbone, representation layer, masked-mean pooling, heads, optimizer
 choices, and epoch loop follow upstream. Adaptations are limited to the shared
 Huada Lance contract, explicit subject manifests, regression, richer metrics,
-checkpoint auditing, smoke mode, evaluation mode, and sex-stratified subject CV4.
+checkpoint auditing, smoke mode, evaluation mode, sex CV4, and age subject CV7.
 """
 
 from __future__ import annotations
@@ -43,6 +43,12 @@ from lance_dataset import (
 from model import EEGPretrainModel
 from prefetch_loader import PrefetchLoader
 from run_logging import get_run_logger, log_event, log_exception, setup_run_logging
+from age_cv7 import (
+    PROTOCOL as AGE_CV7_PROTOCOL,
+    build_age_subject_cv7,
+    regression_metrics as age_regression_metrics,
+    validation_result_is_better,
+)
 from sex_cv4 import (
     PROTOCOL as SEX_CV4_PROTOCOL,
     build_sex_stratified_subject_cv4,
@@ -144,11 +150,11 @@ def parse_args(argv=None):
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument(
         "--protocol",
-        choices=["legacy_single_split", SEX_CV4_PROTOCOL],
+        choices=["legacy_single_split", SEX_CV4_PROTOCOL, AGE_CV7_PROTOCOL],
         default="legacy_single_split",
     )
     parser.add_argument("--folds", type=int, default=4)
-    parser.add_argument("--fold-index", type=int, choices=range(4))
+    parser.add_argument("--fold-index", type=int, choices=range(7))
     parser.add_argument("--stage", choices=["search", "evaluate"])
     parser.add_argument("--sweep-candidate-id")
     parser.add_argument("--sweep-config-sha256")
@@ -677,6 +683,9 @@ def model_training_metadata(cfg, model, shape_params, optimizer_report=None):
         "optimizer_param_groups": [] if optimizer_report is None else optimizer_report["param_groups"],
         "head_input_dim": int(model.head_input_dim),
         "head_parameter_count": head_parameter_count(model),
+        "trainable_parameter_count": count_parameters(model),
+        "backbone_trainable_parameter_count": 0 if cfg.finetune.feature_source == "cache" else None,
+        "initial_head_fingerprint": getattr(cfg.finetune, "initial_head_fingerprint", None),
         "num_tokens": int(shape_params["num_tokens"]),
         "d_model": int(cfg.model.d_model),
     }
@@ -715,7 +724,9 @@ def _infer_checkpoint_pooling(model, head_input_dim):
 def load_downstream_checkpoint_strict(model, path, device):
     """Load a downstream checkpoint with explicit/inferred pooling compatibility checks."""
     payload = torch.load(path, map_location=device, weights_only=False)
-    if payload.get("checkpoint_kind") == "cached_feature_head_only":
+    if payload.get("checkpoint_kind") in {
+        "cached_feature_head_only", "cached_feature_age_regression_head_only",
+    }:
         if "head_state_dict" not in payload or "backbone_state_dict" in payload:
             raise RuntimeError("Invalid cached-feature head-only checkpoint contents")
         checkpoint_pooling = payload.get("pooling")
@@ -733,7 +744,7 @@ def load_downstream_checkpoint_strict(model, path, device):
             "pooling": checkpoint_pooling,
             "pooling_inferred": False,
             "head_input_dim": checkpoint_dim,
-            "checkpoint_kind": "cached_feature_head_only",
+            "checkpoint_kind": payload["checkpoint_kind"],
         }
         return payload
     if "model_state_dict" not in payload:
@@ -806,7 +817,11 @@ def validate_sweep_checkpoint_metadata(payload, cfg):
         if not matches:
             raise RuntimeError(f"Checkpoint {key} mismatch: {actual!r} != {expected_value!r}")
     if cfg.finetune.feature_source == "cache":
-        if payload.get("checkpoint_kind") != "cached_feature_head_only":
+        expected_kind = (
+            "cached_feature_age_regression_head_only"
+            if cfg.finetune.task == "age_regression" else "cached_feature_head_only"
+        )
+        if payload.get("checkpoint_kind") != expected_kind:
             raise RuntimeError("Cached evaluation requires a head-only checkpoint")
         if payload.get("feature_cache_key") != cfg.finetune.feature_cache_key:
             raise RuntimeError("Checkpoint feature_cache_key mismatch")
@@ -815,6 +830,19 @@ def validate_sweep_checkpoint_metadata(payload, cfg):
         expected_dim, _ = resolved_head_dimensions(cfg, compute_shape_params(cfg))
         if int(payload.get("feature_dim", -1)) != expected_dim:
             raise RuntimeError("Checkpoint feature_dim mismatch")
+        if cfg.finetune.task == "age_regression":
+            expected_age_metadata = {
+                "task": "age_regression",
+                "label_unit": "years",
+                "age_target_normalization": "none",
+                "age_prediction_clipping": "none",
+                "fold": cfg.finetune.fold_index,
+            }
+            for key, expected_value in expected_age_metadata.items():
+                if payload.get(key) != expected_value:
+                    raise RuntimeError(
+                        f"Age checkpoint {key} mismatch: {payload.get(key)!r} != {expected_value!r}"
+                    )
     return True
 
 
@@ -926,6 +954,7 @@ def compute_metrics(task, targets, predictions, average_loss, smoke=False):
         r2 = None if targets.size < 2 or denominator == 0.0 else float(1.0 - np.sum(errors ** 2) / denominator)
         result.update({
             "mae": mae, "rmse": rmse, "r2": r2,
+            "r2_defined": r2 is not None,
             "r2_reliable": bool(targets.size >= 2 and denominator > 0.0 and not smoke),
             "metrics_not_statistically_meaningful": bool(smoke or targets.size < 2),
         })
@@ -1033,6 +1062,49 @@ def evaluate_sex_test_once(model, loader, criterion, device, fold, checkpoint_pa
     return metrics, rows
 
 
+@torch.no_grad()
+def evaluate_age_test_once(model, loader, criterion, device, fold, checkpoint_path):
+    """Evaluate one locked age checkpoint and retain raw, unclipped predictions."""
+    model.eval()
+    total_loss = 0.0
+    total_count = 0
+    rows = []
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        labels = get_labels_from_batch(batch, "age_regression")
+        predictions = _forward_outputs(model, batch, "age_regression")
+        loss = criterion(predictions, labels)
+        count = int(labels.numel())
+        total_loss += float(loss.item()) * count
+        total_count += count
+        for index in range(count):
+            truth = float(labels[index].item())
+            prediction = float(predictions[index].item())
+            rows.append({
+                "fold": int(fold),
+                "split": "test",
+                "sample_id": str(batch["sample_id"][index]),
+                "subject_id": str(batch["subject_id"][index]),
+                "recording_id": str(batch.get("recording_id", [""] * count)[index]),
+                "window_index": int(
+                    batch["window_index"][index].item() if "window_index" in batch else index
+                ),
+                "true_age": truth,
+                "predicted_age": prediction,
+                "signed_error": prediction - truth,
+                "absolute_error": abs(prediction - truth),
+                "num_valid_tokens": int(batch["num_valid_tokens"][index].item()),
+                "checkpoint_path": str(Path(checkpoint_path).resolve()),
+            })
+    if not rows:
+        raise RuntimeError(f"Fold {fold} age test loader produced no rows")
+    metrics = age_regression_metrics(
+        [row["true_age"] for row in rows], [row["predicted_age"] for row in rows]
+    )
+    metrics.update({"loss": total_loss / max(total_count, 1), "num_samples": total_count})
+    return metrics, rows
+
+
 def save_downstream_checkpoint(
     path, model, cfg, shape_params, probe_layer_idx, epoch, metrics,
     checkpoint_report, optimizer_report,
@@ -1048,19 +1120,41 @@ def save_downstream_checkpoint(
         "mode": cfg.finetune.mode,
         "task": cfg.finetune.task,
         "label_mapping": SEX_LABEL_MAPPING if cfg.finetune.task == "sex_classification" else None,
+        "label_unit": "years" if cfg.finetune.task == "age_regression" else None,
+        "age_target_normalization": "none" if cfg.finetune.task == "age_regression" else None,
+        "age_prediction_clipping": "none" if cfg.finetune.task == "age_regression" else None,
         "config": asdict(cfg),
         "shape_params": shape_params,
         "epoch": epoch,
         "metrics": metrics,
+        "best_epoch": epoch if cfg.finetune.task == "age_regression" else None,
+        "validation_mae": (
+            metrics.get("validation", {}).get("mae")
+            if cfg.finetune.task == "age_regression" else None
+        ),
+        "validation_rmse": (
+            metrics.get("validation", {}).get("rmse")
+            if cfg.finetune.task == "age_regression" else None
+        ),
+        "validation_loss": (
+            metrics.get("validation", {}).get("loss")
+            if cfg.finetune.task == "age_regression" else None
+        ),
         "pooling": training_metadata["pooling"],
         "head_input_dim": training_metadata["head_input_dim"],
         "head_parameter_count": training_metadata["head_parameter_count"],
+        "trainable_parameter_count": training_metadata["trainable_parameter_count"],
+        "backbone_trainable_parameter_count": training_metadata[
+            "backbone_trainable_parameter_count"
+        ],
         "head_lr": training_metadata["head_lr"],
         "weight_decay": training_metadata["weight_decay"],
         "optimizer_name": training_metadata["optimizer_name"],
         "optimizer_param_groups": training_metadata["optimizer_param_groups"],
         "checkpoint_kind": (
-            "cached_feature_head_only"
+            "cached_feature_age_regression_head_only"
+            if cfg.finetune.feature_source == "cache" and cfg.finetune.task == "age_regression"
+            else "cached_feature_head_only"
             if cfg.finetune.feature_source == "cache"
             else "full_downstream_model"
         ),
@@ -1075,6 +1169,11 @@ def save_downstream_checkpoint(
         "sweep_candidate_id": cfg.finetune.sweep_candidate_id or None,
         "sweep_config_sha256": cfg.finetune.sweep_config_sha256 or None,
         "sweep_args_json": cfg.finetune.sweep_args_json or None,
+        "fold_seed": cfg.finetune.seed,
+        "initial_head_fingerprint": getattr(cfg.finetune, "initial_head_fingerprint", None),
+        "label_unit": "years" if cfg.finetune.task == "age_regression" else None,
+        "age_target_normalization": "none" if cfg.finetune.task == "age_regression" else None,
+        "age_prediction_clipping": "none" if cfg.finetune.task == "age_regression" else None,
         "upstream": {"url": UPSTREAM_URL, "branch": UPSTREAM_BRANCH, "commit": UPSTREAM_COMMIT},
     }
     if cfg.finetune.feature_source != "cache":
@@ -1091,6 +1190,15 @@ def _best_value(task, metrics):
         value = metrics.get("accuracy")
         return -float("inf") if value is None else float(value)
     return -float(metrics["loss"])
+
+
+def head_state_fingerprint(model):
+    digest = hashlib.sha256()
+    for name, value in sorted(model.head.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(np.asarray(value.detach().cpu()).tobytes())
+    return digest.hexdigest()
 
 
 def run_one_checkpoint(
@@ -1132,6 +1240,7 @@ def run_one_checkpoint(
         )
     checkpoint_report = checkpoint_report or loaded_report
     model, probe_layer_idx = build_downstream_model(cfg, backbone, device, shape_params)
+    cfg.finetune.initial_head_fingerprint = head_state_fingerprint(model)
     criterion = make_criterion(cfg.finetune.task)
     log_event(
         logger, "INFO", "candidate.model", "downstream model ready",
@@ -1149,7 +1258,11 @@ def run_one_checkpoint(
         payload = load_downstream_checkpoint_strict(model, path, device)
         validate_sweep_checkpoint_metadata(payload, cfg)
         if test_prediction_context is not None:
-            test_metrics, test_predictions = evaluate_sex_test_once(
+            evaluator = (
+                evaluate_sex_test_once
+                if cfg.finetune.task == "sex_classification" else evaluate_age_test_once
+            )
+            test_metrics, test_predictions = evaluator(
                 model, test_loader, criterion, device,
                 test_prediction_context["fold"], path,
             )
@@ -1185,7 +1298,15 @@ def run_one_checkpoint(
             if search_only and cfg.finetune.task == "sex_classification"
             else _best_value(cfg.finetune.task, val_metrics)
         )
-        updated_best = score > best_score
+        if cfg.finetune.task == "age_regression":
+            age_candidate = {**val_metrics, "epoch": epoch + 1}
+            age_incumbent = (
+                None if best_payload is None
+                else {**best_payload["metrics"]["validation"], "epoch": best_payload["epoch"]}
+            )
+            updated_best = validation_result_is_better(age_candidate, age_incumbent)
+        else:
+            updated_best = score > best_score
         if updated_best:
             best_score = score
             best_payload = save_downstream_checkpoint(
@@ -1204,7 +1325,10 @@ def run_one_checkpoint(
                 logger, "INFO", "candidate.epoch", "candidate training progress",
                 fold=fold, candidate_id=candidate_id,
                 epoch=f"{epoch_number}/{cfg.finetune.num_epochs}",
-                train_loss=train_metrics.get("loss"), validation_loss=val_metrics.get("loss"),
+                train_loss=train_metrics.get("loss"), train_mse=train_metrics.get("loss"),
+                validation_loss=val_metrics.get("loss"),
+                validation_mae=val_metrics.get("mae"),
+                validation_rmse=val_metrics.get("rmse"),
                 validation_accuracy=val_metrics.get("accuracy"),
                 validation_balanced_accuracy=val_metrics.get("balanced_accuracy"),
                 validation_macro_f1=val_metrics.get("macro_f1"),
@@ -1225,7 +1349,11 @@ def run_one_checkpoint(
         }, probe_layer_idx, checkpoint_report, []
     load_downstream_checkpoint_strict(model, cfg.finetune.save_path, device)
     if test_prediction_context is not None:
-        test_metrics, test_predictions = evaluate_sex_test_once(
+        evaluator = (
+            evaluate_sex_test_once
+            if cfg.finetune.task == "sex_classification" else evaluate_age_test_once
+        )
+        test_metrics, test_predictions = evaluator(
             model,
             test_loader,
             criterion,
@@ -1309,6 +1437,186 @@ def _write_prediction_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_age_prediction_csv(path, rows):
+    fields = [
+        "fold", "split", "sample_id", "subject_id", "recording_id", "window_index",
+        "true_age", "predicted_age", "signed_error", "absolute_error",
+        "num_valid_tokens", "candidate_id", "checkpoint_path",
+        "test_is_outside_train_age_range",
+    ]
+    with Path(path).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_age_cv7_stage(cfg, shape_params, device, run_dir):
+    """Run one isolated age CV7 search/evaluate stage on label-free cached features."""
+    if cfg.finetune.task != "age_regression":
+        raise ValueError("Age CV7 stages require age_regression")
+    if cfg.finetune.fold_index is None or cfg.finetune.stage not in {"search", "evaluate"}:
+        raise ValueError("Age CV7 requires --fold-index and --stage")
+    if cfg.finetune.folds != 7:
+        raise ValueError("age_subject_cv7 requires --folds 7")
+    if cfg.finetune.feature_source != "cache" or cfg.finetune.pooling != "mean":
+        raise ValueError("Age CV7 requires cached mean features")
+    if cfg.finetune.mode != "linear_probe" or cfg.finetune.use_mlp_head:
+        raise ValueError("Age CV7 v1 requires a linear cached head")
+
+    dataset = load_downstream_dataset(cfg)
+    metadata_rows = dataset.get_subject_label_rows()
+    subject_ages = {}
+    for row in metadata_rows:
+        subject = str(row["subject_id"])
+        age = float(row["label"])
+        if subject in subject_ages and not math.isclose(subject_ages[subject], age):
+            raise ValueError(f"Inconsistent ages for subject {subject}")
+        subject_ages[subject] = age
+    split_payload = build_age_subject_cv7(subject_ages, cfg.finetune.split_seed)
+    fold = int(cfg.finetune.fold_index)
+    fold_info = split_payload["folds"][fold]
+    fold_seed = int(cfg.finetune.seed) + fold
+    cfg.finetune.seed = fold_seed
+    set_seed(fold_seed)
+
+    subjects_by_split = {
+        "train": set(fold_info["train_subjects"]),
+        "validation": {fold_info["validation_subject"]},
+        "test": {fold_info["test_subject"]},
+    }
+    indices_by_split = {}
+    for split_name, subjects in subjects_by_split.items():
+        indices = [
+            row["index"] for row in metadata_rows if str(row["subject_id"]) in subjects
+        ]
+        if not indices:
+            raise ValueError(f"Age fold {fold} has an empty {split_name} split")
+        indices_by_split[split_name] = indices
+    active_splits = ("train", "validation") if cfg.finetune.stage == "search" else ("test",)
+    rows_by_split = {
+        split_name: BatchedSubset(dataset, indices_by_split[split_name])
+        for split_name in active_splits
+    }
+    split_metadata = {
+        "train_subjects": list(fold_info["train_subjects"]),
+        "validation_subject": fold_info["validation_subject"],
+        "test_subject": fold_info["test_subject"],
+        "train_age_min": fold_info["train_age_min"],
+        "train_age_max": fold_info["train_age_max"],
+        "train_age_mean": fold_info["train_age_mean"],
+        "validation_age": fold_info["validation_age"],
+        "test_age": fold_info["test_age"],
+        "test_is_outside_train_age_range": fold_info["test_is_outside_train_age_range"],
+        "train_window_count": len(indices_by_split["train"]),
+        "validation_window_count": len(indices_by_split["validation"]),
+        "test_window_count": len(indices_by_split["test"]),
+    }
+    log_event(
+        get_run_logger(), "INFO", "age.fold", "age CV7 fold resolved",
+        fold=fold, fold_seed=fold_seed, run_stage=cfg.finetune.stage, **split_metadata,
+    )
+
+    if cfg.finetune.stage == "search":
+        train_loader = _loader(rows_by_split["train"], cfg, device, shuffle=True)
+        validation_loader = _loader(rows_by_split["validation"], cfg, device, shuffle=False)
+        model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
+            cfg, shape_params, train_loader, validation_loader, None, device,
+            search_only=True,
+        )
+        del model
+        if predictions:
+            raise RuntimeError("Age search stage unexpectedly produced test predictions")
+        validation = metrics["best_validation"]
+        summary = {
+            "status": "completed",
+            "stage": "search",
+            "fold": fold,
+            "fold_seed": fold_seed,
+            "candidate_id": cfg.finetune.sweep_candidate_id,
+            "candidate_config_sha256": cfg.finetune.sweep_config_sha256,
+            "normalized_cli_args": json.loads(cfg.finetune.sweep_args_json),
+            "best_epoch": int(metrics["best_epoch"]),
+            "best_validation_loss": float(validation["loss"]),
+            "best_validation_mae": float(validation["mae"]),
+            "best_validation_rmse": float(validation["rmse"]),
+            "best_validation_r2": None,
+            "best_validation_r2_defined": False,
+            "checkpoint_path": str(Path(cfg.finetune.save_path).resolve()),
+            "checkpoint_sha256": sha256_file(cfg.finetune.save_path),
+            "training_metadata": metrics["training_metadata"],
+            "feature_source": metrics["training_metadata"]["feature_source"],
+            "feature_cache_key": metrics["training_metadata"]["feature_cache_key"],
+            "feature_cache_path": metrics["training_metadata"]["feature_cache_path"],
+            "feature_cache_pooling": metrics["training_metadata"]["feature_cache_pooling"],
+            "feature_cache_reused": metrics["training_metadata"]["feature_cache_reused"],
+            "feature_dim": metrics["training_metadata"]["feature_dim"],
+            "backbone_forward_count": metrics["training_metadata"]["backbone_forward_count"],
+            "checkpoint_kind": "cached_feature_age_regression_head_only",
+            "initial_head_fingerprint": metrics["training_metadata"]["initial_head_fingerprint"],
+            "test_accessed": False,
+            "test_accessed_during_selection": False,
+            "age_target_normalization": "none",
+            "age_prediction_clipping": "none",
+            **split_metadata,
+        }
+        _atomic_json_dump(Path(run_dir) / "validation_summary.json", summary)
+        return {
+            "metrics": {"validation": validation},
+            "training_metadata": metrics["training_metadata"],
+            "sample_count": {
+                "train": len(rows_by_split["train"]),
+                "validation": len(rows_by_split["validation"]),
+            },
+            "split_subjects": split_metadata,
+            "stage_summary": summary,
+        }, checkpoint_report
+
+    test_loader = _loader(rows_by_split["test"], cfg, device, shuffle=False)
+    model, metrics, _, checkpoint_report, predictions = run_one_checkpoint(
+        cfg, shape_params, None, None, test_loader, device,
+        test_prediction_context={"fold": fold},
+    )
+    del model
+    for row in predictions:
+        row["candidate_id"] = cfg.finetune.sweep_candidate_id
+        row["test_is_outside_train_age_range"] = fold_info[
+            "test_is_outside_train_age_range"
+        ]
+    if len(predictions) != len(rows_by_split["test"]):
+        raise RuntimeError("Age test prediction count does not match fold test dataset")
+    _write_age_prediction_csv(Path(run_dir) / "test_predictions.csv", predictions)
+    test_summary = {
+        **metrics["test"],
+        "status": "evaluated",
+        "stage": "evaluate",
+        "fold": fold,
+        "fold_seed": fold_seed,
+        "candidate_id": cfg.finetune.sweep_candidate_id,
+        "checkpoint_path": str(Path(cfg.finetune.downstream_checkpoint).resolve()),
+        "checkpoint_sha256": sha256_file(cfg.finetune.downstream_checkpoint),
+        "test_prediction_count": len(predictions),
+        "evaluation_call_count": 1,
+        "r2": None,
+        "r2_defined": False,
+        "age_target_normalization": "none",
+        "age_prediction_clipping": "none",
+        "feature_source": metrics["training_metadata"]["feature_source"],
+        "feature_cache_key": metrics["training_metadata"]["feature_cache_key"],
+        "feature_cache_path": metrics["training_metadata"]["feature_cache_path"],
+        "backbone_forward_count": metrics["training_metadata"]["backbone_forward_count"],
+        "checkpoint_kind": "cached_feature_age_regression_head_only",
+        **split_metadata,
+    }
+    _atomic_json_dump(Path(run_dir) / "test_metrics.json", test_summary)
+    return {
+        "metrics": {"test": metrics["test"]},
+        "training_metadata": metrics["training_metadata"],
+        "sample_count": {"test": len(rows_by_split["test"])},
+        "split_subjects": split_metadata,
+        "stage_summary": test_summary,
+    }, checkpoint_report
 
 
 def run_sex_cv4_stage(cfg, shape_params, device, run_dir):
@@ -1764,8 +2072,8 @@ def main(argv=None):
     args = parse_args(argv)
     if (args.stage is None) != (args.fold_index is None):
         raise ValueError("--stage and --fold-index must be provided together")
-    if args.stage and args.protocol != SEX_CV4_PROTOCOL:
-        raise ValueError("--stage is only valid with sex_stratified_subject_cv4")
+    if args.stage and args.protocol not in {SEX_CV4_PROTOCOL, AGE_CV7_PROTOCOL}:
+        raise ValueError("--stage is only valid with a formal CV protocol")
     if args.stage == "search" and args.downstream_checkpoint:
         raise ValueError("Search stage must not receive --downstream-checkpoint")
     if args.stage == "evaluate" and not args.downstream_checkpoint:
@@ -1784,6 +2092,16 @@ def main(argv=None):
         raise ValueError(f"{SEX_CV4_PROTOCOL} requires --folds 4")
     if args.protocol == SEX_CV4_PROTOCOL and args.allow_random_init_smoke:
         raise ValueError("CV folds must all load the same real pretrained checkpoint")
+    if args.protocol == AGE_CV7_PROTOCOL and args.task != "age_regression":
+        raise ValueError(f"{AGE_CV7_PROTOCOL} is only valid for age_regression")
+    if args.protocol == AGE_CV7_PROTOCOL and args.folds != 7:
+        raise ValueError(f"{AGE_CV7_PROTOCOL} requires --folds 7")
+    if args.protocol == AGE_CV7_PROTOCOL and args.stage is None:
+        raise ValueError("Age CV7 must run through isolated search/evaluate stages")
+    if args.protocol == AGE_CV7_PROTOCOL and (
+        args.pooling != "mean" or args.mode != "linear_probe" or args.feature_cache_path is None
+    ):
+        raise ValueError("Age CV7 requires --pooling mean, --mode linear_probe, and feature cache")
     if not args.smoke and args.protocol == "legacy_single_split" and not args.subject_split_manifest:
         raise ValueError("Full train/evaluation requires --subject-split-manifest")
     if min(args.epochs, args.batch_size, args.smoke_max_samples, args.smoke_max_samples_per_subject) <= 0:
@@ -1813,7 +2131,11 @@ def main(argv=None):
     schema = str(ds.schema)
     source_before = source_snapshot(cfg.data.lance_path)
 
-    if cfg.finetune.protocol == SEX_CV4_PROTOCOL and cfg.finetune.stage:
+    if cfg.finetune.protocol == AGE_CV7_PROTOCOL:
+        result, checkpoint_report = run_age_cv7_stage(
+            cfg, shape_params, device, run_dir
+        )
+    elif cfg.finetune.protocol == SEX_CV4_PROTOCOL and cfg.finetune.stage:
         result, checkpoint_report = run_sex_cv4_stage(
             cfg, shape_params, device, run_dir
         )

@@ -654,6 +654,7 @@ def run_sweep(options, runner=subprocess.run, cache_ensurer=ensure_feature_cache
     logger = setup_run_logging(output_dir, options.log_level, append=options.resume)
     options.logger = logger
     poolings = sorted({c["normalized_cli_args"].get("--pooling") for c in candidates})
+    options.requested_poolings = tuple(poolings)
     head_lrs = sorted({c["normalized_cli_args"].get("--head-lr") for c in candidates})
     weight_decays = sorted({c["normalized_cli_args"].get("--weight-decay") for c in candidates})
     log_event(

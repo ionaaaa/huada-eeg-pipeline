@@ -143,6 +143,27 @@ def test_one_backbone_pass_per_batch_writes_both_label_free_caches(tiny_cache):
         assert dataset.schema.field("sample_id").type == pa.string()
 
 
+def test_mean_only_cache_is_label_free_and_never_creates_flatten(tmp_path):
+    source = TinySource()
+    backbone = CountingBackbone()
+    path = tmp_path / "mean_only"
+    manifest = cache.build_feature_cache(
+        source_dataset=source, backbone=backbone, probe_layer_idx=1,
+        output_dir=path, batch_size=2, device=torch.device("cpu"),
+        expected_num_tokens=4, d_model=3, manifest_base=_manifest_base(source),
+        requested_poolings=("mean",),
+    )
+    assert manifest["requested_poolings"] == ["mean"]
+    assert manifest["mean_row_count"] == 3
+    assert manifest["flatten_row_count"] == 0
+    assert (path / cache.MEAN_CACHE_NAME).is_dir()
+    assert not (path / cache.FLATTEN_CACHE_NAME).exists()
+    assert not set(lance.dataset(str(path / cache.MEAN_CACHE_NAME)).schema.names).intersection(
+        {"age", "sex", "label", "split", "fold", "candidate"}
+    )
+    cache.validate_feature_cache(path)
+
+
 def test_cache_progress_logs_first_interval_last_and_same_pass(tmp_path, capsys):
     source = TinySource()
     backbone = CountingBackbone()
@@ -274,6 +295,14 @@ def test_training_only_settings_do_not_enter_cache_key():
     ):
         # build_cache_identity has no such arguments by design.
         assert ignored and _identity()[1] == baseline
+
+
+def test_requested_pooling_contract_is_bound_into_cache_key():
+    mean_identity, mean_key = _identity(requested_poolings=("mean",))
+    both_identity, both_key = _identity(requested_poolings=("mean", "flatten"))
+    assert mean_key != both_key
+    assert mean_identity["requested_poolings"] == ["mean"]
+    assert both_identity["requested_poolings"] == ["flatten", "mean"]
 
 
 def _copy_cache(tiny_cache, tmp_path, name):
@@ -420,6 +449,32 @@ def test_cached_dataset_joins_labels_by_sample_id_and_collates(tiny_cache, tmp_p
     )
     assert flatten_dataset[0]["feature"].shape == (12,)
     assert dataset[0]["feature"].shape == (3,)
+
+
+def test_same_label_free_mean_cache_serves_sex_and_age_and_excludes_null_age(
+    tiny_cache, tmp_path
+):
+    path, source, _, manifest = tiny_cache
+    label_lance = tmp_path / "shared_labels.lance"
+    table = pa.table({
+        "sample_id": [row["sample_id"] for row in source.metadata],
+        "subject_id": [row["subject_id"] for row in source.metadata],
+        "age": pa.array([20.0, None, 22.0], type=pa.float64()),
+        "sex": ["female", "male", "male"],
+    })
+    lance.write_dataset(table, str(label_lance), mode="create", data_storage_version="stable")
+    sex = cache.CachedFeatureDataset(
+        path, "mean", label_lance, "sex_classification",
+        expected_cache_key=manifest["cache_key"],
+    )
+    age = cache.CachedFeatureDataset(
+        path, "mean", label_lance, "age_regression",
+        expected_cache_key=manifest["cache_key"],
+    )
+    assert len(sex) == 3
+    assert len(age) == 2
+    assert {row["subject_id"] for row in age.get_subject_label_rows()} == {"SUB1", "SUB8"}
+    assert all(age[index]["label"].dtype == torch.float32 for index in range(len(age)))
 
 
 def test_cached_training_never_builds_backbone_and_saves_head_only(

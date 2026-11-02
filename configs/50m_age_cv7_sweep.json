@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "selection": {
+    "primary_metric": "best_validation_mae",
+    "primary_mode": "min",
+    "tie_breakers": [
+      {
+        "metric": "best_validation_rmse",
+        "mode": "min"
+      },
+      {
+        "metric": "best_validation_loss",
+        "mode": "min"
+      },
+      {
+        "metric": "candidate_id",
+        "mode": "asc"
+      }
+    ]
+  },
+  "search_spaces": [
+    {
+      "name": "mean",
+      "fixed_args": {
+        "--pooling": "mean"
+      },
+      "grid": {
+        "--head-lr": [
+          0.0003,
+          0.001
+        ],
+        "--weight-decay": [
+          0.0,
+          0.001
+        ]
+      }
+    }
+  ]
+}

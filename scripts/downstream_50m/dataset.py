@@ -111,6 +111,8 @@ def collate_fn(batch):
         for meta_key in ["sample_id", "subject_id", "recording_id", "label_name"]:
             if meta_key in batch[0]:
                 out[meta_key] = [str(x[meta_key]) for x in batch]
+        if "window_index" in batch[0]:
+            out["window_index"] = torch.stack([x["window_index"] for x in batch], dim=0)
         return out
 
     out = {

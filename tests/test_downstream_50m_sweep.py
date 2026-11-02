@@ -59,13 +59,13 @@ def _fake_cache_info(tmp_path):
     }
 
 
-def test_current_config_expands_eight_unique_candidates_four_per_space():
+def test_current_config_expands_four_unique_mean_only_candidates():
     candidates = sweep.expand_candidates(_config())
-    assert len(candidates) == 8
-    assert len({row["candidate_id"] for row in candidates}) == 8
-    assert len({row["config_sha256"] for row in candidates}) == 8
+    assert len(candidates) == 4
+    assert len({row["candidate_id"] for row in candidates}) == 4
+    assert len({row["config_sha256"] for row in candidates}) == 4
     assert [row["search_space"] for row in candidates].count("mean") == 4
-    assert [row["search_space"] for row in candidates].count("flatten") == 4
+    assert all(row["normalized_cli_args"]["--pooling"] == "mean" for row in candidates)
 
 
 def test_candidate_id_is_stable_when_argument_key_order_changes():
@@ -358,7 +358,7 @@ def test_end_to_end_mock_trainer_search_evaluate_once_resume_and_oof(tmp_path):
     summary = sweep.run_sweep(
         options, runner=runner, cache_ensurer=lambda options: cache_info
     )
-    assert len([call for call in calls if call[call.index("--stage") + 1] == "search"]) == 32
+    assert len([call for call in calls if call[call.index("--stage") + 1] == "search"]) == 16
     assert len([call for call in calls if call[call.index("--stage") + 1] == "evaluate"]) == 4
     assert {
         call[call.index("--feature-cache-key") + 1] for call in calls
@@ -368,7 +368,7 @@ def test_end_to_end_mock_trainer_search_evaluate_once_resume_and_oof(tmp_path):
     } == {cache_info["feature_cache_path"]}
     search_calls = [call for call in calls if call[call.index("--stage") + 1] == "search"]
     assert sum(call[call.index("--pooling") + 1] == "mean" for call in search_calls) == 16
-    assert sum(call[call.index("--pooling") + 1] == "flatten" for call in search_calls) == 16
+    assert all(call[call.index("--pooling") + 1] != "flatten" for call in search_calls)
     assert summary["test_evaluation_calls"] == {str(fold): 1 for fold in range(4)}
     assert summary["backbone_forward_count_during_candidate_training"] == 0
     assert summary["backbone_forward_count_during_test_evaluation"] == 0
@@ -541,10 +541,10 @@ def test_dry_run_writes_manifest_and_commands_without_starting_training(tmp_path
     result = sweep.run_sweep(
         options, runner=lambda *args, **kwargs: pytest.fail("dry-run launched trainer")
     )
-    assert result == {"dry_run": True, "candidate_count": 8, "command_count": 32}
+    assert result == {"dry_run": True, "candidate_count": 4, "command_count": 16}
     output = Path(options.output_dir)
     assert (output / "candidate_manifest.csv").is_file()
-    assert len(json.loads((output / "dry_run_commands.json").read_text())) == 32
+    assert len(json.loads((output / "dry_run_commands.json").read_text())) == 16
     plan = json.loads((output / "dry_run_plan.json").read_text())
     assert len(plan["evaluation_templates"]) == 4
     assert plan["feature_cache"]["build_performed"] is False

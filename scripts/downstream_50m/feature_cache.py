@@ -459,6 +459,30 @@ def _mean_source_probe_parity_report(parity_ids, online_mean, mean_path, source_
     }
 
 
+def _mean_feature_parity_report(parity_ids, online_mean, mean_path):
+    """Validate a generic mean-only cache without introducing a task head."""
+    cached_mean = _read_features_by_sample(mean_path, parity_ids)
+    records = []
+    differences = []
+    for sample_id in parity_ids:
+        online = online_mean[sample_id]
+        cached = cached_mean[sample_id]
+        difference = float(np.max(np.abs(online - cached)))
+        if not np.allclose(online, cached, atol=1e-6, rtol=1e-6):
+            raise RuntimeError(f"Mean-only feature parity failed for {sample_id}: {difference}")
+        differences.append(difference)
+        records.append({"sample_id": sample_id, "mean_max_abs_diff": difference})
+    return {
+        "parity_sample_ids": list(parity_ids),
+        "mean_max_abs_diff": max(differences, default=0.0),
+        "parity_records": records,
+        "parity_head_source": None,
+        "parity_atol": 1e-6,
+        "parity_rtol": 1e-6,
+        "parity_passed": True,
+    }
+
+
 def build_feature_cache(
     *, source_dataset, backbone, probe_layer_idx, output_dir, batch_size,
     device, expected_num_tokens, d_model, manifest_base, logger=None,
@@ -608,6 +632,8 @@ def build_feature_cache(
     )
     if requested_poolings == ("mean",) and parity_head is not None:
         parity = _mean_source_probe_parity_report(parity_ids, online_mean, mean_path, parity_head)
+    elif requested_poolings == ("mean",):
+        parity = _mean_feature_parity_report(parity_ids, online_mean, mean_path)
     elif set(requested_poolings) == {"mean", "flatten"}:
         parity = _parity_report(parity_ids, online_mean, online_flatten, mean_path, flatten_path)
     else:
@@ -809,6 +835,9 @@ def ensure_feature_cache(options):
     checkpoint_sha256 = sha256_file(options.checkpoint)
     log_event(logger, "INFO", "cache.checkpoint", "checkpoint SHA256 computed",
               checkpoint=str(options.checkpoint), checkpoint_sha256=checkpoint_sha256)
+    requested_poolings = tuple(getattr(options, "requested_poolings", ("mean", "flatten")))
+    if not requested_poolings or set(requested_poolings).difference({"mean", "flatten"}):
+        raise ValueError("requested_poolings must contain mean and/or flatten")
     identity, cache_key = build_cache_identity(
         input_fingerprint=input_fingerprint,
         input_row_count=input_info["row_count"],
@@ -824,6 +853,7 @@ def ensure_feature_cache(options):
         probe_layer_ratio=cfg.finetune.probe_layer_ratio,
         model_code_sha256=model_implementation_fingerprint(project_root),
         git_commit=git_commit,
+        requested_poolings=requested_poolings,
     )
     root = Path(options.feature_cache_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -843,6 +873,12 @@ def ensure_feature_cache(options):
                       cache_path=str(canonical_dir), cache_policy=policy)
         raise
     if reused:
+        available_poolings = set(manifest.get("requested_poolings", ("mean", "flatten")))
+        if not set(requested_poolings).issubset(available_poolings):
+            raise ValueError(
+                "Existing feature cache does not contain requested poolings: "
+                f"requested={requested_poolings}, available={sorted(available_poolings)}"
+            )
         log_event(
             logger, "INFO", "cache.lookup", "cache hit: feature extraction skipped",
             cache_path=str(final_dir), cache_policy=policy,
@@ -941,6 +977,7 @@ def ensure_feature_cache(options):
             manifest_base=manifest_base,
             logger=logger,
             log_every_batches=getattr(options, "cache_log_every_batches", 5),
+            requested_poolings=requested_poolings,
         )
         del backbone
         validate_feature_cache(temporary_dir, identity, cache_key, logger=logger)
@@ -977,9 +1014,15 @@ def ensure_feature_cache(options):
         processed_rows=manifest["backbone_processed_window_count"],
         backbone_forward_count=manifest["backbone_forward_count"],
         mean_shape=f"[{manifest['mean_row_count']},{manifest['mean_feature_dim']}]",
-        flatten_shape=f"[{manifest['flatten_row_count']},{manifest['flatten_feature_dim']}]",
+        flatten_shape=(
+            None if "flatten" not in manifest.get("requested_poolings", [])
+            else f"[{manifest['flatten_row_count']},{manifest['flatten_feature_dim']}]"
+        ),
         mean_cache_path=str(final_dir / MEAN_CACHE_NAME),
-        flatten_cache_path=str(final_dir / FLATTEN_CACHE_NAME),
+        flatten_cache_path=(
+            str(final_dir / FLATTEN_CACHE_NAME)
+            if "flatten" in manifest.get("requested_poolings", []) else None
+        ),
         cache_size_bytes=directory_size(final_dir), elapsed_seconds=round(elapsed, 1),
         success_path=str(final_dir / SUCCESS_NAME),
     )
@@ -1026,9 +1069,10 @@ class CachedFeatureDataset(Dataset):
             raise ValueError("Selected feature cache row count mismatch")
         kwargs = {} if storage_options is None else {"storage_options": storage_options}
         source = lance.dataset(str(input_lance), **kwargs)
-        source_rows = source.to_table(
-            columns=["sample_id", "subject_id", "age", "sex"]
-        ).to_pylist()
+        source_columns = ["sample_id", "subject_id", "age", "sex"]
+        if "window_index" in source.schema.names:
+            source_columns.append("window_index")
+        source_rows = source.to_table(columns=source_columns).to_pylist()
         source_by_id = {str(row["sample_id"]): row for row in source_rows}
         cache_rows = self.ds.to_table(columns=["sample_id", "subject_id"]).to_pylist()
         self.metadata = []
@@ -1051,9 +1095,10 @@ class CachedFeatureDataset(Dataset):
                 label = float(source_row["age"])
                 label_name = ""
             self.metadata.append({
-                "index": index, "sample_id": sample_id,
+                "index": len(self.metadata), "cache_index": index, "sample_id": sample_id,
                 "subject_id": str(source_row["subject_id"]),
                 "label": label, "label_name": label_name,
+                "window_index": int(source_row.get("window_index", index)),
             })
 
     def __len__(self):
@@ -1066,6 +1111,7 @@ class CachedFeatureDataset(Dataset):
             "sample_id": metadata["sample_id"],
             "subject_id": metadata["subject_id"],
             "recording_id": "" if row.get("recording_id") is None else str(row["recording_id"]),
+            "window_index": torch.tensor(metadata["window_index"], dtype=torch.int64),
             "feature": torch.from_numpy(feature),
             "num_valid_tokens": torch.tensor(int(row["num_valid_tokens"]), dtype=torch.int64),
             "label_name": metadata["label_name"],
@@ -1078,7 +1124,7 @@ class CachedFeatureDataset(Dataset):
     def __getitem__(self, local_index):
         metadata = self.metadata[int(local_index)]
         row = self.ds.take(
-            [metadata["index"]],
+            [metadata["cache_index"]],
             columns=["sample_id", "recording_id", "feature", "num_valid_tokens"],
         ).to_pylist()[0]
         if str(row["sample_id"]) != metadata["sample_id"]:
@@ -1090,7 +1136,7 @@ class CachedFeatureDataset(Dataset):
             return []
         metadata = [self.metadata[int(index)] for index in local_indices]
         rows = self.ds.take(
-            [row["index"] for row in metadata],
+            [row["cache_index"] for row in metadata],
             columns=["sample_id", "recording_id", "feature", "num_valid_tokens"],
         ).to_pylist()
         if [str(row["sample_id"]) for row in rows] != [row["sample_id"] for row in metadata]:
