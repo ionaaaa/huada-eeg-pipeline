@@ -227,6 +227,13 @@ def validate_oof_window_predictions(rows, eligible_samples, subject_test_folds):
 
 
 def aggregate_subject_predictions(window_rows):
+    """Aggregate window probabilities and votes with a deterministic tie-break.
+
+    The function is shared by CV/OOF and external zero-shot evaluation.  Fold
+    metadata is validated and returned only when it is present in the input.
+    Vote ties use probability-mean argmax; an exact probability tie resolves
+    to class 0 (female), matching NumPy's deterministic ``argmax`` behavior.
+    """
     grouped = defaultdict(list)
     for row in window_rows:
         grouped[str(row["subject_id"])].append(row)
@@ -234,9 +241,12 @@ def aggregate_subject_predictions(window_rows):
     for subject_id in sorted(grouped):
         rows = grouped[subject_id]
         true_labels = {int(row["true_label"]) for row in rows}
-        folds = {int(row["fold"]) for row in rows}
-        if len(true_labels) != 1 or len(folds) != 1:
-            raise ValueError(f"Inconsistent OOF subject rows for {subject_id}")
+        has_folds = any("fold" in row for row in rows)
+        if has_folds and not all("fold" in row for row in rows):
+            raise ValueError(f"Partially populated fold metadata for {subject_id}")
+        folds = {int(row["fold"]) for row in rows} if has_folds else set()
+        if len(true_labels) != 1 or (has_folds and len(folds) != 1):
+            raise ValueError(f"Inconsistent subject rows for {subject_id}")
         true_label = next(iter(true_labels))
         mean_female = float(np.mean([float(row["prob_female"]) for row in rows]))
         mean_male = float(np.mean([float(row["prob_male"]) for row in rows]))
@@ -255,7 +265,7 @@ def aggregate_subject_predictions(window_rows):
             majority_prediction = 1
         else:
             majority_prediction = 0
-        subject_rows.append({
+        subject_row = {
             "subject_id": subject_id,
             "true_label": true_label,
             "true_sex": LABEL_TO_SEX[true_label],
@@ -269,8 +279,10 @@ def aggregate_subject_predictions(window_rows):
             "majority_vote_pred_label": majority_prediction,
             "majority_vote_pred_sex": LABEL_TO_SEX[majority_prediction],
             "tie_break_used": tie_break_used,
-            "test_fold": next(iter(folds)),
-        })
+        }
+        if has_folds:
+            subject_row["test_fold"] = next(iter(folds))
+        subject_rows.append(subject_row)
     return subject_rows
 
 

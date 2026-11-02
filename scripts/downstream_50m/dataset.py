@@ -140,7 +140,7 @@ def collate_fn(batch):
         if meta_key in batch[0]:
             out[meta_key] = [str(x[meta_key]) for x in batch]
 
-    for tensor_key in ["source_sfreq", "model_sfreq"]:
+    for tensor_key in ["source_sfreq", "model_sfreq", "window_index"]:
         if tensor_key in batch[0]:
             out[tensor_key] = torch.stack([x[tensor_key] for x in batch], dim=0)
 

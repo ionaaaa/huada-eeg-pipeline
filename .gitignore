@@ -8,6 +8,8 @@ preprocessed_common/
 preprocessed_common_smoke/
 preprocessing_audit/
 audit_resting_state/
+checkpoint_compatibility_audit/
+downstream_output/
 model_tokens/
 model_tokens_smoke/
 /downstream_smoke/
