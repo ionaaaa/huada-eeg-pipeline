@@ -62,8 +62,12 @@ except ImportError:  # direct script execution
 TASK = "age_regression"
 FEATURE_DIM = 512
 POOLING = "mean"
-TARGET_TRANSFORM = "raw_years"
+RAW_TARGET_TRANSFORM = "raw_years"
+ZSCORE_TARGET_TRANSFORM = "train_subject_zscore"
+TARGET_TRANSFORMS = (RAW_TARGET_TRANSFORM, ZSCORE_TARGET_TRANSFORM)
 CHECKPOINT_KIND = "age_head_convergence_diagnostic_only"
+LEAST_SQUARES_CHECKPOINT_KIND = "diagnostic_least_squares_head_only"
+TARGET_STD_EPSILON = 1e-12
 EXPLOSION_DIAGNOSTIC_THRESHOLD = 1e6
 EXPECTED_SUBJECTS = {"SUB1", "SUB2", "SUB3", "SUB4", "SUB5", "SUB6", "SUB7", "SUB8"}
 ISSUE_FIELDS = [
@@ -72,6 +76,13 @@ ISSUE_FIELDS = [
 ]
 STEP_FIELDS = [
     "experiment", "epoch", "global_step", "batch_index", "batch_size", "lr",
+    "target_transform", "target_mean_years", "target_std_years",
+    "loss_mse_z", "batch_mae_z", "batch_rmse_z", "batch_mae_years",
+    "batch_rmse_years", "batch_mean_bias_years",
+    "prediction_z_min", "prediction_z_max", "prediction_z_mean", "prediction_z_std",
+    "prediction_years_min", "prediction_years_max", "prediction_years_mean",
+    "prediction_years_std", "target_z_min", "target_z_max", "target_z_mean",
+    "target_z_std",
     "loss_mse", "mae_years", "rmse_years", "target_min", "target_max",
     "target_mean", "target_std", "prediction_min", "prediction_max",
     "prediction_mean", "prediction_std", "feature_l2_norm_min",
@@ -84,9 +95,15 @@ STEP_FIELDS = [
     "gradient_norm_after_clip", "gradient_clip_threshold", "elapsed_seconds",
 ]
 EPOCH_FIELDS = [
-    "experiment", "epoch", "optimizer_steps", "train_mse", "train_mae_years",
-    "train_rmse_years", "validation_mse", "validation_mae_years",
-    "validation_rmse_years", "prediction_min", "prediction_max",
+    "experiment", "epoch", "optimizer_steps", "target_transform", "target_mean_years",
+    "target_std_years", "train_mse_z", "train_mae_z", "train_rmse_z",
+    "train_mse", "train_mae_years", "train_rmse_years", "train_mean_bias_years",
+    "validation_mse_z", "validation_mae_z", "validation_rmse_z",
+    "validation_mse", "validation_mae_years", "validation_rmse_years",
+    "validation_mean_bias_years", "prediction_z_min", "prediction_z_max",
+    "prediction_z_mean", "prediction_z_std", "prediction_years_min",
+    "prediction_years_max", "prediction_years_mean", "prediction_years_std",
+    "prediction_min", "prediction_max",
     "prediction_mean", "prediction_std", "head_weight_l2_norm", "head_bias",
     "head_parameter_delta_from_init", "gradient_norm_mean", "gradient_norm_max",
     "learning_rate", "epoch_elapsed_seconds", "all_finite",
@@ -120,6 +137,73 @@ class FeatureRecord:
     age: float
     feature: np.ndarray
     num_valid_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class TargetTransform:
+    mode: str
+    train_subject_ages: dict[str, float]
+    mean_years: float
+    std_years: float
+    epsilon: float = TARGET_STD_EPSILON
+
+    @property
+    def standardized(self) -> bool:
+        return self.mode == ZSCORE_TARGET_TRANSFORM
+
+    @property
+    def initialization(self) -> str:
+        return "zeros" if self.standardized else "legacy_seeded_random"
+
+    def transform_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        if not self.standardized:
+            return values
+        return (values - float(self.mean_years)) / float(self.std_years)
+
+    def inverse_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        if not self.standardized:
+            return values
+        return values * float(self.std_years) + float(self.mean_years)
+
+    def transform_numpy(self, values: np.ndarray) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        if not self.standardized:
+            return array
+        return (array - self.mean_years) / self.std_years
+
+    def inverse_numpy(self, values: np.ndarray) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        if not self.standardized:
+            return array
+        return array * self.std_years + self.mean_years
+
+    def as_dict(self, fold_info: dict[str, Any]) -> dict[str, Any]:
+        subject_ids = list(fold_info["train_subjects"])
+        ages = np.asarray([self.train_subject_ages[subject] for subject in subject_ids], dtype=np.float64)
+        round_trip = self.inverse_numpy(self.transform_numpy(ages))
+        return {
+            "fold": int(fold_info["fold"]),
+            "target_transform": self.mode,
+            "target_statistics_scope": "unique_train_subjects_only",
+            "target_statistics_weighting": "equal_subject_weight",
+            "train_subject_ids": subject_ids,
+            "train_subject_ages_years": {
+                subject: float(self.train_subject_ages[subject]) for subject in subject_ids
+            },
+            "target_mean_years": float(self.mean_years),
+            "target_std_years": float(self.std_years),
+            "target_std_ddof": 0,
+            "epsilon": float(self.epsilon),
+            "formula": "z = (age_years - mu_train) / sigma_train",
+            "inverse_formula": "age_years = z * sigma_train + mu_train",
+            "target_inverse_transform_applied": bool(self.standardized),
+            "validation_used_for_target_statistics": False,
+            "test_used_for_target_statistics": False,
+            "validation_subject": str(fold_info["validation_subject"]),
+            "test_subject": str(fold_info["test_subject"]),
+            "test_age_read": False,
+            "round_trip_max_abs_error_years": float(np.max(np.abs(round_trip - ages))),
+        }
 
 
 class FeatureRecordDataset(Dataset):
@@ -175,6 +259,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--train-seed", type=int, default=42)
+    parser.add_argument("--target-transform", choices=TARGET_TRANSFORMS, default=RAW_TARGET_TRANSFORM)
     parser.add_argument("--head-lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -187,6 +272,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plateau-slope-tolerance", type=float, default=1e-4)
     parser.add_argument("--step-log-interval", type=int, default=1)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
+    parser.add_argument("--lstsq-driver", choices=["gels", "gelsy", "gelsd", "gelss"], default="gelsd")
+    parser.add_argument("--lstsq-rcond", type=float, default=None)
+    parser.add_argument("--lstsq-absolute-tolerance", type=float, default=1e-6)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -207,6 +295,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("head LR must be positive and weight decay cannot be negative")
     if args.gradient_clip_norm is not None and args.gradient_clip_norm <= 0:
         parser.error("--gradient-clip-norm must be positive when enabled")
+    if args.lstsq_rcond is not None and args.lstsq_rcond < 0:
+        parser.error("--lstsq-rcond cannot be negative")
+    if args.lstsq_absolute_tolerance <= 0:
+        parser.error("--lstsq-absolute-tolerance must be positive")
     return args
 
 
@@ -427,6 +519,161 @@ def stratified_mini_sample(
     return selected
 
 
+def build_train_only_target_transform(
+    train_records: Sequence[FeatureRecord], fold_info: dict[str, Any], mode: str,
+    epsilon: float = TARGET_STD_EPSILON,
+) -> TargetTransform:
+    """Build target statistics from one age per canonical train subject only."""
+
+    if mode not in TARGET_TRANSFORMS:
+        raise DataValidationError(f"Unsupported target transform: {mode}")
+    expected = list(fold_info["train_subjects"])
+    expected_set = set(expected)
+    forbidden = set(fold_info["validation_subjects"]) | set(fold_info["test_subjects"])
+    grouped: dict[str, set[float]] = defaultdict(set)
+    for row in train_records:
+        if row.subject_id in forbidden or row.subject_id not in expected_set:
+            raise DataValidationError(
+                f"Non-train subject supplied to target statistics: {row.subject_id}"
+            )
+        if not math.isfinite(float(row.age)):
+            raise DataValidationError(f"Non-finite train age for {row.sample_id}")
+        grouped[row.subject_id].add(float(row.age))
+    if set(grouped) != expected_set:
+        raise DataValidationError(
+            f"Target-statistics subject mismatch: got={sorted(grouped)}, expected={expected}"
+        )
+    inconsistent = {subject: sorted(values) for subject, values in grouped.items() if len(values) != 1}
+    if inconsistent:
+        raise DataValidationError(f"Inconsistent age within train subject: {inconsistent}")
+    subject_ages = {subject: next(iter(grouped[subject])) for subject in expected}
+    age_vector = np.asarray([subject_ages[subject] for subject in expected], dtype=np.float64)
+    mean_years = float(np.mean(age_vector))
+    std_years = float(np.std(age_vector, ddof=0))
+    if not math.isfinite(mean_years) or not math.isfinite(std_years):
+        raise NonFiniteError("Train-only target statistics became NaN/Inf")
+    if mode == ZSCORE_TARGET_TRANSFORM and std_years <= float(epsilon):
+        raise DataValidationError(
+            f"Train-subject age std {std_years} is not greater than epsilon {epsilon}"
+        )
+    return TargetTransform(
+        mode=mode,
+        train_subject_ages=subject_ages,
+        mean_years=mean_years,
+        std_years=std_years,
+        epsilon=float(epsilon),
+    )
+
+
+@dataclass(frozen=True)
+class LeastSquaresReference:
+    diagnostics: dict[str, Any]
+    head_state_dict: dict[str, torch.Tensor]
+    predicted_years: np.ndarray
+    sample_ids: tuple[str, ...]
+
+
+def solve_train_only_linear_least_squares(
+    records: Sequence[FeatureRecord], target_transform: TargetTransform, *,
+    driver: str = "gelsd", rcond: float | None = None,
+    absolute_tolerance: float = 1e-6,
+) -> LeastSquaresReference:
+    """Compute a CPU/float64 affine least-squares reference from train rows only."""
+
+    if not records:
+        raise DataValidationError("Least-squares diagnostic requires train records")
+    if absolute_tolerance <= 0:
+        raise DataValidationError("Least-squares absolute tolerance must be positive")
+    sample_ids = tuple(row.sample_id for row in records)
+    if len(sample_ids) != len(set(sample_ids)):
+        raise DataValidationError("Duplicate sample_id in least-squares rows")
+    features_np = np.stack([np.asarray(row.feature, dtype=np.float64) for row in records])
+    targets_years_np = np.asarray([row.age for row in records], dtype=np.float64)
+    if features_np.shape != (len(records), FEATURE_DIM):
+        raise DataValidationError("Least-squares features must be [N,512]")
+    if not np.isfinite(features_np).all() or not np.isfinite(targets_years_np).all():
+        raise NonFiniteError("Least-squares input contains NaN/Inf")
+    targets_z_np = target_transform.transform_numpy(targets_years_np)
+    features = torch.from_numpy(features_np).to(device="cpu", dtype=torch.float64)
+    targets_z = torch.from_numpy(targets_z_np).to(device="cpu", dtype=torch.float64).reshape(-1, 1)
+    ones = torch.ones((features.shape[0], 1), dtype=torch.float64, device="cpu")
+    augmented = torch.cat([features, ones], dim=1)
+    try:
+        solved = torch.linalg.lstsq(
+            augmented, targets_z, rcond=rcond, driver=str(driver)
+        )
+    except RuntimeError as exc:
+        raise DataValidationError(f"torch.linalg.lstsq failed: {exc}") from exc
+    theta = solved.solution.reshape(-1)
+    if theta.numel() != FEATURE_DIM + 1 or not torch.isfinite(theta).all():
+        raise NonFiniteError("Least-squares solution is non-finite or has the wrong shape")
+    predicted_z = augmented @ theta
+    if not torch.isfinite(predicted_z).all():
+        raise NonFiniteError("Least-squares prediction became NaN/Inf")
+    residual_z = predicted_z - targets_z.reshape(-1)
+    predicted_years = target_transform.inverse_numpy(predicted_z.numpy())
+    residual_years = predicted_years - targets_years_np
+    singular = torch.linalg.svdvals(augmented)
+    rank = int(torch.linalg.matrix_rank(augmented).item())
+    singular_np = singular.detach().cpu().numpy()
+    positive = singular_np[singular_np > np.finfo(np.float64).eps]
+    condition = None if positive.size == 0 else float(positive.max() / positive.min())
+    residual_z_np = residual_z.detach().cpu().numpy()
+    mse_z = float(np.mean(residual_z_np ** 2))
+    diagnostics = {
+        "solver": "torch.linalg.lstsq",
+        "compute_device": "cpu",
+        "compute_dtype": "float64",
+        "driver": str(driver),
+        "rcond": None if rcond is None else float(rcond),
+        "absolute_tolerance": float(absolute_tolerance),
+        "rows": len(records),
+        "feature_dim": FEATURE_DIM,
+        "augmented_dim": FEATURE_DIM + 1,
+        "matrix_rank": rank,
+        "full_row_rank": rank == min(len(records), FEATURE_DIM + 1),
+        "condition_number": condition,
+        "singular_value_min": None if singular_np.size == 0 else float(singular_np.min()),
+        "singular_value_max": None if singular_np.size == 0 else float(singular_np.max()),
+        "singular_value_summary": _array_summary(singular_np),
+        "target_transform": target_transform.mode,
+        "target_mean_years": float(target_transform.mean_years),
+        "target_std_years": float(target_transform.std_years),
+        "solution_finite": True,
+        "prediction_finite": True,
+        "train_mse_z": mse_z,
+        "train_mae_z": float(np.mean(np.abs(residual_z_np))),
+        "train_rmse_z": float(np.sqrt(mse_z)),
+        "train_mse_years": float(np.mean(residual_years ** 2)),
+        "train_mae_years": float(np.mean(np.abs(residual_years))),
+        "train_rmse_years": float(np.sqrt(np.mean(residual_years ** 2))),
+        "train_mean_bias_years": float(np.mean(residual_years)),
+        "train_prediction_min_years": float(np.min(predicted_years)),
+        "train_prediction_max_years": float(np.max(predicted_years)),
+        "explicit_residual_l2": float(torch.linalg.vector_norm(residual_z).item()),
+        "explicit_residual_abs_max": float(torch.max(torch.abs(residual_z)).item()),
+        "exact_interpolation_within_tolerance": bool(
+            torch.max(torch.abs(residual_z)).item() <= float(absolute_tolerance)
+        ),
+        "residual_source": "explicit_recomputation_not_lstsq_residuals",
+        "train_sample_count": len(sample_ids),
+        "train_sample_id_sha256": hashlib.sha256("\n".join(sample_ids).encode()).hexdigest(),
+        "validation_rows_used": 0,
+        "test_rows_used": 0,
+        "test_accessed": False,
+    }
+    state = {
+        "weight": theta[:FEATURE_DIM].to(dtype=torch.float32).reshape(1, FEATURE_DIM).clone(),
+        "bias": theta[FEATURE_DIM:].to(dtype=torch.float32).reshape(1).clone(),
+    }
+    return LeastSquaresReference(
+        diagnostics=diagnostics,
+        head_state_dict=state,
+        predicted_years=np.asarray(predicted_years, dtype=np.float64),
+        sample_ids=sample_ids,
+    )
+
+
 def _array_summary(values: np.ndarray) -> dict[str, float]:
     values = np.asarray(values, dtype=np.float64)
     return {
@@ -560,7 +807,9 @@ def _head_fingerprint(model: CachedFeatureClassifier) -> str:
     return digest.hexdigest()
 
 
-def create_age_head(seed: int, device: torch.device) -> CachedFeatureClassifier:
+def create_age_head(
+    seed: int, device: torch.device, initialization: str = "legacy_seeded_random"
+) -> CachedFeatureClassifier:
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(seed))
         model = CachedFeatureClassifier(
@@ -568,6 +817,12 @@ def create_age_head(seed: int, device: torch.device) -> CachedFeatureClassifier:
             use_mlp_head=False, head_dropout=0.0,
         )
     model = model.to(device)
+    if initialization == "zeros":
+        with torch.no_grad():
+            model.head.weight.zero_()
+            model.head.bias.zero_()
+    elif initialization != "legacy_seeded_random":
+        raise DataValidationError(f"Unsupported head initialization: {initialization}")
     if sum(parameter.numel() for parameter in model.parameters()) != 513:
         raise RuntimeError("Diagnostic age head must have exactly 513 parameters")
     return model
@@ -619,22 +874,26 @@ def perform_training_step(
     criterion: torch.nn.Module, batch: dict[str, Any], device: torch.device,
     experiment: str, epoch: int, global_step: int, batch_index: int,
     initial_parameters: torch.Tensor, gradient_clip_norm: float | None,
-    elapsed_seconds: float,
+    elapsed_seconds: float, target_transform: TargetTransform | None = None,
 ) -> dict[str, Any]:
     forbidden = batch.get("forbidden_subjects", set())
     if set(batch["subject_id"]) & set(forbidden):
         raise AssertionError("Test subject appeared in a training batch")
     features = batch["feature"].to(device)
-    targets = batch["label"].to(device).view(-1)
+    targets_years = batch["label"].to(device).view(-1)
+    transform = target_transform or TargetTransform(
+        RAW_TARGET_TRANSFORM, {}, 0.0, 1.0
+    )
+    targets_z = transform.transform_tensor(targets_years)
     feature_finite = bool(torch.isfinite(features).all().item())
     if not feature_finite:
         raise NonFiniteError("Training batch feature contains NaN/Inf")
     optimizer.zero_grad(set_to_none=True)
-    predictions = model.classify_features(features).view(-1)
-    prediction_finite = bool(torch.isfinite(predictions).all().item())
+    predictions_z = model.classify_features(features).view(-1)
+    prediction_finite = bool(torch.isfinite(predictions_z).all().item())
     if not prediction_finite:
         raise NonFiniteError("Prediction became NaN/Inf")
-    loss = criterion(predictions, targets)
+    loss = criterion(predictions_z, targets_z)
     loss_finite = bool(torch.isfinite(loss).item())
     if not loss_finite:
         raise NonFiniteError("Loss became NaN/Inf")
@@ -655,20 +914,45 @@ def perform_training_step(
     parameters = _parameter_stats(model, initial_parameters)
     if not parameters["parameter_finite"]:
         raise NonFiniteError("Head parameters became NaN/Inf after optimizer step")
-    target_stats = _stats(targets)
-    prediction_stats = _stats(predictions)
+    predictions_years = transform.inverse_tensor(predictions_z.detach())
+    target_year_stats = _stats(targets_years)
+    target_z_stats = _stats(targets_z)
+    prediction_z_stats = _stats(predictions_z)
+    prediction_year_stats = _stats(predictions_years)
     feature_norm_stats = _stats(torch.linalg.vector_norm(features.float(), dim=1))
-    errors = predictions.detach() - targets
+    errors_z = predictions_z.detach() - targets_z
+    errors_years = predictions_years - targets_years
     return {
         "experiment": experiment, "epoch": epoch, "global_step": global_step,
-        "batch_index": batch_index, "batch_size": int(targets.numel()),
+        "batch_index": batch_index, "batch_size": int(targets_years.numel()),
         "lr": float(optimizer.param_groups[0]["lr"]),
-        "loss_mse": float(loss.item()), "mae_years": float(errors.abs().mean().item()),
-        "rmse_years": float(torch.sqrt(torch.mean(errors ** 2)).item()),
-        "target_min": target_stats["min"], "target_max": target_stats["max"],
-        "target_mean": target_stats["mean"], "target_std": target_stats["std"],
-        "prediction_min": prediction_stats["min"], "prediction_max": prediction_stats["max"],
-        "prediction_mean": prediction_stats["mean"], "prediction_std": prediction_stats["std"],
+        "target_transform": transform.mode,
+        "target_mean_years": float(transform.mean_years),
+        "target_std_years": float(transform.std_years),
+        "loss_mse_z": float(loss.item()),
+        "batch_mae_z": float(errors_z.abs().mean().item()),
+        "batch_rmse_z": float(torch.sqrt(torch.mean(errors_z ** 2)).item()),
+        "batch_mae_years": float(errors_years.abs().mean().item()),
+        "batch_rmse_years": float(torch.sqrt(torch.mean(errors_years ** 2)).item()),
+        "batch_mean_bias_years": float(errors_years.mean().item()),
+        "prediction_z_min": prediction_z_stats["min"],
+        "prediction_z_max": prediction_z_stats["max"],
+        "prediction_z_mean": prediction_z_stats["mean"],
+        "prediction_z_std": prediction_z_stats["std"],
+        "prediction_years_min": prediction_year_stats["min"],
+        "prediction_years_max": prediction_year_stats["max"],
+        "prediction_years_mean": prediction_year_stats["mean"],
+        "prediction_years_std": prediction_year_stats["std"],
+        "target_z_min": target_z_stats["min"], "target_z_max": target_z_stats["max"],
+        "target_z_mean": target_z_stats["mean"], "target_z_std": target_z_stats["std"],
+        "loss_mse": float(loss.item()), "mae_years": float(errors_years.abs().mean().item()),
+        "rmse_years": float(torch.sqrt(torch.mean(errors_years ** 2)).item()),
+        "target_min": target_year_stats["min"], "target_max": target_year_stats["max"],
+        "target_mean": target_year_stats["mean"], "target_std": target_year_stats["std"],
+        "prediction_min": prediction_year_stats["min"],
+        "prediction_max": prediction_year_stats["max"],
+        "prediction_mean": prediction_year_stats["mean"],
+        "prediction_std": prediction_year_stats["std"],
         "feature_l2_norm_min": feature_norm_stats["min"],
         "feature_l2_norm_max": feature_norm_stats["max"],
         "feature_l2_norm_mean": feature_norm_stats["mean"],
@@ -686,6 +970,8 @@ def perform_training_step(
 def evaluate_records(
     model: CachedFeatureClassifier, records: Sequence[FeatureRecord],
     batch_size: int, device: torch.device, forbidden_subjects: Iterable[str],
+    target_transform: TargetTransform | None = None,
+    return_predictions: bool = False,
 ) -> dict[str, Any]:
     dataset = FeatureRecordDataset(records, forbidden_subjects)
     loader = DataLoader(
@@ -693,28 +979,50 @@ def evaluate_records(
         num_workers=0, collate_fn=collate_records, drop_last=False,
     )
     model.eval()
-    truth: list[float] = []
-    predicted: list[float] = []
+    transform = target_transform or TargetTransform(RAW_TARGET_TRANSFORM, {}, 0.0, 1.0)
+    truth_years: list[float] = []
+    predicted_z: list[float] = []
     for batch in loader:
         if set(batch["subject_id"]) & set(forbidden_subjects):
             raise AssertionError("Test subject appeared in evaluation batch")
         features = batch["feature"].to(device)
         labels = batch["label"].to(device).view(-1)
-        outputs = model.classify_features(features).view(-1)
-        if not torch.isfinite(outputs).all():
+        outputs_z = model.classify_features(features).view(-1)
+        if not torch.isfinite(outputs_z).all():
             raise NonFiniteError("Evaluation prediction became NaN/Inf")
-        truth.extend(labels.cpu().tolist())
-        predicted.extend(outputs.cpu().tolist())
-    targets = np.asarray(truth, dtype=np.float64)
-    predictions = np.asarray(predicted, dtype=np.float64)
-    errors = predictions - targets
-    return {
-        "mse": float(np.mean(errors ** 2)), "mae": float(np.mean(np.abs(errors))),
-        "rmse": float(np.sqrt(np.mean(errors ** 2))),
-        "prediction_min": float(predictions.min()), "prediction_max": float(predictions.max()),
-        "prediction_mean": float(predictions.mean()), "prediction_std": float(predictions.std()),
-        "all_finite": bool(np.isfinite(predictions).all()), "sample_count": len(predictions),
+        truth_years.extend(labels.cpu().tolist())
+        predicted_z.extend(outputs_z.cpu().tolist())
+    targets_years = np.asarray(truth_years, dtype=np.float64)
+    targets_z = transform.transform_numpy(targets_years)
+    predictions_z = np.asarray(predicted_z, dtype=np.float64)
+    predictions_years = transform.inverse_numpy(predictions_z)
+    errors_z = predictions_z - targets_z
+    errors_years = predictions_years - targets_years
+    mse_z = float(np.mean(errors_z ** 2))
+    mse_years = float(np.mean(errors_years ** 2))
+    result = {
+        "mse": mse_years, "mae": float(np.mean(np.abs(errors_years))),
+        "rmse": float(np.sqrt(mse_years)),
+        "mse_z": mse_z, "mae_z": float(np.mean(np.abs(errors_z))),
+        "rmse_z": float(np.sqrt(mse_z)),
+        "mae_years": float(np.mean(np.abs(errors_years))),
+        "rmse_years": float(np.sqrt(mse_years)),
+        "mean_bias_years": float(np.mean(errors_years)),
+        "prediction_min": float(predictions_years.min()),
+        "prediction_max": float(predictions_years.max()),
+        "prediction_mean": float(predictions_years.mean()),
+        "prediction_std": float(predictions_years.std()),
+        "prediction_z_min": float(predictions_z.min()),
+        "prediction_z_max": float(predictions_z.max()),
+        "prediction_z_mean": float(predictions_z.mean()),
+        "prediction_z_std": float(predictions_z.std()),
+        "all_finite": bool(np.isfinite(predictions_years).all()),
+        "sample_count": len(predictions_years),
     }
+    if return_predictions:
+        result["_prediction_years"] = predictions_years
+        result["_sample_ids"] = tuple(row.sample_id for row in records)
+    return result
 
 
 def _state_copy(model: CachedFeatureClassifier) -> dict[str, torch.Tensor]:
@@ -731,7 +1039,9 @@ def _last_n_slope(values: Sequence[float], window: int) -> float | None:
 def _diagnostic_checkpoint(
     path: Path, state: dict[str, torch.Tensor], experiment: str, epoch: int,
     fold_info: dict[str, Any], args: argparse.Namespace, cache_key: str | None,
+    target_transform: TargetTransform | None = None,
 ) -> None:
+    transform = target_transform or TargetTransform(RAW_TARGET_TRANSFORM, {}, 0.0, 1.0)
     torch.save({
         "checkpoint_kind": CHECKPOINT_KIND,
         "not_for_formal_evaluation": True,
@@ -739,8 +1049,36 @@ def _diagnostic_checkpoint(
         "diagnostic_head_state_dict": state,
         "experiment": experiment, "epoch": int(epoch), "fold": int(fold_info["fold"]),
         "task": TASK, "pooling": POOLING, "feature_dim": FEATURE_DIM,
-        "target_transform": TARGET_TRANSFORM, "optimizer": "AdamW",
+        "target_transform": transform.mode,
+        "target_mean_years": float(transform.mean_years),
+        "target_std_years": float(transform.std_years),
+        "initialization": transform.initialization,
+        "optimizer": "AdamW",
         "head_lr": float(args.head_lr), "weight_decay": float(args.weight_decay),
+        "feature_cache_key": cache_key,
+    }, path)
+
+
+def _least_squares_checkpoint(
+    path: Path, reference: LeastSquaresReference, experiment: str,
+    fold_info: dict[str, Any], target_transform: TargetTransform,
+    cache_key: str | None,
+) -> None:
+    torch.save({
+        "checkpoint_kind": LEAST_SQUARES_CHECKPOINT_KIND,
+        "not_for_formal_evaluation": True,
+        "test_accessed": False,
+        "diagnostic_least_squares_head_state_dict": reference.head_state_dict,
+        "experiment": experiment,
+        "fold": int(fold_info["fold"]),
+        "task": TASK,
+        "pooling": POOLING,
+        "feature_dim": FEATURE_DIM,
+        "target_transform": target_transform.mode,
+        "target_mean_years": float(target_transform.mean_years),
+        "target_std_years": float(target_transform.std_years),
+        "solver": reference.diagnostics["solver"],
+        "driver": reference.diagnostics["driver"],
         "feature_cache_key": cache_key,
     }, path)
 
@@ -750,7 +1088,7 @@ def run_training_experiment(
     validation_records: Sequence[FeatureRecord] | None, output_dir: Path,
     max_epochs: int, convergence_mae: float, args: argparse.Namespace,
     fold_info: dict[str, Any], logger: logging.Logger,
-    cache_key: str | None = None,
+    target_transform: TargetTransform, cache_key: str | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     test_subjects = set(fold_info["test_subjects"])
@@ -758,20 +1096,51 @@ def run_training_experiment(
         row.subject_id for row in (validation_records or [])
     }) & test_subjects:
         raise AssertionError("Test record supplied to diagnostic experiment")
+    if any(row.subject_id not in set(fold_info["train_subjects"]) for row in train_records):
+        raise AssertionError("Non-train record supplied to optimizer or least-squares diagnostic")
+    lstsq = solve_train_only_linear_least_squares(
+        train_records,
+        target_transform,
+        driver=str(getattr(args, "lstsq_driver", "gelsd")),
+        rcond=getattr(args, "lstsq_rcond", None),
+        absolute_tolerance=float(getattr(args, "lstsq_absolute_tolerance", 1e-6)),
+    )
+    if set(lstsq.sample_ids) != {row.sample_id for row in train_records}:
+        raise AssertionError("Least-squares sample IDs differ from train records")
+    _write_json(output_dir / "least_squares_diagnostics.json", lstsq.diagnostics)
+    _least_squares_checkpoint(
+        output_dir / "least_squares_diagnostic_head.pt", lstsq, experiment,
+        fold_info, target_transform, cache_key,
+    )
     device = torch.device(args.device)
-    model = create_age_head(args.train_seed, device)
+    model = create_age_head(args.train_seed, device, target_transform.initialization)
     initial_parameters = _head_vector(model)
     initial_fingerprint = _head_fingerprint(model)
+    initial_weight_norm = float(torch.linalg.vector_norm(model.head.weight.detach()).item())
+    initial_bias = float(model.head.bias.detach().reshape(-1)[0].item())
     criterion = make_criterion(TASK)
     optimizer = torch.optim.AdamW(
         [{"params": model.head.parameters(), "name": "head"}],
         lr=float(args.head_lr), weight_decay=float(args.weight_decay),
     )
-    initial_train = evaluate_records(model, train_records, args.batch_size, device, test_subjects)
+    initial_train = evaluate_records(
+        model, train_records, args.batch_size, device, test_subjects, target_transform
+    )
     initial_validation = (
         None if validation_records is None else
-        evaluate_records(model, validation_records, args.batch_size, device, test_subjects)
+        evaluate_records(
+            model, validation_records, args.batch_size, device, test_subjects, target_transform
+        )
     )
+    if target_transform.standardized:
+        if initial_weight_norm != 0.0 or initial_bias != 0.0:
+            raise DataValidationError("Z-score diagnostic head was not zero initialized")
+        if max(
+            abs(initial_train["prediction_z_min"]), abs(initial_train["prediction_z_max"])
+        ) > 1e-7:
+            raise DataValidationError("Zero-initialized head did not predict z=0")
+        if abs(initial_train["prediction_mean"] - target_transform.mean_years) > 1e-6:
+            raise DataValidationError("Zero-initialized head did not predict train mean age")
     dataset = FeatureRecordDataset(train_records, test_subjects)
     generator = torch.Generator().manual_seed(int(args.train_seed))
     loader = DataLoader(
@@ -782,14 +1151,22 @@ def run_training_experiment(
     )
     epoch_rows: list[dict[str, Any]] = []
     train_mae_history: list[float] = []
-    best_train = {"mae": math.inf, "mse": math.inf, "rmse": math.inf, "epoch": None}
-    best_loss = {"mse": math.inf, "epoch": None}
-    best_validation = {"mae": math.inf, "mse": math.inf, "rmse": math.inf, "epoch": None}
+    best_train = {
+        "mae": math.inf, "mse": math.inf, "rmse": math.inf,
+        "mae_z": math.inf, "mse_z": math.inf, "rmse_z": math.inf, "epoch": None,
+    }
+    best_loss = {"mse_z": math.inf, "epoch": None}
+    best_validation = {
+        "mae": math.inf, "mse": math.inf, "rmse": math.inf,
+        "mae_z": math.inf, "mse_z": math.inf, "rmse_z": math.inf, "epoch": None,
+    }
     best_loss_state: dict[str, torch.Tensor] | None = None
     global_step = 0
     status = "completed_not_converged"
     stop_reason = "epoch_budget_exhausted"
     epoch_reaching_threshold = None
+    epoch_reaching_mae_threshold = None
+    epoch_reaching_lstsq_tolerance = None
     started = time.monotonic()
     failure: dict[str, Any] | None = None
     last_valid_train = initial_train
@@ -816,6 +1193,7 @@ def run_training_experiment(
                         initial_parameters=initial_parameters,
                         gradient_clip_norm=args.gradient_clip_norm,
                         elapsed_seconds=time.monotonic() - started,
+                        target_transform=target_transform,
                     )
                     epoch_gradient_norms.append(float(row["gradient_total_l2_norm"]))
                     if global_step % int(args.step_log_interval) == 0:
@@ -829,10 +1207,15 @@ def run_training_experiment(
                     "message": str(exc), "value": "non_finite", "threshold": "finite",
                 }
                 break
-            train_metrics = evaluate_records(model, train_records, args.batch_size, device, test_subjects)
+            train_metrics = evaluate_records(
+                model, train_records, args.batch_size, device, test_subjects, target_transform
+            )
             validation_metrics = (
                 None if validation_records is None else
-                evaluate_records(model, validation_records, args.batch_size, device, test_subjects)
+                evaluate_records(
+                    model, validation_records, args.batch_size, device, test_subjects,
+                    target_transform,
+                )
             )
             parameters = _parameter_stats(model, initial_parameters)
             all_finite = bool(
@@ -851,12 +1234,34 @@ def run_training_experiment(
                 break
             epoch_row = {
                 "experiment": experiment, "epoch": epoch,
-                "optimizer_steps": global_step, "train_mse": train_metrics["mse"],
+                "optimizer_steps": global_step,
+                "target_transform": target_transform.mode,
+                "target_mean_years": target_transform.mean_years,
+                "target_std_years": target_transform.std_years,
+                "train_mse_z": train_metrics["mse_z"],
+                "train_mae_z": train_metrics["mae_z"],
+                "train_rmse_z": train_metrics["rmse_z"],
+                "train_mse": train_metrics["mse"],
                 "train_mae_years": train_metrics["mae"],
                 "train_rmse_years": train_metrics["rmse"],
+                "train_mean_bias_years": train_metrics["mean_bias_years"],
+                "validation_mse_z": None if validation_metrics is None else validation_metrics["mse_z"],
+                "validation_mae_z": None if validation_metrics is None else validation_metrics["mae_z"],
+                "validation_rmse_z": None if validation_metrics is None else validation_metrics["rmse_z"],
                 "validation_mse": None if validation_metrics is None else validation_metrics["mse"],
                 "validation_mae_years": None if validation_metrics is None else validation_metrics["mae"],
                 "validation_rmse_years": None if validation_metrics is None else validation_metrics["rmse"],
+                "validation_mean_bias_years": (
+                    None if validation_metrics is None else validation_metrics["mean_bias_years"]
+                ),
+                "prediction_z_min": train_metrics["prediction_z_min"],
+                "prediction_z_max": train_metrics["prediction_z_max"],
+                "prediction_z_mean": train_metrics["prediction_z_mean"],
+                "prediction_z_std": train_metrics["prediction_z_std"],
+                "prediction_years_min": train_metrics["prediction_min"],
+                "prediction_years_max": train_metrics["prediction_max"],
+                "prediction_years_mean": train_metrics["prediction_mean"],
+                "prediction_years_std": train_metrics["prediction_std"],
                 "prediction_min": train_metrics["prediction_min"],
                 "prediction_max": train_metrics["prediction_max"],
                 "prediction_mean": train_metrics["prediction_mean"],
@@ -876,48 +1281,81 @@ def run_training_experiment(
             last_valid_train = train_metrics
             last_valid_validation = validation_metrics
             if train_metrics["mae"] < best_train["mae"]:
-                best_train = {**{key: float(train_metrics[key]) for key in ("mae", "mse", "rmse")}, "epoch": epoch}
-            if train_metrics["mse"] < best_loss["mse"]:
-                best_loss = {"mse": float(train_metrics["mse"]), "epoch": epoch}
+                best_train = {
+                    **{key: float(train_metrics[key]) for key in (
+                        "mae", "mse", "rmse", "mae_z", "mse_z", "rmse_z"
+                    )},
+                    "epoch": epoch,
+                }
+            if train_metrics["mse_z"] < best_loss["mse_z"]:
+                best_loss = {"mse_z": float(train_metrics["mse_z"]), "epoch": epoch}
                 best_loss_state = _state_copy(model)
             if validation_metrics is not None and validation_metrics["mae"] < best_validation["mae"]:
                 best_validation = {
-                    **{key: float(validation_metrics[key]) for key in ("mae", "mse", "rmse")},
+                    **{key: float(validation_metrics[key]) for key in (
+                        "mae", "mse", "rmse", "mae_z", "mse_z", "rmse_z"
+                    )},
                     "epoch": epoch,
                 }
             log_event(
                 logger, "INFO", "diagnostic.epoch", "diagnostic epoch completed",
                 experiment=experiment, epoch=f"{epoch}/{max_epochs}", steps=global_step,
-                train_loss=round(train_metrics["mse"], 6),
-                train_mae=round(train_metrics["mae"], 6),
+                train_mse_z=round(train_metrics["mse_z"], 8),
+                train_mae_years=round(train_metrics["mae"], 6),
                 validation_mae=(None if validation_metrics is None else round(validation_metrics["mae"], 6)),
+                best_train_mae_years=round(best_train["mae"], 6),
+                least_squares_train_mae_years=round(lstsq.diagnostics["train_mae_years"], 10),
+                adamw_to_lstsq_mae_gap=round(
+                    best_train["mae"] - lstsq.diagnostics["train_mae_years"], 10
+                ),
                 prediction_range=[round(train_metrics["prediction_min"], 4), round(train_metrics["prediction_max"], 4)],
                 weight_norm=round(parameters["head_weight_l2_norm"], 6),
                 gradient_mean=round(float(np.mean(epoch_gradient_norms)), 6),
                 gradient_max=round(float(np.max(epoch_gradient_norms)), 6),
                 finite=all_finite, elapsed_seconds=round(time.monotonic() - started, 3),
             )
-            if experiment == "mini_overfit" and train_metrics["mae"] <= float(convergence_mae):
-                status, stop_reason = "completed_converged", "mae_threshold_reached"
+            mae_reached = train_metrics["mae"] <= float(convergence_mae)
+            lstsq_reached = train_metrics["mse_z"] <= (
+                float(lstsq.diagnostics["train_mse_z"])
+                + float(getattr(args, "lstsq_absolute_tolerance", 1e-6))
+            )
+            if mae_reached and epoch_reaching_mae_threshold is None:
+                epoch_reaching_mae_threshold = epoch
+            if lstsq_reached and epoch_reaching_lstsq_tolerance is None:
+                epoch_reaching_lstsq_tolerance = epoch
+            required_lstsq_reached = lstsq_reached if target_transform.standardized else True
+            if experiment == "mini_overfit" and mae_reached and required_lstsq_reached:
+                status, stop_reason = "completed_converged", "mae_and_lstsq_threshold_reached"
                 epoch_reaching_threshold = epoch
                 log_event(
                     logger, "INFO", "diagnostic.converged", "mini-overfit threshold reached",
                     experiment=experiment, epoch=epoch, train_mae=train_metrics["mae"],
                     threshold=convergence_mae,
+                    lstsq_absolute_tolerance=getattr(args, "lstsq_absolute_tolerance", 1e-6),
                 )
                 break
     if status == "failed_non_finite":
         final_train = last_valid_train
         final_validation = last_valid_validation
     else:
-        final_train = evaluate_records(model, train_records, args.batch_size, device, test_subjects)
+        final_train = evaluate_records(
+            model, train_records, args.batch_size, device, test_subjects,
+            target_transform, return_predictions=True,
+        )
         final_validation = (
             None if validation_records is None else
-            evaluate_records(model, validation_records, args.batch_size, device, test_subjects)
+            evaluate_records(
+                model, validation_records, args.batch_size, device, test_subjects,
+                target_transform,
+            )
         )
     if status not in {"failed_non_finite", "failed_runtime"}:
         threshold = convergence_mae
-        if best_train["mae"] <= threshold:
+        reached_required_optimum = (
+            best_loss["mse_z"] <= float(lstsq.diagnostics["train_mse_z"])
+            + float(getattr(args, "lstsq_absolute_tolerance", 1e-6))
+        ) if target_transform.standardized and experiment == "mini_overfit" else True
+        if best_train["mae"] <= threshold and reached_required_optimum:
             status = "completed_converged"
             if epoch_reaching_threshold is None:
                 epoch_reaching_threshold = best_train["epoch"]
@@ -926,33 +1364,66 @@ def run_training_experiment(
     if best_loss_state is not None and experiment == "full_train":
         _diagnostic_checkpoint(
             output_dir / "minimum_train_loss_diagnostic_head.pt", best_loss_state, experiment,
-            int(best_loss["epoch"]), fold_info, args, cache_key,
+            int(best_loss["epoch"]), fold_info, args, cache_key, target_transform,
         )
         _diagnostic_checkpoint(
             output_dir / "final_diagnostic_head.pt", _state_copy(model), experiment,
             int(epoch_rows[-1]["epoch"] if epoch_rows else 0), fold_info, args, cache_key,
+            target_transform,
         )
     slope = _last_n_slope(train_mae_history, args.plateau_window)
     plateau = bool(slope is not None and abs(slope) <= float(args.plateau_slope_tolerance))
+    final_prediction_years = np.asarray(
+        final_train.get("_prediction_years", np.asarray([], dtype=np.float64)), dtype=np.float64
+    )
+    final_sample_ids = tuple(final_train.get("_sample_ids", ()))
+    if final_sample_ids and final_sample_ids != lstsq.sample_ids:
+        raise AssertionError("AdamW and least-squares prediction row order differs")
+    prediction_diff = (
+        final_prediction_years - lstsq.predicted_years
+        if final_prediction_years.size == lstsq.predicted_years.size else None
+    )
+    final_train_public = {key: value for key, value in final_train.items() if not key.startswith("_")}
+    lstsq_mse_z = float(lstsq.diagnostics["train_mse_z"])
+    tolerance = float(getattr(args, "lstsq_absolute_tolerance", 1e-6))
+    lstsq_optimum_reached = bool(
+        best_loss["epoch"] is not None and best_loss["mse_z"] <= lstsq_mse_z + tolerance
+    )
     result = {
         "experiment": experiment, "status": status, "stop_reason": stop_reason,
+        "target_transform": target_transform.mode,
+        "target_mean_years": float(target_transform.mean_years),
+        "target_std_years": float(target_transform.std_years),
+        "initialization": target_transform.initialization,
+        "initial_weight_norm": initial_weight_norm,
+        "initial_bias": initial_bias,
+        "initial_prediction_z": initial_train["prediction_z_mean"],
+        "initial_prediction_age_years": initial_train["prediction_mean"],
         "initial_head_fingerprint": initial_fingerprint,
         "final_head_fingerprint": _head_fingerprint(model),
-        "initial_loss": initial_train["mse"], "final_loss": final_train["mse"],
-        "minimum_loss": None if best_loss["epoch"] is None else best_loss["mse"],
+        "initial_loss": initial_train["mse_z"], "final_loss": final_train_public["mse_z"],
+        "minimum_loss": None if best_loss["epoch"] is None else best_loss["mse_z"],
         "epoch_of_minimum_train_loss": best_loss["epoch"],
-        "initial_mae": initial_train["mae"], "final_mae": final_train["mae"],
+        "initial_mae": initial_train["mae"], "final_mae": final_train_public["mae"],
         "minimum_mae": None if best_train["epoch"] is None else best_train["mae"],
-        "initial_rmse": initial_train["rmse"], "final_rmse": final_train["rmse"],
+        "initial_rmse": initial_train["rmse"], "final_rmse": final_train_public["rmse"],
+        "initial_mse_z": initial_train["mse_z"],
+        "final_mse_z": final_train_public["mse_z"],
+        "minimum_mse_z": None if best_loss["epoch"] is None else best_loss["mse_z"],
+        "initial_mae_z": initial_train["mae_z"],
+        "final_mae_z": final_train_public["mae_z"],
+        "minimum_mae_z": None if best_train["epoch"] is None else best_train["mae_z"],
         "minimum_rmse": (
             None if not epoch_rows else min(float(row["train_rmse_years"]) for row in epoch_rows)
         ),
         "epoch_of_minimum_train_mae": best_train["epoch"],
         "epoch_reaching_threshold": epoch_reaching_threshold,
+        "epoch_reaching_mae_threshold": epoch_reaching_mae_threshold,
+        "epoch_reaching_lstsq_tolerance": epoch_reaching_lstsq_tolerance,
         "converged": status == "completed_converged",
         "loss_reduction_fraction": (
-            None if initial_train["mse"] == 0 else
-            float((initial_train["mse"] - final_train["mse"]) / initial_train["mse"])
+            None if initial_train["mse_z"] == 0 else
+            float((initial_train["mse_z"] - final_train_public["mse_z"]) / initial_train["mse_z"])
         ),
         "initial_validation": initial_validation, "final_validation": final_validation,
         "minimum_validation": None if best_validation["epoch"] is None else best_validation,
@@ -965,6 +1436,43 @@ def run_training_experiment(
         "optimizer_steps": global_step, "step_trajectory_rows": step_writer.count,
         "epoch_trajectory_rows": len(epoch_rows), "failure": failure,
         "test_accessed": False,
+        "least_squares": lstsq.diagnostics,
+        "least_squares_train_mae_years": lstsq.diagnostics["train_mae_years"],
+        "adamw_min_train_mae_years": None if best_train["epoch"] is None else best_train["mae"],
+        "adamw_final_train_mae_years": final_train_public["mae"],
+        "adamw_min_minus_lstsq_mae": (
+            None if best_train["epoch"] is None else
+            float(best_train["mae"] - lstsq.diagnostics["train_mae_years"])
+        ),
+        "adamw_final_minus_lstsq_mae": float(
+            final_train_public["mae"] - lstsq.diagnostics["train_mae_years"]
+        ),
+        "least_squares_train_mse_z": lstsq_mse_z,
+        "adamw_min_train_mse_z": None if best_loss["epoch"] is None else best_loss["mse_z"],
+        "adamw_final_train_mse_z": final_train_public["mse_z"],
+        "adamw_min_minus_lstsq_mse_z": (
+            None if best_loss["epoch"] is None else float(best_loss["mse_z"] - lstsq_mse_z)
+        ),
+        "adamw_final_minus_lstsq_mse_z": float(final_train_public["mse_z"] - lstsq_mse_z),
+        "adamw_vs_lstsq_prediction_mae_years": (
+            None if prediction_diff is None else float(np.mean(np.abs(prediction_diff)))
+        ),
+        "adamw_vs_lstsq_prediction_max_abs_diff_years": (
+            None if prediction_diff is None else float(np.max(np.abs(prediction_diff)))
+        ),
+        "lstsq_absolute_tolerance": tolerance,
+        "lstsq_optimum_reached": lstsq_optimum_reached,
+        "train_mae_thresholds_reached": {
+            "0.10": bool(best_train["mae"] <= 0.10),
+            "0.25": bool(best_train["mae"] <= 0.25),
+            "0.50": bool(best_train["mae"] <= 0.50),
+        },
+        "final_gradient_norm_mean": (
+            None if not epoch_rows else float(epoch_rows[-1]["gradient_norm_mean"])
+        ),
+        "final_gradient_significantly_nonzero": bool(
+            epoch_rows and float(epoch_rows[-1]["gradient_norm_mean"]) > 1e-8
+        ),
     }
     if status == "failed_non_finite":
         result["failure_mode"] = "non_finite"
@@ -1002,31 +1510,35 @@ def automatic_conclusion(mini: dict[str, Any], full: dict[str, Any], args: argpa
             "category": "A", "code": "non_finite_training_failure",
             "message_zh": "出现非有限数值，当前不能把正式CV7差结果解释为泛化失败。",
         }
-    if not mini.get("converged", False):
+    references = [mini.get("least_squares") or {}, full.get("least_squares") or {}]
+    if not all(reference.get("exact_interpolation_within_tolerance", False) for reference in references):
         return {
-            "category": "A", "code": "mini_overfit_failed",
-            "message_zh": "少量训练样本无法过拟合，仍可能存在实现、尺度、优化器或梯度问题。",
+            "category": "A", "code": "least_squares_cannot_fit_train",
+            "message_zh": "train-only解析最小二乘也未达到低残差；需检查rank、feature/target关联、solver或数据。",
         }
-    if not full.get("converged", False):
+    if (
+        not mini.get("converged", False)
+        or not mini.get("lstsq_optimum_reached", False)
+        or not full.get("train_mae_thresholds_reached", {}).get("0.50", False)
+    ):
         return {
-            "category": "B", "code": "mini_passed_full_train_fit_poor",
-            "message_zh": "基本训练链路可工作，但完整训练集拟合仍差，需检查容量、特征尺度、优化设置或样本冲突。",
+            "category": "B", "code": "adamw_above_reachable_train_optimum",
+            "message_zh": "解析解可近零误差拟合，但AdamW仍明显高于可达解；主要问题是优化速度、尺度或训练配置，不能据此判断年龄泛化。",
         }
-    initial_val = (full.get("initial_validation") or {}).get("mae")
-    final_val = (full.get("final_validation") or {}).get("mae")
-    minimum_val = (full.get("minimum_validation") or {}).get("mae")
-    sustained_improvement = bool(
-        initial_val is not None and final_val is not None and minimum_val is not None
-        and minimum_val <= 0.8 * initial_val and final_val <= 0.9 * initial_val
+    final_val = (full.get("final_validation") or {}).get("mae_years")
+    minimum_train = full.get("adamw_min_train_mae_years")
+    validation_gap = bool(
+        final_val is not None and minimum_train is not None
+        and final_val > max(0.50, 2.0 * float(minimum_train))
     )
-    if sustained_improvement:
+    if validation_gap:
         return {
-            "category": "D", "code": "train_and_validation_improved",
-            "message_zh": "mini和完整train均能拟合且validation持续改善，之前正式训练的epoch、LR或选择设置值得进一步核查。",
+            "category": "D", "code": "low_train_error_validation_gap",
+            "message_zh": "train误差已低但单个validation被试仍差，更像记忆训练集或跨被试泛化失败；因validation仅一名被试，结论需谨慎。",
         }
     return {
-        "category": "C", "code": "train_fit_validation_generalization_gap",
-        "message_zh": "线性头能学习训练数据，但validation没有持续改善，主要问题更像极小样本跨被试泛化。",
+        "category": "C", "code": "adamw_near_reachable_train_optimum",
+        "message_zh": "AdamW已接近解析训练最优且train误差低，迭代优化问题基本解决；之后才可用validation/OOF评估跨被试泛化。",
     }
 
 
@@ -1051,25 +1563,79 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
     mini = summary["mini_overfit"]
     full = summary["full_train"]
     conclusion = summary["automatic_conclusion"]
+    transform = summary["target_transform_metadata"]
+    ages = ", ".join(
+        f"{subject}={age:g}" for subject, age in transform["train_subject_ages_years"].items()
+    )
+    mini_ls = mini.get("least_squares") or {}
+    full_ls = full.get("least_squares") or {}
+    initial_val = full.get("initial_validation") or {}
+    minimum_val = full.get("minimum_validation") or {}
+    final_val = full.get("final_validation") or {}
+    supports_formal_change = bool(
+        mini.get("converged")
+        and (mini.get("minimum_mae") or math.inf) <= 0.10
+        and mini.get("lstsq_optimum_reached")
+        and summary.get("all_values_finite")
+        and not mini.get("test_accessed")
+    )
     report = f"""# 年龄线性头收敛诊断
 
 本次是诊断实验，不是正式性能实验。未创建test dataset/DataLoader，未读取test feature、prediction或label，不能从本结果报告test MAE。
 
+## Fold与target transform
+
 - fold: `{summary['fold']}`
-- train / validation / excluded test subject: `{summary['train_subjects']}` / `{summary['validation_subject']}` / `{summary['test_subject']}`
-- target: `raw years`
-- optimizer: `AdamW`
+- train subjects及年龄: `{ages}`
+- validation / excluded test subject: `{summary['validation_subject']}` / `{summary['test_subject']}`
+- target transform: `{summary['target_transform']}`
+- train-only subject mean/std: `{summary['target_mean_years']}` / `{summary['target_std_years']}`（ddof=0）
+- transform: `z = (age_years - mu_train) / sigma_train`
+- inverse: `age_years = z * sigma_train + mu_train`
+- 统计权重: `unique train subjects, equal subject weight`
+- validation/test用于统计: `False / False`
+- 初始化: `{summary['initialization']}`；初始z/年龄预测: `{mini.get('initial_prediction_z')}` / `{mini.get('initial_prediction_age_years')}`
+
+## Train-only解析最小二乘参考
+
+| 实验 | rows / rank | condition number | LS train MAE / RMSE (years) | exact interpolation |
+|---|---:|---:|---:|---:|
+| mini | {mini_ls.get('rows')} / {mini_ls.get('matrix_rank')} | {mini_ls.get('condition_number')} | {mini_ls.get('train_mae_years')} / {mini_ls.get('train_rmse_years')} | {mini_ls.get('exact_interpolation_within_tolerance')} |
+| full | {full_ls.get('rows')} / {full_ls.get('matrix_rank')} | {full_ls.get('condition_number')} | {full_ls.get('train_mae_years')} / {full_ls.get('train_rmse_years')} | {full_ls.get('exact_interpolation_within_tolerance')} |
+
+解析解仅证明这些train rows在线性系统中可拟合，不证明feature具有可泛化的年龄规律。512维feature面对不足513个train窗口时具有很强的记忆能力。
+
+## AdamW与可达解
+
+| 实验 | AdamW minimum / final MAE (years) | LS MAE | minimum / final gap | last-{mini.get('plateau_window')} epoch slope | final gradient mean |
+|---|---:|---:|---:|---:|---:|
+| mini | {mini.get('adamw_min_train_mae_years')} / {mini.get('adamw_final_train_mae_years')} | {mini.get('least_squares_train_mae_years')} | {mini.get('adamw_min_minus_lstsq_mae')} / {mini.get('adamw_final_minus_lstsq_mae')} | {mini.get('last_n_epoch_mae_slope')} | {mini.get('final_gradient_norm_mean')} |
+| full | {full.get('adamw_min_train_mae_years')} / {full.get('adamw_final_train_mae_years')} | {full.get('least_squares_train_mae_years')} | {full.get('adamw_min_minus_lstsq_mae')} / {full.get('adamw_final_minus_lstsq_mae')} | {full.get('last_n_epoch_mae_slope')} | {full.get('final_gradient_norm_mean')} |
+
+- optimizer / LR / weight decay: `AdamW / {summary['head_lr']} / {summary['weight_decay']}`
 - gradient clipping: `{summary['gradient_clipping']}`
-- mini status / minimum MAE: `{mini['status']}` / `{mini.get('minimum_mae')}`
-- full status / minimum train MAE: `{full['status']}` / `{full.get('minimum_mae')}`
-- full minimum/final validation MAE: `{(full.get('minimum_validation') or {}).get('mae')}` / `{(full.get('final_validation') or {}).get('mae')}`
+- mini status / reached 0.10 years / reached LS tolerance: `{mini['status']}` / `{mini.get('train_mae_thresholds_reached', {}).get('0.10')}` / `{mini.get('lstsq_optimum_reached')}`
+- full reached 0.10 / 0.25 / 0.50 years: `{full.get('train_mae_thresholds_reached')}`
 - any non-finite value: `{not summary['all_values_finite']}`
+
+## Validation观察
+
+- initial validation MAE: `{initial_val.get('mae_years')}` years
+- minimum validation MAE / epoch: `{minimum_val.get('mae')}` / `{minimum_val.get('epoch')}`
+- final validation MAE: `{final_val.get('mae_years')}` years
+
+Validation只有一名被试，只用于观察轨迹，不用于解析求解、target统计、checkpoint选择或正式性能结论。
+
+## Test隔离与结论
+
+- test dataset/DataLoader created: `{summary['test_dataset_created']} / {summary['test_dataloader_created']}`
+- test query/materialized/forward/metrics: `False / {summary['test_rows_materialized']} / {summary['test_forward_count']} / {summary['test_metrics_computed']}`
 
 自动结论 `{conclusion['category']}`：{conclusion['message_zh']}
 
-此前正式sweep的cached linear-probe实际使用SGD；`lr=0.001`在所有fold表现为约32–45年validation MAE，而`0.0003`保持有限。本诊断按要求改用AdamW并记录逐step梯度/尺度，因此可以诊断AdamW头能否收敛，但不能把优化器差异静默忽略，也不会修改正式CV7结论。
+本次是否支持下一阶段考虑修改正式CV7：`{supports_formal_change}`。此前正式cached linear-probe真实使用`SGD`，本诊断使用`AdamW`；两者不能静默等同，本次不会修改正式CV7。
 
-诊断checkpoint仅含`diagnostic_head_state_dict`，标记`not_for_formal_evaluation=true`，不得用于正式模型结论。
+所有迭代与解析checkpoint均标记`not_for_formal_evaluation=true`，不得用于正式模型结论。
 """
     path.write_text(report, encoding="utf-8")
 
@@ -1077,6 +1643,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
 def _access_guards() -> dict[str, Any]:
     return {
         "test_dataset_created": False, "test_dataloader_created": False,
+        "test_query_executed": False,
         "test_rows_materialized": 0, "test_forward_count": 0,
         "test_metrics_computed": False,
     }
@@ -1087,9 +1654,11 @@ def verify_trajectory_artifacts(output_dir: Path, summary: dict[str, Any]) -> bo
 
     required = [
         "feature_diagnostics.json", "feature_dimension_statistics.csv",
-        "selected_mini_samples.csv", "split_subjects.csv",
+        "selected_mini_samples.csv", "split_subjects.csv", "target_transform.json",
         "mini_overfit/step_trajectory.csv", "mini_overfit/epoch_trajectory.csv",
+        "mini_overfit/least_squares_diagnostics.json",
         "full_train/step_trajectory.csv", "full_train/epoch_trajectory.csv",
+        "full_train/least_squares_diagnostics.json",
         "diagnostic_issues.csv", "diagnostic_errors.log",
     ]
     missing = [name for name in required if not (output_dir / name).exists()]
@@ -1121,16 +1690,37 @@ def verify_trajectory_artifacts(output_dir: Path, summary: dict[str, Any]) -> bo
     ).readline().strip().split(",")
     if issues_header != ISSUE_FIELDS:
         raise RuntimeError("Diagnostic issue schema mismatch")
-    for checkpoint in (output_dir / "full_train").glob("*_diagnostic_head.pt"):
+    checkpoints = [
+        checkpoint
+        for experiment in ("mini_overfit", "full_train")
+        for checkpoint in (output_dir / experiment).glob("*_diagnostic_head.pt")
+    ]
+    for checkpoint in checkpoints:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        kind = payload.get("checkpoint_kind")
+        safe_kind = kind in {CHECKPOINT_KIND, LEAST_SQUARES_CHECKPOINT_KIND}
+        forbidden_formal_state = set(payload) & {"head_state_dict", "model_state_dict"}
+        expected_state = (
+            "diagnostic_head_state_dict" if kind == CHECKPOINT_KIND
+            else "diagnostic_least_squares_head_state_dict"
+        )
         if (
-            payload.get("checkpoint_kind") != CHECKPOINT_KIND
+            not safe_kind
+            or expected_state not in payload
             or payload.get("not_for_formal_evaluation") is not True
             or payload.get("test_accessed") is not False
-            or "head_state_dict" in payload
-            or "model_state_dict" in payload
+            or forbidden_formal_state
         ):
             raise RuntimeError(f"Unsafe diagnostic checkpoint metadata: {checkpoint}")
+    transform = json.loads((output_dir / "target_transform.json").read_text(encoding="utf-8"))
+    if (
+        set(transform["train_subject_ids"]) != set(summary["train_subjects"])
+        or transform["validation_subject"] in transform["train_subject_ids"]
+        or transform["test_subject"] in transform["train_subject_ids"]
+        or transform["validation_used_for_target_statistics"] is not False
+        or transform["test_used_for_target_statistics"] is not False
+    ):
+        raise RuntimeError("Unsafe target transform statistics scope")
     return True
 
 
@@ -1154,6 +1744,11 @@ def execute_from_records(
         raise DataValidationError("Train or validation split is empty")
     if {row.sample_id for row in train_records} & {row.sample_id for row in validation_records}:
         raise DataValidationError("Train/validation sample leakage")
+    target_transform = build_train_only_target_transform(
+        train_records, fold_info, getattr(args, "target_transform", RAW_TARGET_TRANSFORM)
+    )
+    target_transform_payload = target_transform.as_dict(fold_info)
+    _write_json(output_dir / "target_transform.json", target_transform_payload)
     mini_records = stratified_mini_sample(
         train_records, args.mini_samples_per_subject, args.train_seed
     )
@@ -1174,19 +1769,30 @@ def execute_from_records(
         experiment="mini_overfit", train_records=mini_records, validation_records=None,
         output_dir=output_dir / "mini_overfit", max_epochs=args.mini_max_epochs,
         convergence_mae=args.mini_convergence_mae, args=args, fold_info=fold_info,
-        logger=logger, cache_key=cache_key,
+        logger=logger, target_transform=target_transform, cache_key=cache_key,
     )
     if mini["status"] == "failed_non_finite":
         full_dir = output_dir / "full_train"
         full_dir.mkdir(parents=True, exist_ok=False)
         _write_csv(full_dir / "step_trajectory.csv", [], STEP_FIELDS)
         _write_csv(full_dir / "epoch_trajectory.csv", [], EPOCH_FIELDS)
+        full_lstsq = solve_train_only_linear_least_squares(
+            train_records, target_transform,
+            driver=str(getattr(args, "lstsq_driver", "gelsd")),
+            rcond=getattr(args, "lstsq_rcond", None),
+            absolute_tolerance=float(getattr(args, "lstsq_absolute_tolerance", 1e-6)),
+        )
+        _write_json(full_dir / "least_squares_diagnostics.json", full_lstsq.diagnostics)
+        _least_squares_checkpoint(
+            full_dir / "least_squares_diagnostic_head.pt", full_lstsq, "full_train",
+            fold_info, target_transform, cache_key,
+        )
         full = {
             "experiment": "full_train", "status": "failed_non_finite",
             "stop_reason": "skipped_after_mini_non_finite", "converged": False,
             "all_values_finite": False, "optimizer_steps": 0,
             "step_trajectory_rows": 0, "epoch_trajectory_rows": 0,
-            "test_accessed": False,
+            "test_accessed": False, "least_squares": full_lstsq.diagnostics,
         }
     else:
         log_event(logger, "INFO", "diagnostic.stage5", "[stage 5] full-train convergence")
@@ -1194,7 +1800,8 @@ def execute_from_records(
             experiment="full_train", train_records=train_records,
             validation_records=validation_records, output_dir=output_dir / "full_train",
             max_epochs=args.full_max_epochs, convergence_mae=args.full_train_good_mae,
-            args=args, fold_info=fold_info, logger=logger, cache_key=cache_key,
+            args=args, fold_info=fold_info, logger=logger,
+            target_transform=target_transform, cache_key=cache_key,
         )
     conclusion = automatic_conclusion(mini, full, args)
     summary = {
@@ -1205,7 +1812,17 @@ def execute_from_records(
             else "completed_not_converged"
         ),
         "diagnostic_only": True, "not_for_formal_performance": True,
-        "task": TASK, "target_transform": TARGET_TRANSFORM, "pooling": POOLING,
+        "task": TASK, "target_transform": target_transform.mode, "pooling": POOLING,
+        "target_transform_metadata": target_transform_payload,
+        "target_statistics_scope": "unique_train_subjects_only",
+        "target_statistics_weighting": "equal_subject_weight",
+        "target_mean_years": float(target_transform.mean_years),
+        "target_std_years": float(target_transform.std_years),
+        "target_std_ddof": 0,
+        "target_inverse_transform_applied": bool(target_transform.standardized),
+        "validation_used_for_target_statistics": False,
+        "test_used_for_target_statistics": False,
+        "initialization": target_transform.initialization,
         "feature_dim": FEATURE_DIM, "feature_source": "existing_cache",
         "backbone_constructed": False, "backbone_forward_count": 0,
         "fold": int(fold_info["fold"]), "split_seed": int(args.split_seed),
@@ -1226,6 +1843,13 @@ def execute_from_records(
         ),
         **_access_guards(),
     }
+    summary["formal_age_cv7_change_supported"] = bool(
+        mini.get("converged")
+        and (mini.get("minimum_mae") or math.inf) <= 0.10
+        and mini.get("lstsq_optimum_reached")
+        and summary["all_values_finite"]
+        and summary["test_rows_materialized"] == 0
+    )
     return summary
 
 
@@ -1272,7 +1896,7 @@ def run(args: argparse.Namespace) -> int:
         )
         provenance = {
             **summary,
-            "protocol": "age_head_convergence_diagnostic_v1",
+            "protocol": "age_head_convergence_diagnostic_v2_train_zscore_lstsq",
             "canonical_cv_protocol": PROTOCOL,
             "canonical_fold_algorithm_version": ALGORITHM_VERSION,
             "fold_assignment": fold_info,
@@ -1288,9 +1912,10 @@ def run(args: argparse.Namespace) -> int:
                 "head_lr_0p001_validation_mae_observed_range": [32.13933048248291, 45.18931341952965],
                 "head_lr_0p0003_validation_mae_observed_range": [0.5651840597896253, 5.850984191894531],
                 "source": "audited 50m_age_cv7_sweep_20261102_135226 run.log",
+                "optimizer_resolved_from": "scripts/downstream_50m/largeScale_fineTune.py:make_optimizer linear_probe branch",
                 "diagnostic_optimizer_differs": True,
             },
-            "test_query_executed": False,
+            "formal_age_cv7_modified": False,
             "formal_checkpoint_compatible": False,
             "git": _git_state(project_root),
             "code_sha256": {

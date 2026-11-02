@@ -43,6 +43,7 @@ test ! -e "$OUTPUT_DIR"
   --fold "$FOLD" \
   --split-seed "$SPLIT_SEED" \
   --train-seed "$TRAIN_SEED" \
+  --target-transform train_subject_zscore \
   --head-lr "$HEAD_LR" \
   --weight-decay "$WEIGHT_DECAY" \
   --batch-size "$BATCH_SIZE" \

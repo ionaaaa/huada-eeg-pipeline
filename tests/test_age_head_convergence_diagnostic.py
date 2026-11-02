@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import sys
+from types import SimpleNamespace
 from argparse import Namespace
 from pathlib import Path
 
@@ -57,6 +58,8 @@ def _args(**overrides):
         full_max_epochs=150, mini_convergence_mae=0.1, full_train_good_mae=1.0,
         plateau_window=5, plateau_slope_tolerance=1e-4, step_log_interval=1,
         gradient_clip_norm=None, device="cpu", log_level="INFO",
+        target_transform=diagnostic.RAW_TARGET_TRANSFORM,
+        lstsq_driver="gelsd", lstsq_rcond=None, lstsq_absolute_tolerance=1e-6,
     )
     values.update(overrides)
     return Namespace(**values)
@@ -237,6 +240,7 @@ def test_synthetic_mini_overfit_full_reinit_and_trajectory_artifacts(tmp_path):
         args=_args(), logger=_logger(), cache_key="fake-cache",
     )
     mini, full = result["mini_overfit"], result["full_train"]
+    assert result["target_transform"] == diagnostic.RAW_TARGET_TRANSFORM
     assert mini["converged"] is True and mini["minimum_mae"] <= 0.1
     assert full["initial_head_fingerprint"] == mini["initial_head_fingerprint"]
     assert full["initial_head_fingerprint"] != mini["final_head_fingerprint"]
@@ -256,6 +260,191 @@ def test_synthetic_mini_overfit_full_reinit_and_trajectory_artifacts(tmp_path):
     assert all(row["validation_mse"] == "" for row in mini_epochs)
     assert len(_csv_rows(tmp_path / "feature_dimension_statistics.csv")) == 3 * 512
     assert len(_csv_rows(tmp_path / "selected_mini_samples.csv")) == 10
+
+
+def test_train_subject_zscore_is_unique_subject_weighted_and_train_only():
+    records = _records(rows_per_subject=2)
+    train = [row for row in records if row.subject_id in set(_fold_info()["train_subjects"])]
+    # Extra SUB1 windows must not change the equal-subject-weight statistics.
+    train.extend([row for row in train if row.subject_id == "SUB1"] * 10)
+    transform = diagnostic.build_train_only_target_transform(
+        train, _fold_info(), diagnostic.ZSCORE_TARGET_TRANSFORM
+    )
+    expected = np.asarray([22.0, 24.0, 26.0, 28.0, 30.0])
+    assert transform.mean_years == pytest.approx(float(expected.mean()))
+    assert transform.std_years == pytest.approx(float(expected.std(ddof=0)))
+    payload = transform.as_dict(_fold_info())
+    assert payload["train_subject_ids"] == _fold_info()["train_subjects"]
+    assert payload["validation_used_for_target_statistics"] is False
+    assert payload["test_used_for_target_statistics"] is False
+    assert "SUB7" not in payload["train_subject_ages_years"]
+    assert "SUB8" not in payload["train_subject_ages_years"]
+    validation_row = next(row for row in records if row.subject_id == "SUB7")
+    with pytest.raises(diagnostic.DataValidationError, match="Non-train"):
+        diagnostic.build_train_only_target_transform(
+            train + [validation_row], _fold_info(), diagnostic.ZSCORE_TARGET_TRANSFORM
+        )
+
+
+def test_target_zscore_zero_std_fails_closed_and_round_trip_is_exact():
+    records = []
+    for subject in _fold_info()["train_subjects"]:
+        records.append(diagnostic.FeatureRecord(
+            f"{subject}_0", subject, "R", 0, 25.0, np.zeros(512, np.float32)
+        ))
+    with pytest.raises(diagnostic.DataValidationError, match="std"):
+        diagnostic.build_train_only_target_transform(
+            records, _fold_info(), diagnostic.ZSCORE_TARGET_TRANSFORM
+        )
+    transform = diagnostic.build_train_only_target_transform(
+        [row for row in _records() if row.subject_id in set(_fold_info()["train_subjects"])],
+        _fold_info(), diagnostic.ZSCORE_TARGET_TRANSFORM,
+    )
+    values = np.asarray([22.0, 25.5, 30.0])
+    assert np.max(np.abs(transform.inverse_numpy(transform.transform_numpy(values)) - values)) < 1e-12
+
+
+def test_zscore_zero_initialization_predicts_train_subject_mean(tmp_path):
+    result = diagnostic.execute_from_records(
+        records=_records(), fold_info=_fold_info(), output_dir=tmp_path,
+        args=_args(
+            target_transform=diagnostic.ZSCORE_TARGET_TRANSFORM,
+            mini_max_epochs=2, full_max_epochs=2,
+        ),
+        logger=_logger(), cache_key="fake",
+    )
+    for experiment in (result["mini_overfit"], result["full_train"]):
+        assert experiment["initialization"] == "zeros"
+        assert experiment["initial_weight_norm"] == 0.0
+        assert experiment["initial_bias"] == 0.0
+        assert experiment["initial_prediction_z"] == pytest.approx(0.0, abs=1e-7)
+        assert experiment["initial_prediction_age_years"] == pytest.approx(26.0)
+    assert result["mini_overfit"]["initial_head_fingerprint"] == result["full_train"]["initial_head_fingerprint"]
+    assert result["mini_overfit"]["final_head_fingerprint"] != result["full_train"]["initial_head_fingerprint"]
+
+
+def test_zscore_synthetic_mini_reaches_year_and_lstsq_thresholds(tmp_path):
+    result = diagnostic.execute_from_records(
+        records=_records(), fold_info=_fold_info(), output_dir=tmp_path,
+        args=_args(
+            target_transform=diagnostic.ZSCORE_TARGET_TRANSFORM,
+            mini_max_epochs=150, full_max_epochs=3,
+        ),
+        logger=_logger(), cache_key="fake",
+    )
+    mini = result["mini_overfit"]
+    assert mini["converged"] is True
+    assert mini["minimum_mae"] <= 0.10
+    assert mini["lstsq_optimum_reached"] is True
+    assert mini["least_squares"]["exact_interpolation_within_tolerance"] is True
+    assert mini["all_values_finite"] is True
+
+
+def test_lstsq_cpu_float64_bias_explicit_residual_and_full_row_rank():
+    fold = _fold_info()
+    train = [row for row in _records(rows_per_subject=1) if row.subject_id in set(fold["train_subjects"])]
+    transform = diagnostic.build_train_only_target_transform(
+        train, fold, diagnostic.ZSCORE_TARGET_TRANSFORM
+    )
+    solved = diagnostic.solve_train_only_linear_least_squares(
+        train, transform, driver="gelsd", absolute_tolerance=1e-9
+    )
+    info = solved.diagnostics
+    assert info["compute_device"] == "cpu"
+    assert info["compute_dtype"] == "float64"
+    assert info["driver"] == "gelsd"
+    assert info["augmented_dim"] == 513
+    assert info["full_row_rank"] is True
+    assert info["residual_source"] == "explicit_recomputation_not_lstsq_residuals"
+    assert info["exact_interpolation_within_tolerance"] is True
+    assert info["train_mae_years"] < 1e-10
+    assert solved.head_state_dict["weight"].shape == (1, 512)
+    assert solved.head_state_dict["bias"].shape == (1,)
+
+    constant = [diagnostic.FeatureRecord(
+        f"{subject}_C", subject, "R", 0, 3.0, np.zeros(512, np.float32)
+    ) for subject in fold["train_subjects"]]
+    raw = diagnostic.build_train_only_target_transform(
+        constant, fold, diagnostic.RAW_TARGET_TRANSFORM
+    )
+    bias_solution = diagnostic.solve_train_only_linear_least_squares(
+        constant, raw, driver="gelsd", absolute_tolerance=1e-9
+    )
+    assert float(bias_solution.head_state_dict["bias"].item()) == pytest.approx(3.0)
+    assert bias_solution.diagnostics["train_mae_years"] < 1e-10
+
+
+def test_lstsq_rank_deficiency_is_reported_without_using_validation_or_test():
+    fold = _fold_info()
+    ages = [22.0, 24.0, 26.0, 28.0, 30.0]
+    rows = [diagnostic.FeatureRecord(
+        f"{subject}_Z", subject, "R", 0, age, np.zeros(512, np.float32)
+    ) for subject, age in zip(fold["train_subjects"], ages)]
+    transform = diagnostic.build_train_only_target_transform(
+        rows, fold, diagnostic.ZSCORE_TARGET_TRANSFORM
+    )
+    solved = diagnostic.solve_train_only_linear_least_squares(rows, transform)
+    assert solved.diagnostics["full_row_rank"] is False
+    assert solved.diagnostics["matrix_rank"] == 1
+    assert solved.diagnostics["exact_interpolation_within_tolerance"] is False
+    assert solved.diagnostics["validation_rows_used"] == solved.diagnostics["test_rows_used"] == 0
+    assert solved.diagnostics["test_accessed"] is False
+
+
+def test_lstsq_nonfinite_solution_fails_closed(monkeypatch):
+    train = [row for row in _records(rows_per_subject=1) if row.subject_id in set(_fold_info()["train_subjects"])]
+    transform = diagnostic.build_train_only_target_transform(
+        train, _fold_info(), diagnostic.ZSCORE_TARGET_TRANSFORM
+    )
+    monkeypatch.setattr(
+        torch.linalg, "lstsq",
+        lambda *args, **kwargs: SimpleNamespace(solution=torch.full((513, 1), float("inf"))),
+    )
+    with pytest.raises(diagnostic.NonFiniteError, match="solution"):
+        diagnostic.solve_train_only_linear_least_squares(train, transform)
+    monkeypatch.setattr(
+        torch.linalg, "lstsq",
+        lambda *args, **kwargs: SimpleNamespace(
+            solution=torch.full((513, 1), 1e308, dtype=torch.float64)
+        ),
+    )
+    with pytest.raises(diagnostic.NonFiniteError, match="prediction"):
+        diagnostic.solve_train_only_linear_least_squares(train, transform)
+
+
+def test_zscore_metrics_gap_and_trajectory_schema(tmp_path):
+    result = diagnostic.execute_from_records(
+        records=_records(), fold_info=_fold_info(), output_dir=tmp_path,
+        args=_args(
+            target_transform=diagnostic.ZSCORE_TARGET_TRANSFORM,
+            mini_max_epochs=5, full_max_epochs=5,
+        ),
+        logger=_logger(), cache_key="fake",
+    )
+    mini = result["mini_overfit"]
+    assert mini["adamw_min_minus_lstsq_mae"] == pytest.approx(
+        mini["adamw_min_train_mae_years"] - mini["least_squares_train_mae_years"]
+    )
+    assert mini["adamw_final_minus_lstsq_mse_z"] == pytest.approx(
+        mini["adamw_final_train_mse_z"] - mini["least_squares_train_mse_z"]
+    )
+    step = _csv_rows(tmp_path / "mini_overfit/step_trajectory.csv")[0]
+    epoch = _csv_rows(tmp_path / "full_train/epoch_trajectory.csv")[0]
+    for field in (
+        "target_transform", "loss_mse_z", "batch_mae_z", "batch_rmse_z",
+        "batch_mae_years", "batch_rmse_years", "batch_mean_bias_years",
+        "prediction_z_min", "prediction_years_min", "target_z_min",
+    ):
+        assert field in step and step[field] != ""
+    for field in (
+        "train_mse_z", "train_mae_z", "train_rmse_z", "train_mean_bias_years",
+        "validation_mse_z", "validation_mae_z", "validation_mean_bias_years",
+        "prediction_z_min", "prediction_years_min",
+    ):
+        assert field in epoch and epoch[field] != ""
+    assert float(step["batch_mae_years"]) == pytest.approx(
+        float(step["batch_mae_z"]) * result["target_std_years"], rel=1e-5
+    )
 
 
 def test_artifact_verifier_checks_summary_and_stable_files(tmp_path):
@@ -350,6 +539,7 @@ def test_end_to_end_tiny_lance_smoke_writes_summary_and_guards(tmp_path):
         input_lance=str(source), feature_cache_lance=str(cache),
         feature_cache_manifest=str(manifest), output_dir=str(output),
         mini_samples_per_subject=1, mini_max_epochs=2, full_max_epochs=2,
+        target_transform=diagnostic.ZSCORE_TARGET_TRANSFORM,
     )
     assert diagnostic.run(args) == 0
     summary = json.loads((output / "convergence_summary.json").read_text(encoding="utf-8"))
@@ -358,6 +548,11 @@ def test_end_to_end_tiny_lance_smoke_writes_summary_and_guards(tmp_path):
     assert summary["test_rows_materialized"] == 0
     assert summary["test_metrics_computed"] is False
     assert provenance["backbone_constructed"] is False
+    assert summary["target_transform"] == diagnostic.ZSCORE_TARGET_TRANSFORM
+    assert summary["target_statistics_scope"] == "unique_train_subjects_only"
+    assert (output / "target_transform.json").is_file()
+    assert (output / "mini_overfit/least_squares_diagnostics.json").is_file()
+    assert (output / "full_train/least_squares_diagnostics.json").is_file()
     assert (output / "run.log").is_file()
     assert (output / "convergence_report.md").is_file()
 
@@ -373,6 +568,22 @@ def test_diagnostic_checkpoint_is_rejected_by_formal_loader(tmp_path):
     formal_model = CachedFeatureClassifier(512, 1, "mean")
     with pytest.raises(RuntimeError, match="no model_state_dict"):
         load_downstream_checkpoint_strict(formal_model, path, "cpu")
+
+    train = [row for row in _records(rows_per_subject=1) if row.subject_id in set(_fold_info()["train_subjects"])]
+    transform = diagnostic.build_train_only_target_transform(
+        train, _fold_info(), diagnostic.ZSCORE_TARGET_TRANSFORM
+    )
+    reference = diagnostic.solve_train_only_linear_least_squares(train, transform)
+    least_squares_path = tmp_path / "least_squares.pt"
+    diagnostic._least_squares_checkpoint(
+        least_squares_path, reference, "mini_overfit", _fold_info(), transform, "fake"
+    )
+    least_squares_payload = torch.load(least_squares_path, map_location="cpu", weights_only=True)
+    assert least_squares_payload["checkpoint_kind"] == diagnostic.LEAST_SQUARES_CHECKPOINT_KIND
+    assert least_squares_payload["not_for_formal_evaluation"] is True
+    assert "head_state_dict" not in least_squares_payload
+    with pytest.raises(RuntimeError, match="no model_state_dict"):
+        load_downstream_checkpoint_strict(formal_model, least_squares_path, "cpu")
 
 
 def test_empty_issue_and_error_artifacts_have_stable_schema(tmp_path):
@@ -396,6 +607,7 @@ def test_cloud_script_is_diagnostic_only_and_has_safe_defaults():
     assert "HEAD_LR=\"${HEAD_LR:-0.0003}\"" in script
     assert "MINI_MAX_EPOCHS=\"${MINI_MAX_EPOCHS:-1000}\"" in script
     assert "FULL_MAX_EPOCHS=\"${FULL_MAX_EPOCHS:-300}\"" in script
+    assert "--target-transform train_subject_zscore" in script
     assert script.count("diagnose_age_head_convergence.py") == 2
     lower = script.lower()
     for forbidden in ("run_age_cv7_sweep", "zero_shot", "feature-cache-policy", "--overwrite"):
