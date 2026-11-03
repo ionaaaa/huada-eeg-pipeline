@@ -295,3 +295,7 @@ def test_command_contracts_and_formal_command_is_not_executed_by_tests():
     assert "--probe-layer-idx 8" in full and "--pooling mean" in full
     assert "--amp-mode bf16" in full and "--skip-test" not in full
     assert "--smoke --skip-test" in ddp
+    smoke = (commands / "run_dortmund_age_full_finetune_smoke.sh").read_text(encoding="utf-8")
+    assert "--audit-policy record_only" in smoke and "--smoke" in smoke
+    assert "torchrun --standalone" in smoke
+    assert "--audit-policy record_only" in full and "--smoke" not in full

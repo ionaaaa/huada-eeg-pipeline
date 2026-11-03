@@ -78,7 +78,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-lance", required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--split-manifest", type=Path, required=True)
-    parser.add_argument("--audit-summary", type=Path, required=True)
+    parser.add_argument("--audit-summary", type=Path)
+    parser.add_argument(
+        "--audit-policy", choices=["enforce", "record_only"], default="enforce",
+        help="enforce requires a passed audit for formal runs; record_only records any supplied audit without gating",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu")
@@ -134,6 +138,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Formal training cannot skip the single locked test evaluation")
     if args.allow_random_init_smoke and not args.smoke:
         raise ValueError("Random initialization is smoke-only")
+    if args.audit_policy == "enforce" and args.audit_summary is None:
+        raise ValueError("--audit-summary is required when --audit-policy=enforce")
     if args.max_epochs_this_run is not None and (not args.smoke or args.max_epochs_this_run < 1):
         raise ValueError("--max-epochs-this-run is a positive smoke-only control")
 
@@ -164,13 +170,30 @@ def _git_state() -> dict[str, Any]:
         return {"commit": None, "branch": None, "dirty": None, "error": repr(error)}
 
 
-def _audit_gate(path: Path, smoke: bool) -> dict[str, Any]:
+def _audit_gate(path: Path | None, smoke: bool, policy: str) -> dict[str, Any]:
+    if policy == "record_only":
+        if path is None:
+            return {
+                "policy": "record_only", "conclusion": "not_provided",
+                "formal_training_allowed": True,
+                "note": "audit gate explicitly disabled by CLI; checkpoint/data runtime checks remain active",
+            }
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        conclusion = str(payload.get("overall_conclusion", payload.get("conclusion", ""))).strip().lower()
+        return {
+            "policy": "record_only", "conclusion": conclusion,
+            "formal_training_allowed": True, "path": str(path),
+            "sha256": sha256_file(path),
+            "note": "audit conclusion recorded but not used as a launch gate",
+        }
+    if path is None:
+        raise ValueError("Audit summary is required by enforce policy")
     payload = json.loads(path.read_text(encoding="utf-8"))
     conclusion = str(payload.get("overall_conclusion", payload.get("conclusion", ""))).strip().lower()
     if conclusion == "passed":
-        return {"conclusion": conclusion, "formal_training_allowed": True, "path": str(path), "sha256": sha256_file(path)}
+        return {"policy": "enforce", "conclusion": conclusion, "formal_training_allowed": True, "path": str(path), "sha256": sha256_file(path)}
     if smoke and conclusion == "conditional_pass":
-        return {"conclusion": conclusion, "formal_training_allowed": False, "smoke_only": True, "path": str(path), "sha256": sha256_file(path)}
+        return {"policy": "enforce", "conclusion": conclusion, "formal_training_allowed": False, "smoke_only": True, "path": str(path), "sha256": sha256_file(path)}
     raise RuntimeError(f"Audit gate rejected run: conclusion={conclusion!r}, smoke={smoke}")
 
 
@@ -398,7 +421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     rank = context["rank"]
     try:
         set_seed(args.train_seed + rank)
-        gate = _audit_gate(args.audit_summary, args.smoke)
+        gate = _audit_gate(args.audit_summary, args.smoke, args.audit_policy)
         if not args.split_manifest.is_file():
             raise FileNotFoundError(args.split_manifest)
         manifest_rows = _read_manifest(args.split_manifest)
@@ -411,7 +434,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolved = vars(args).copy()
         resolved.update({
             "checkpoint": None if args.checkpoint is None else str(args.checkpoint),
-            "split_manifest": str(args.split_manifest), "audit_summary": str(args.audit_summary),
+            "split_manifest": str(args.split_manifest),
+            "audit_summary": None if args.audit_summary is None else str(args.audit_summary),
             "output_dir": str(args.output_dir), "resume": None if args.resume is None else str(args.resume),
             "distributed": context,
             "per_device_batch_size": args.batch_size,
