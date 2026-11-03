@@ -89,7 +89,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
     parser.add_argument("--accumulation-steps", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--num-workers", type=int, default=0,
+        help="Must be 0 for Lance: Linux forked DataLoader workers are not Lance-safe",
+    )
     parser.add_argument("--samples-per-epoch", type=int)
     parser.add_argument("--backbone-lr", type=float, default=1e-5)
     parser.add_argument("--head-lr", type=float, default=1e-4)
@@ -130,6 +133,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("weight_decay must be >=0 and warmup_ratio must be in [0,1)")
     if args.early_stopping_patience < 1 or args.num_workers < 0:
         raise ValueError("Invalid early stopping patience or num_workers")
+    if args.num_workers != 0:
+        raise ValueError(
+            "Dortmund Lance training requires --num-workers 0: Lance is not fork-safe and "
+            "forked DataLoader workers can segfault. DDP ranks still read data independently."
+        )
     if args.probe_layer_idx != 8 or args.pooling != "mean":
         raise ValueError("Protocol v1 is fixed to probe_layer_idx=8 and masked mean pooling")
     if args.amp_mode == "fp16" and (args.device != "cuda" or not torch.cuda.is_available()):

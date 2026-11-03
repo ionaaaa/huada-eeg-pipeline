@@ -13,7 +13,7 @@ set -euo pipefail
 : "${FULL_EPOCHS:=100}"
 : "${PER_DEVICE_BATCH_SIZE:=2}"
 : "${ACCUMULATION_STEPS:=16}"
-: "${NUM_WORKERS:=4}"
+: "${NUM_WORKERS:=0}"
 : "${BACKBONE_LR:=1e-5}"
 : "${HEAD_LR:=1e-4}"
 
@@ -48,6 +48,7 @@ echo "accumulation_steps=${ACCUMULATION_STEPS}"
 echo "effective_global_batch_size=${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "backbone_lr=${BACKBONE_LR}"
 echo "head_lr=${HEAD_LR}"
+echo "num_workers=${NUM_WORKERS}"
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   scripts/downstream_50m/run_dortmund_age_full_finetune.py \

@@ -48,6 +48,7 @@ echo "accumulation_steps=${ACCUMULATION_STEPS}"
 echo "effective_global_batch_size=${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "backbone_lr=${BACKBONE_LR}"
 echo "head_lr=${HEAD_LR}"
+echo "num_workers=0"
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   scripts/downstream_50m/run_dortmund_age_full_finetune.py \
