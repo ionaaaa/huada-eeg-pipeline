@@ -19,6 +19,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import preprocess_huada_common_windows as preprocessing  # noqa: E402
 from preprocess_huada_common_windows import (  # noqa: E402
+    apply_common_signal_processing,
     common_window_schema,
     _prepare_output_dir,
     _snapshot_raw_files,
@@ -43,6 +44,33 @@ from preprocess_huada_common_windows import (  # noqa: E402
     window_slices,
     zero_bad_channels,
 )
+
+
+def test_shared_signal_processing_matches_legacy_huada_chain():
+    """Extraction regression lock: Huada output remains elementwise identical."""
+    from mne.filter import filter_data, notch_filter, resample
+
+    rng = np.random.default_rng(56)
+    source = rng.normal(size=(2, 6000))
+    legacy = notch_filter(
+        source, Fs=500.0, freqs=[50.0], filter_length="auto",
+        trans_bandwidth=1.0, method="fir", copy=True, phase="zero-double",
+        fir_window="hamming", fir_design="firwin", pad="reflect_limited",
+        verbose="ERROR",
+    )
+    legacy = filter_data(
+        legacy, sfreq=500.0, l_freq=0.3, h_freq=75.0,
+        filter_length="auto", l_trans_bandwidth="auto",
+        h_trans_bandwidth="auto", method="fir", copy=False,
+        phase="zero-double", fir_window="hamming", fir_design="firwin",
+        pad="reflect_limited", verbose="ERROR",
+    )
+    legacy = resample(
+        legacy, up=200.0, down=500.0, axis=-1, window="auto",
+        pad="reflect", npad=100, method="polyphase", verbose="ERROR",
+    )
+    shared = apply_common_signal_processing(source, 500, 200, 50, 0.3, 75)
+    np.testing.assert_allclose(shared, legacy, rtol=0, atol=0)
 
 
 def make_cache_row(subject_id: str = "SUB5", bad_index: int = 3) -> dict:

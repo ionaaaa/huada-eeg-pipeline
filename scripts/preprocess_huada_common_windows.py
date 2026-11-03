@@ -165,6 +165,40 @@ def normalize_clip_divide_200(data_uv: np.ndarray) -> np.ndarray:
     return np.clip(np.asarray(data_uv, dtype=np.float64) / 200.0, -1.0, 1.0).astype(np.float32)
 
 
+def apply_common_signal_processing(
+    data_uv: np.ndarray,
+    source_sfreq: float,
+    target_sfreq: float,
+    notch_hz: float,
+    bandpass_low: float,
+    bandpass_high: float,
+) -> np.ndarray:
+    """Apply the company-common deterministic notch, bandpass, and resample chain.
+
+    This is the exact implementation historically embedded in the Huada
+    pipeline. Dataset adapters import this function instead of duplicating the
+    signal-processing implementation.
+    """
+    processed = notch_filter(
+        np.asarray(data_uv, dtype=np.float64), Fs=float(source_sfreq),
+        freqs=[float(notch_hz)], filter_length="auto", trans_bandwidth=1.0,
+        method="fir", copy=True, phase="zero-double", fir_window="hamming",
+        fir_design="firwin", pad="reflect_limited", verbose="ERROR",
+    )
+    processed = filter_data(
+        processed, sfreq=float(source_sfreq), l_freq=float(bandpass_low),
+        h_freq=float(bandpass_high), filter_length="auto",
+        l_trans_bandwidth="auto", h_trans_bandwidth="auto", method="fir",
+        copy=False, phase="zero-double", fir_window="hamming",
+        fir_design="firwin", pad="reflect_limited", verbose="ERROR",
+    )
+    return resample(
+        processed, up=float(target_sfreq), down=float(source_sfreq), axis=-1,
+        window="auto", pad="reflect", npad=100, method="polyphase",
+        verbose="ERROR",
+    )
+
+
 def evaluate_window_qc(
     data_before_zeroing: np.ndarray,
     combined_bad_mask: Sequence[bool],
@@ -444,8 +478,11 @@ def rows_to_arrow(rows: list[dict[str, Any]], schema: pa.Schema | None = None) -
     return pa.Table.from_arrays([columns[field.name] for field in schema], schema=schema)
 
 
-def _write_lance_batch(path: Path, rows: list[dict[str, Any]], first: bool) -> None:
-    table = rows_to_arrow(rows)
+def _write_lance_batch(
+    path: Path, rows: list[dict[str, Any]], first: bool,
+    schema: pa.Schema | None = None,
+) -> None:
+    table = rows_to_arrow(rows, schema)
     lance.write_dataset(
         table,
         path,
@@ -733,22 +770,13 @@ class Pipeline:
                 raise RuntimeError("All channels failed recording-level hard QC")
             good_uv = convert_mne_v_to_uv(raw.get_data(picks=good_idx))
             del raw
-            good_uv = notch_filter(
-                good_uv, Fs=float(self.exp["sampling_rate_hz"]), freqs=[float(self.pre["notch_hz"])],
-                filter_length="auto", trans_bandwidth=1.0, method="fir", copy=True,
-                phase="zero-double", fir_window="hamming", fir_design="firwin",
-                pad="reflect_limited", verbose="ERROR",
-            )
-            good_uv = filter_data(
-                good_uv, sfreq=float(self.exp["sampling_rate_hz"]),
-                l_freq=float(self.pre["bandpass_low"]), h_freq=float(self.pre["bandpass_high"]),
-                filter_length="auto", l_trans_bandwidth="auto", h_trans_bandwidth="auto",
-                method="fir", copy=False, phase="zero-double", fir_window="hamming",
-                fir_design="firwin", pad="reflect_limited", verbose="ERROR",
-            )
-            good_uv = resample(
-                good_uv, up=float(self.pre["target_sfreq"]), down=float(self.exp["sampling_rate_hz"]),
-                axis=-1, window="auto", pad="reflect", npad=100, method="polyphase", verbose="ERROR",
+            good_uv = apply_common_signal_processing(
+                good_uv,
+                source_sfreq=float(self.exp["sampling_rate_hz"]),
+                target_sfreq=float(self.pre["target_sfreq"]),
+                notch_hz=float(self.pre["notch_hz"]),
+                bandpass_low=float(self.pre["bandpass_low"]),
+                bandpass_high=float(self.pre["bandpass_high"]),
             )
             n_resampled = good_uv.shape[1]
             processed = np.zeros((64, n_resampled), dtype=np.float64)
