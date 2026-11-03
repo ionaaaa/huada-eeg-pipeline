@@ -683,10 +683,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
         return 0 if summary.get("blocking_error_count", 0) == 0 and summary.get("source_files_unchanged", True) else 2
     except Exception:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        with (args.output_dir / "preprocessing_errors.log").open("a", encoding="utf-8") as handle:
-            handle.write(f"{now_iso()}\tfatal\t\t\t{traceback.format_exc()}\n")
-        traceback.print_exc()
+        # Always preserve the original failure on stderr. In particular, an
+        # unwritable Ti-ONE output mount must not mask the useful traceback
+        # with a second exception while trying to create the error log.
+        original_traceback = traceback.format_exc()
+        sys.stderr.write(original_traceback)
+        try:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            with (args.output_dir / "preprocessing_errors.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"{now_iso()}\tfatal\t\t\t{original_traceback}\n")
+        except Exception as log_error:
+            print(
+                f"Could not write preprocessing_errors.log below {args.output_dir}: {log_error}",
+                file=sys.stderr,
+            )
         return 1
 
 
