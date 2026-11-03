@@ -680,13 +680,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     patience += 1
                 elapsed = time.time() - epoch_started
+                group_lrs = {
+                    str(group.get("group_name", f"group_{index}")): float(group["lr"])
+                    for index, group in enumerate(optimizer.param_groups)
+                }
+                current_backbone_lr = next(
+                    value for name, value in group_lrs.items() if name.startswith("backbone_")
+                )
+                current_head_lr = next(
+                    value for name, value in group_lrs.items() if name.startswith("age_head_")
+                )
                 row = {
                     "epoch": epoch, "train_z_loss": train_loss, "train_mae_years": train_mae,
                     "validation_z_loss": validation_loss,
                     "validation_subject_mae": subject_metrics["mae"],
                     "validation_subject_rmse": subject_metrics["rmse"],
                     "validation_window_mae": validation_metrics["window"]["mae"],
-                    "backbone_lr": optimizer.param_groups[0]["lr"],
+                    "backbone_lr": current_backbone_lr,
+                    "head_lr": current_head_lr,
                     "gradient_norm": max_grad_norm, "parameter_norm": _parameter_norm(raw_model),
                     "prediction_min": min(row["predicted_age"] for row in validation_rows),
                     "prediction_max": max(row["predicted_age"] for row in validation_rows),
@@ -699,6 +710,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stats_row = train_sampler.statistics()
                 sampler_rows.append({"epoch": epoch, **stats_row})
                 gradient_rows.append({"epoch": epoch, "gradient_norm": max_grad_norm, "parameter_norm": row["parameter_norm"], "unexplained_trainable_without_gradient": 0})
+                epoch_fields = list(epoch_rows[0])
+                _csv(args.output_dir / "epoch_metrics.csv", epoch_rows, epoch_fields)
+                _csv(args.output_dir / "training_trajectory.csv", epoch_rows, epoch_fields)
+                _csv(
+                    args.output_dir / "gradient_statistics.csv", gradient_rows,
+                    ["epoch", "gradient_norm", "parameter_norm", "unexplained_trainable_without_gradient"],
+                )
+                _csv(
+                    args.output_dir / "sampler_epoch_statistics.csv", sampler_rows,
+                    ["epoch", "requested_samples", "global_samples", "local_samples_per_rank", "subject_counts", "subject_condition_counts", "missing_condition_subjects", "unique_window_count", "unique_window_fraction", "repeated_draw_count", "cross_rank_window_identity_overlap", "ddp_padding_duplicates", "rank_lengths"],
+                )
                 local_rng = capture_rng_state()
             else:
                 local_rng = capture_rng_state()

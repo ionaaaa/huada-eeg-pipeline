@@ -11,7 +11,11 @@ set -euo pipefail
 : "${TRAIN_SEED:=42}"
 : "${NPROC_PER_NODE:=2}"
 : "${EXPECTED_CKPT_SHA256:=97335b696b3ae9138dcb51c736f49ee1c6008fdc22fc42f13ea9a5301452f36e}"
+: "${SMOKE_EPOCHS:=2}"
 : "${PER_DEVICE_BATCH_SIZE:=2}"
+: "${ACCUMULATION_STEPS:=1}"
+: "${BACKBONE_LR:=1e-5}"
+: "${HEAD_LR:=1e-4}"
 
 if [[ -z "${PRETRAINED_50M_CKPT:-}" ]]; then
   if [[ -f "${HUADA_ROOT}/data/checkpoint/pretrain_checkpoint_4.pt" ]]; then
@@ -35,6 +39,16 @@ if [[ -f "${AUDIT_SUMMARY}" ]]; then
   AUDIT_ARGS+=(--audit-summary "${AUDIT_SUMMARY}")
 fi
 
+EFFECTIVE_GLOBAL_BATCH_SIZE=$((PER_DEVICE_BATCH_SIZE * NPROC_PER_NODE * ACCUMULATION_STEPS))
+echo "mode=smoke"
+echo "epochs=${SMOKE_EPOCHS}"
+echo "per_device_batch_size=${PER_DEVICE_BATCH_SIZE}"
+echo "world_size=${NPROC_PER_NODE}"
+echo "accumulation_steps=${ACCUMULATION_STEPS}"
+echo "effective_global_batch_size=${EFFECTIVE_GLOBAL_BATCH_SIZE}"
+echo "backbone_lr=${BACKBONE_LR}"
+echo "head_lr=${HEAD_LR}"
+
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   scripts/downstream_50m/run_dortmund_age_full_finetune.py \
   --input-lance "${INPUT_LANCE}" \
@@ -42,9 +56,11 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   --split-manifest "${SPLIT_MANIFEST}" \
   "${AUDIT_ARGS[@]}" \
   --output-dir "${RUN_OUTPUT}" \
-  --epochs 2 --batch-size "${PER_DEVICE_BATCH_SIZE}" --accumulation-steps 1 \
+  --epochs "${SMOKE_EPOCHS}" \
+  --batch-size "${PER_DEVICE_BATCH_SIZE}" \
+  --accumulation-steps "${ACCUMULATION_STEPS}" \
   --samples-per-epoch 8 \
-  --backbone-lr 1e-5 --head-lr 1e-4 --weight-decay 0.05 \
+  --backbone-lr "${BACKBONE_LR}" --head-lr "${HEAD_LR}" --weight-decay 0.05 \
   --gradient-clip-norm 1.0 --scheduler linear_warmup_cosine_decay \
   --warmup-ratio 0.1 --early-stopping-patience 2 \
   --probe-layer-idx 8 --pooling mean --train-seed "${TRAIN_SEED}" \
