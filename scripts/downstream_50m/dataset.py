@@ -137,7 +137,7 @@ def collate_fn(batch):
     # upstream stacking path above.
     for meta_key in [
         "sample_id", "subject_id", "recording_id", "label_name",
-        "subject", "subj_id", "participant_id",
+        "sex", "eyes_condition", "subject", "subj_id", "participant_id",
     ]:
         if meta_key in batch[0]:
             out[meta_key] = [str(x[meta_key]) for x in batch]

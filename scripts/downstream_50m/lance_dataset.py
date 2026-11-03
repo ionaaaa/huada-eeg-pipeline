@@ -81,6 +81,9 @@ class LanceEEGPretrainDataset(Dataset):
         self.manifest = load_subject_manifest(subject_split_manifest)
         self.ds = None
         self._metadata = self._read_metadata()
+        for optional_name in ("window_index", "eyes_condition"):
+            if optional_name in self._open().schema.names and optional_name not in self.columns:
+                self.columns.append(optional_name)
         self.indices = self._select_indices(max_samples=max_samples)
         self.length = len(self.indices)
 
@@ -96,7 +99,13 @@ class LanceEEGPretrainDataset(Dataset):
         missing = sorted(required.difference(ds.schema.names))
         if missing:
             raise ValueError(f"Input Lance is missing required fields: {missing}")
-        return ds.to_table(columns=["sample_id", "subject_id", "age", "sex"]).to_pylist()
+        optional = [
+            name for name in ("recording_id", "window_index", "eyes_condition")
+            if name in ds.schema.names
+        ]
+        return ds.to_table(
+            columns=["sample_id", "subject_id", "age", "sex", *optional]
+        ).to_pylist()
 
     @staticmethod
     def _normalize_subject_id(value):
@@ -195,6 +204,13 @@ class LanceEEGPretrainDataset(Dataset):
             "model_sfreq": torch.tensor(float(row["model_sfreq"]), dtype=torch.float32),
             "label_name": label_name,
         }
+        for metadata_key in ("sex", "eyes_condition"):
+            if metadata_key in row:
+                sample[metadata_key] = str(row[metadata_key])
+        if "window_index" in row:
+            sample["window_index"] = torch.tensor(
+                int(row["window_index"]), dtype=torch.int64
+            )
         if sample["channel_valid_mask"].shape != (n_channels,):
             raise ValueError(f"channel_valid_mask shape mismatch for {sample['sample_id']}")
         if sample["token_valid_mask"].shape != (num_tokens,):
@@ -237,6 +253,23 @@ class LanceEEGPretrainDataset(Dataset):
             {"index": row["index"], "label": row["label"]}
             for row in self.get_subject_label_rows(indices, chunk_size)
         ]
+
+    def get_sampling_rows(self):
+        """Return local-index metadata used by deterministic training samplers."""
+
+        rows = []
+        for local_index, global_index in enumerate(self.indices):
+            row = self._metadata[global_index]
+            rows.append({
+                "index": local_index,
+                "sample_id": str(row["sample_id"]),
+                "subject_id": self._normalize_subject_id(row["subject_id"]),
+                "recording_id": str(row.get("recording_id", "")),
+                "eyes_condition": str(row.get("eyes_condition", "")),
+                "age": None if row.get("age") is None else float(row["age"]),
+                "sex": str(row.get("sex", "")),
+            })
+        return rows
 
 
 class MultiLanceEEGPretrainDataset(Dataset):
