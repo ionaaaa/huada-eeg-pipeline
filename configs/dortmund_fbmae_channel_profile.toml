@@ -1,0 +1,39 @@
+[profile]
+name = "dortmund_fbmae_profile_a_v1"
+dataset = "Dortmund Vital Study"
+expected_channels = 64
+source_reference = "FCz"
+ground = "AFz"
+rereference_applied = false
+processing_reference = "unchanged"
+reference_channel_present_in_data = false
+status_channel_excluded = true
+mapping_semantics = "authoritative_electrode_vocab_last_wins_and_fbmae_standard64_name_scatter"
+
+[source]
+channel_names = [
+  "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "FC5", "FC1", "FC2", "FC6",
+  "T7", "C3", "Cz", "C4", "T8", "TP9", "CP5", "CP1", "CP2", "CP6", "TP10",
+  "P7", "P3", "Pz", "P4", "P8", "PO9", "O1", "Oz", "O2", "PO10", "AF7", "AF3",
+  "AF4", "AF8", "F5", "F1", "F2", "F6", "FT9", "FT7", "FC3", "FC4", "FT8",
+  "FT10", "C5", "C1", "C2", "C6", "TP7", "CP3", "CPz", "CP4", "TP8", "P5",
+  "P1", "P2", "P6", "PO7", "PO3", "POz", "PO4", "PO8",
+]
+electrode_ids = [
+  846, 860, 881, 862, 889, 869, 885, 29, 31, 33, 35, 1008, 439, 471, 446, 1013,
+  49, 452, 423, 437, 456, 59, 1017, 970, 988, 974, 1019, 71, 957, 83, 959, 81,
+  6, 1023, 1024, 14, 873, 835, 848, 877, 27, 28, 30, 34, 36, 37, 450, 411,
+  425, 454, 50, 444, 54, 448, 58, 978, 962, 966, 982, 72, 1048, 1052, 1049, 80,
+]
+
+[model]
+standard_channels_source = "current public EEG_pretrain/channel_config.py (takes precedence over stale converter defaults)"
+standard_channels = [
+  "Fp1", "Fpz", "Fp2", "AF7", "AF3", "AFz", "AF4", "AF8",
+  "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8",
+  "FT7", "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "FT8",
+  "T7", "C5", "C3", "C1", "Cz", "C2", "C4", "C6", "T8",
+  "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "TP8",
+  "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
+  "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2", "Iz", "F9", "F10",
+]

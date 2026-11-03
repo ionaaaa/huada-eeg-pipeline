@@ -303,6 +303,7 @@ def align_to_standard_channels(
     channel_names: Sequence[str],
     channel_mask: Sequence[bool],
     bad_channel_mask: Sequence[bool],
+    standard_channels: Sequence[str] = STANDARD_64_CHANNELS,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     signal = np.asarray(signal, dtype=np.float32)
     if signal.ndim != 2 or signal.shape[0] != len(channel_names):
@@ -313,22 +314,25 @@ def align_to_standard_channels(
         raise ValueError("channel_mask and bad_channel_mask must match source channel count")
     source_valid = present & ~bad
     canonical = [canonical_channel_name(name) for name in channel_names]
-    order_matches = canonical == STANDARD_64_CHANNELS
+    standard_channels = list(standard_channels)
+    if len(standard_channels) != N_CHANNELS or len(set(standard_channels)) != N_CHANNELS:
+        raise ValueError("standard_channels must contain 64 unique names")
+    order_matches = canonical == standard_channels
     if order_matches:
-        assert canonical == STANDARD_64_CHANNELS
+        assert canonical == standard_channels
 
     grouped: dict[str, list[int]] = defaultdict(list)
     for index, name in enumerate(canonical):
         if name:
             grouped[name].append(index)
     duplicates = sorted(name for name, indices in grouped.items() if len(indices) > 1)
-    target_set = set(STANDARD_64_CHANNELS)
+    target_set = set(standard_channels)
     unknown = sorted(name for name in grouped if name not in target_set)
-    missing = sorted(name for name in STANDARD_64_CHANNELS if name not in grouped)
+    missing = sorted(name for name in standard_channels if name not in grouped)
 
     aligned = np.zeros((N_CHANNELS, signal.shape[1]), dtype=np.float32)
     valid = np.zeros(N_CHANNELS, dtype=np.float32)
-    for target_index, target_name in enumerate(STANDARD_64_CHANNELS):
+    for target_index, target_name in enumerate(standard_channels):
         indices = grouped.get(target_name, [])
         valid_indices = [index for index in indices if source_valid[index]]
         if len(indices) == 1 and len(valid_indices) == 1:
@@ -444,7 +448,10 @@ def make_targets(timefreq: np.ndarray) -> np.ndarray:
     return targets
 
 
-def process_row(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def process_row(
+    row: dict[str, Any],
+    standard_channels: Sequence[str] = STANDARD_64_CHANNELS,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if row.get("qc_pass") is not True:
         raise ValueError(f"qc_pass is not true for sample {row.get('sample_id')}")
     shape = tuple(int(value) for value in row.get("shape", []))
@@ -463,6 +470,7 @@ def process_row(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         row["channel_names"],
         row["channel_mask"],
         row["bad_channel_mask"],
+        standard_channels,
     )
     resampled = resample_signal(aligned)
     standardized = standardize_signal(resampled, channel_valid_mask)
