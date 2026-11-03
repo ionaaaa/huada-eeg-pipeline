@@ -187,6 +187,85 @@ def resolve_dortmund_channel_indices(
     return eeg_indices, status_indices
 
 
+def read_edf_signal_header(path: Path) -> list[dict[str, Any]]:
+    """Read the EDF fixed/signal header without relying on MNE private extras."""
+
+    def decode_field(value: bytes) -> str:
+        return value.decode("latin-1").strip()
+
+    with path.open("rb") as handle:
+        fixed = handle.read(256)
+        if len(fixed) != 256:
+            raise RuntimeError(f"Truncated EDF fixed header: expected 256 bytes, got {len(fixed)}")
+        try:
+            header_bytes = int(decode_field(fixed[184:192]))
+            signal_count = int(decode_field(fixed[252:256]))
+        except ValueError as exc:
+            raise RuntimeError("Invalid EDF fixed-header numeric fields") from exc
+        expected_header_bytes = 256 + signal_count * 256
+        if signal_count <= 0 or header_bytes != expected_header_bytes:
+            raise RuntimeError(
+                f"EDF header size mismatch: declared={header_bytes} expected={expected_header_bytes} "
+                f"signals={signal_count}"
+            )
+        signal_block = handle.read(header_bytes - 256)
+        if len(signal_block) != header_bytes - 256:
+            raise RuntimeError(
+                f"Truncated EDF signal header: expected {header_bytes - 256} bytes, got {len(signal_block)}"
+            )
+
+    offset = 0
+
+    def take(width: int) -> list[str]:
+        nonlocal offset
+        size = width * signal_count
+        block = signal_block[offset : offset + size]
+        offset += size
+        return [decode_field(block[index * width : (index + 1) * width]) for index in range(signal_count)]
+
+    labels = take(16)
+    transducers = take(80)
+    physical_dimensions = take(8)
+    physical_mins = take(8)
+    physical_maxs = take(8)
+    digital_mins = take(8)
+    digital_maxs = take(8)
+    prefilters = take(80)
+    samples_per_record = take(8)
+    reserved = take(32)
+    if offset != len(signal_block):
+        raise RuntimeError(f"EDF signal-header parse mismatch: consumed={offset} available={len(signal_block)}")
+
+    rows: list[dict[str, Any]] = []
+    for index in range(signal_count):
+        try:
+            row = {
+                "channel_index": index,
+                "label": labels[index],
+                "transducer": transducers[index],
+                "physical_dimension": physical_dimensions[index],
+                "physical_min": float(physical_mins[index]),
+                "physical_max": float(physical_maxs[index]),
+                "digital_min": float(digital_mins[index]),
+                "digital_max": float(digital_maxs[index]),
+                "prefilter": prefilters[index],
+                "samples_per_record": int(samples_per_record[index]),
+                "reserved": reserved[index],
+            }
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid EDF signal-header numeric field at channel {index}") from exc
+        if not row["label"]:
+            raise RuntimeError(f"Empty EDF signal label at channel {index}")
+        if row["physical_min"] >= row["physical_max"]:
+            raise RuntimeError(f"Invalid EDF physical range at channel {index}: {row}")
+        if row["digital_min"] >= row["digital_max"]:
+            raise RuntimeError(f"Invalid EDF digital range at channel {index}: {row}")
+        if row["samples_per_record"] <= 0:
+            raise RuntimeError(f"Invalid EDF samples-per-record at channel {index}: {row}")
+        rows.append(row)
+    return rows
+
+
 def condition_from_entities(entities: dict[str, str]) -> str:
     task = entities.get("task", "").lower()
     if task == "eyesopen":
@@ -417,11 +496,35 @@ class DortmundPipeline:
         first = np.full(n_channels, np.nan); all_same = np.ones(n_channels, dtype=bool)
         has_nan = np.zeros(n_channels, dtype=bool); has_inf = np.zeros(n_channels, dtype=bool)
         hit_min = np.zeros(n_channels, dtype=np.int64); hit_max = np.zeros(n_channels, dtype=np.int64)
-        extras = raw._raw_extras[0]
-        physical_min = np.asarray(extras["physical_min"], dtype=float)[eeg_raw_indices]
-        physical_max = np.asarray(extras["physical_max"], dtype=float)[eeg_raw_indices]
-        digital_min = np.asarray(extras["digital_min"], dtype=float)[eeg_raw_indices]
-        digital_max = np.asarray(extras["digital_max"], dtype=float)[eeg_raw_indices]
+        edf_headers = read_edf_signal_header(Path(rec["absolute_path"]))
+        if len(edf_headers) != len(raw.ch_names):
+            raise RuntimeError(
+                f"EDF signal-header count {len(edf_headers)} != MNE channel count {len(raw.ch_names)}"
+            )
+        edf_labels = [row["label"] for row in edf_headers]
+        if edf_labels != list(raw.ch_names):
+            differences = [
+                f"{idx}: EDF={expected!r} MNE={actual!r}"
+                for idx, (expected, actual) in enumerate(zip(edf_labels, raw.ch_names))
+                if expected != actual
+            ]
+            raise RuntimeError("EDF/MNE channel label mismatch: " + "; ".join(differences[:12]))
+        eeg_headers = [edf_headers[index] for index in eeg_raw_indices]
+        header_multipliers = [unit_to_uv_multiplier(row["physical_dimension"]) for row in eeg_headers]
+        if any(multiplier is None for multiplier in header_multipliers):
+            failures = [
+                f"{DORTMUND_CHANNELS[idx]}={eeg_headers[idx]['physical_dimension']!r}"
+                for idx, multiplier in enumerate(header_multipliers)
+                if multiplier is None
+            ]
+            raise RuntimeError("Unrecognized EDF physical dimension: " + "; ".join(failures))
+        physical_min_raw = np.asarray([row["physical_min"] for row in eeg_headers], dtype=float)
+        physical_max_raw = np.asarray([row["physical_max"] for row in eeg_headers], dtype=float)
+        header_multipliers_array = np.asarray(header_multipliers, dtype=float)
+        physical_min_uv = physical_min_raw * header_multipliers_array
+        physical_max_uv = physical_max_raw * header_multipliers_array
+        digital_min = np.asarray([row["digital_min"] for row in eeg_headers], dtype=float)
+        digital_max = np.asarray([row["digital_max"] for row in eeg_headers], dtype=float)
         read_samples = 0
         for start in range(0, n_samples, chunk):
             stop = min(n_samples, start + chunk)
@@ -437,8 +540,8 @@ class DortmundPipeline:
                 if not np.all(finite == first[idx]): all_same[idx] = False
                 mins[idx] = min(mins[idx], float(finite.min())); maxs[idx] = max(maxs[idx], float(finite.max()))
                 sums[idx] += finite.sum(dtype=np.float64); squares[idx] += np.dot(finite, finite); counts[idx] += finite.size
-                hit_min[idx] += np.count_nonzero(np.isclose(finite, physical_min[idx], rtol=0, atol=1e-9))
-                hit_max[idx] += np.count_nonzero(np.isclose(finite, physical_max[idx], rtol=0, atol=1e-9))
+                hit_min[idx] += np.count_nonzero(np.isclose(finite, physical_min_uv[idx], rtol=0, atol=1e-9))
+                hit_max[idx] += np.count_nonzero(np.isclose(finite, physical_max_uv[idx], rtol=0, atol=1e-9))
         validate_full_read(read_samples, n_samples, bool(has_nan.any()), bool(has_inf.any()))
         if np.any(counts != n_samples):
             raise RuntimeError("Incomplete finite sample count for one or more channels")
@@ -452,14 +555,20 @@ class DortmundPipeline:
                 if first[idx] == 0: reasons.append("all_zero")
                 reasons.extend(["strict_constant", "exact_zero_variance"])
             bad[idx] = bool(reasons)
-            unit = channel_meta[idx].get("units", "")
-            if unit_to_uv_multiplier(unit) != 1.0:
-                raise RuntimeError(f"Unverified EEG unit for {DORTMUND_CHANNELS[idx]}: {unit!r}")
+            unit = eeg_headers[idx]["physical_dimension"]
+            sidecar_unit = channel_meta[idx].get("units", "")
+            header_multiplier = unit_to_uv_multiplier(unit)
+            sidecar_multiplier = unit_to_uv_multiplier(sidecar_unit)
+            if header_multiplier is None or sidecar_multiplier is None or header_multiplier != sidecar_multiplier:
+                raise RuntimeError(
+                    f"Unverified/conflicting EEG unit for {DORTMUND_CHANNELS[idx]}: "
+                    f"EDF={unit!r} channels.tsv={sidecar_unit!r}"
+                )
             physical_hits = int(hit_min[idx] + hit_max[idx])
             near_zero = variance <= 1e-12 and not all_same[idx]
             dc = abs(mean) > 1000.0
             extreme = max(abs(mins[idx]), abs(maxs[idx])) > 10000.0
-            row = {"subject_id": rec["subject_id"], "recording_id": rec["recording_id"], "source_path": rec["source_path"], "channel_index": idx, "channel_name": DORTMUND_CHANNELS[idx], "channel_type": "EEG", "physical_dimension": unit, "physical_min": physical_min[idx], "physical_max": physical_max[idx], "digital_min": digital_min[idx], "digital_max": digital_max[idx], "raw_min_uv": mins[idx], "raw_max_uv": maxs[idx], "raw_mean_uv": mean, "raw_std_uv": math.sqrt(variance), "post_filter_min_uv": "", "post_filter_max_uv": "", "post_filter_mean_uv": "", "post_filter_std_uv": "", "physical_limit_hit_count": physical_hits, "near_zero_variance_flag": near_zero, "dc_offset_flag": dc, "extreme_amplitude_flag": extreme, "is_bad": bool(bad[idx]), "bad_reason": ";".join(reasons)}
+            row = {"subject_id": rec["subject_id"], "recording_id": rec["recording_id"], "source_path": rec["source_path"], "channel_index": idx, "channel_name": DORTMUND_CHANNELS[idx], "channel_type": "EEG", "physical_dimension": unit, "physical_min": physical_min_raw[idx], "physical_max": physical_max_raw[idx], "digital_min": digital_min[idx], "digital_max": digital_max[idx], "raw_min_uv": mins[idx], "raw_max_uv": maxs[idx], "raw_mean_uv": mean, "raw_std_uv": math.sqrt(variance), "post_filter_min_uv": "", "post_filter_max_uv": "", "post_filter_mean_uv": "", "post_filter_std_uv": "", "physical_limit_hit_count": physical_hits, "near_zero_variance_flag": near_zero, "dc_offset_flag": dc, "extreme_amplitude_flag": extreme, "is_bad": bool(bad[idx]), "bad_reason": ";".join(reasons)}
             inventory.append(row)
             if physical_hits:
                 self.issue("warning", "raw_signal_qc", "physical_limit_hit", f"{physical_hits} samples equal EDF physical limits; source limits are documented as potentially invalid", "Record only; do not reject on this evidence alone", rec, DORTMUND_CHANNELS[idx])

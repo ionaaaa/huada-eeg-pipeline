@@ -57,6 +57,31 @@ def cache_row(sample_id="x", age=25.0):
     }
 
 
+def write_synthetic_edf_header(path: Path) -> None:
+    def field(value, width):
+        encoded = str(value).encode("latin-1")
+        assert len(encoded) <= width
+        return encoded.ljust(width, b" ")
+
+    signal_count = 2
+    header_bytes = 256 + 256 * signal_count
+    fixed = b"".join([
+        field("0", 8), field("synthetic", 80), field("synthetic", 80),
+        field("01.01.01", 8), field("01.01.01", 8), field(header_bytes, 8),
+        field("", 44), field(1, 8), field(1, 8), field(signal_count, 4),
+    ])
+    assert len(fixed) == 256
+    columns = [
+        (["Fp1", "Status"], 16), (["", ""], 80), (["uV", "uV"], 8),
+        (["-100", "-1"], 8), (["100", "1"], 8),
+        (["-32768", "-32768"], 8), (["32767", "32767"], 8),
+        (["", ""], 80), (["1000", "1000"], 8), (["", ""], 32),
+    ]
+    signal_header = b"".join(field(value, width) for values, width in columns for value in values)
+    assert len(signal_header) == 256 * signal_count
+    path.write_bytes(fixed + signal_header)
+
+
 def test_profile_a_selects_only_ses1_pre():
     assert dortmund.profile_a_decision({"session": "ses-1", "acquisition": "pre", "task": "EyesOpen"}, {"TaskName": "RestingState"}) == (True, "selected_profile_a")
 
@@ -123,6 +148,26 @@ def test_status_must_exist_exactly_once():
             [*dortmund.DORTMUND_CHANNELS, "Trigger"],
             ["eeg"] * 64 + ["stim"],
         )
+
+
+def test_edf_signal_header_parser_is_independent_of_mne_private_extras(tmp_path):
+    path = tmp_path / "synthetic.edf"
+    write_synthetic_edf_header(path)
+    rows = dortmund.read_edf_signal_header(path)
+    assert [row["label"] for row in rows] == ["Fp1", "Status"]
+    assert rows[0]["physical_dimension"] == "uV"
+    assert rows[0]["physical_min"] == -100.0
+    assert rows[0]["physical_max"] == 100.0
+    assert rows[0]["digital_min"] == -32768.0
+    assert rows[0]["digital_max"] == 32767.0
+    assert rows[0]["samples_per_record"] == 1000
+
+
+def test_edf_signal_header_parser_rejects_truncation(tmp_path):
+    path = tmp_path / "truncated.edf"
+    path.write_bytes(b"0" * 100)
+    with pytest.raises(RuntimeError, match="Truncated EDF fixed header"):
+        dortmund.read_edf_signal_header(path)
 
 
 def test_native_channel_order_is_stable():
