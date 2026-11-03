@@ -108,6 +108,23 @@ def test_status_is_not_native_eeg_channel():
     assert "Status" not in dortmund.DORTMUND_CHANNELS
 
 
+@pytest.mark.parametrize("status_type", ["stim", "eeg", "misc"])
+def test_status_exclusion_does_not_depend_on_mne_inferred_type(status_type):
+    names = [*dortmund.DORTMUND_CHANNELS, "Status"]
+    types = ["eeg"] * 64 + [status_type]
+    eeg_indices, status_indices = dortmund.resolve_dortmund_channel_indices(names, types)
+    assert eeg_indices == list(range(64))
+    assert status_indices == [64]
+
+
+def test_status_must_exist_exactly_once():
+    with pytest.raises(RuntimeError, match="one exact-name Status"):
+        dortmund.resolve_dortmund_channel_indices(
+            [*dortmund.DORTMUND_CHANNELS, "Trigger"],
+            ["eeg"] * 64 + ["stim"],
+        )
+
+
 def test_native_channel_order_is_stable():
     assert dortmund.DORTMUND_CHANNELS[:5] == ["Fp1", "Fp2", "F7", "F3", "Fz"]
     assert dortmund.DORTMUND_CHANNELS[-1] == "PO8"

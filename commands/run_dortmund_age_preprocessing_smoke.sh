@@ -55,6 +55,14 @@ echo "[dortmund-smoke] selected subjects: sub-004 sub-230 sub-600; max windows p
       echo "[dortmund-smoke] tail of preprocessing_errors.log:" >&2
       tail -n 100 "$OUTPUT_DIR/preprocessing_errors.log" >&2
     fi
+    if [[ -f "$OUTPUT_DIR/recording_processing_summary.csv" ]]; then
+      echo "[dortmund-smoke] recording_processing_summary.csv:" >&2
+      tail -n 20 "$OUTPUT_DIR/recording_processing_summary.csv" >&2
+    fi
+    if [[ -f "$OUTPUT_DIR/preprocessing_issues.csv" ]]; then
+      echo "[dortmund-smoke] tail of preprocessing_issues.csv:" >&2
+      tail -n 30 "$OUTPUT_DIR/preprocessing_issues.csv" >&2
+    fi
     exit "$status"
   }
 

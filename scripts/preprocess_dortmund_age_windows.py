@@ -161,6 +161,32 @@ def resolve_duration(header_samples: int, sfreq: float, sidecar_duration: float)
     return actual, math.isclose(actual, float(sidecar_duration), abs_tol=1.1)
 
 
+def resolve_dortmund_channel_indices(
+    channel_names: Sequence[str], channel_types: Sequence[str]
+) -> tuple[list[int], list[int]]:
+    """Resolve native EEG and Status slots without trusting Status type inference."""
+    if len(channel_names) != len(channel_types):
+        raise RuntimeError(
+            f"Channel name/type length mismatch: {len(channel_names)} != {len(channel_types)}"
+        )
+    status_indices = [
+        idx for idx, name in enumerate(channel_names)
+        if name.casefold() == STATUS_NAME.casefold()
+    ]
+    eeg_indices = [
+        idx for idx, channel_type in enumerate(channel_types)
+        if channel_type == "eeg" and idx not in status_indices
+    ]
+    if len(channel_names) != 65 or len(eeg_indices) != 64 or len(status_indices) != 1:
+        typed_names = list(zip(channel_names, channel_types))
+        raise RuntimeError(
+            "Expected 64 EEG + one exact-name Status channel, got "
+            f"names={len(channel_names)} eeg_excluding_status={len(eeg_indices)} "
+            f"status={len(status_indices)} typed_names={typed_names!r}"
+        )
+    return eeg_indices, status_indices
+
+
 def condition_from_entities(entities: dict[str, str]) -> str:
     task = entities.get("task", "").lower()
     if task == "eyesopen":
@@ -456,19 +482,53 @@ class DortmundPipeline:
             raw = mne.io.read_raw_edf(rec["absolute_path"], preload=False, infer_types=True, verbose="ERROR")
             validation["header_read_success"] = True
             types = raw.get_channel_types()
-            eeg_indices = [i for i, typ in enumerate(types) if typ == "eeg"]
-            status_indices = [i for i, (name, typ) in enumerate(zip(raw.ch_names, types)) if name.lower() == "status" and typ == "stim"]
-            if len(raw.ch_names) != 65 or len(eeg_indices) != 64 or len(status_indices) != 1:
-                raise RuntimeError(f"Expected 64 EEG + one Status stim, got names={len(raw.ch_names)} eeg={len(eeg_indices)} status={len(status_indices)}")
+            # Status is an exact source channel name. Do not make exclusion
+            # depend on MNE's inferred type because that inference has varied
+            # between MNE releases (stim/eeg/misc). The other 64 channels must
+            # still be explicitly typed as EEG.
+            eeg_indices, status_indices = resolve_dortmund_channel_indices(raw.ch_names, types)
+            status_type = types[status_indices[0]]
+            if status_type != "stim":
+                self.issue(
+                    "warning",
+                    "header_qc",
+                    "status_type_inference_differs",
+                    f"MNE inferred Status as {status_type!r}; excluded by exact channel name",
+                    "Exclude Status from EEG data; retain the inferred type in diagnostics",
+                    rec,
+                    STATUS_NAME,
+                )
             eeg_names = [raw.ch_names[i] for i in eeg_indices]
             if eeg_names != DORTMUND_CHANNELS:
-                raise RuntimeError("Dortmund native 64-channel order mismatch")
+                differences = [
+                    f"{idx}: expected={expected!r} actual={actual!r}"
+                    for idx, (expected, actual) in enumerate(zip(DORTMUND_CHANNELS, eeg_names))
+                    if expected != actual
+                ]
+                if len(eeg_names) != len(DORTMUND_CHANNELS):
+                    differences.append(f"length: expected=64 actual={len(eeg_names)}")
+                raise RuntimeError(
+                    "Dortmund native 64-channel order mismatch: " + "; ".join(differences[:12])
+                )
             sfreq = float(raw.info["sfreq"])
             if not math.isclose(sfreq, SOURCE_SFREQ, rel_tol=0, abs_tol=1e-6):
                 raise RuntimeError(f"Expected 1000 Hz, got {sfreq}")
-            channel_meta = read_tsv(self.data_dir / rec["channels_path"])
+            channel_meta_all = read_tsv(self.data_dir / rec["channels_path"])
+            channel_meta = [
+                row for row in channel_meta_all
+                if row.get("name", "").casefold() != STATUS_NAME.casefold()
+                and row.get("type", "EEG").casefold() == "eeg"
+            ]
             if [row.get("name") for row in channel_meta] != DORTMUND_CHANNELS:
-                raise RuntimeError("channels.tsv order does not match native profile")
+                actual_names = [row.get("name") for row in channel_meta]
+                differences = [
+                    f"{idx}: expected={expected!r} actual={actual!r}"
+                    for idx, (expected, actual) in enumerate(zip(DORTMUND_CHANNELS, actual_names))
+                    if expected != actual
+                ]
+                if len(actual_names) != len(DORTMUND_CHANNELS):
+                    differences.append(f"length: expected=64 actual={len(actual_names)}")
+                raise RuntimeError("channels.tsv order does not match native profile: " + "; ".join(differences[:12]))
             bad, channel_rows, read_count = self._scan_recording(raw, eeg_indices, rec, channel_meta)
             n_samples = int(raw.n_times)
             sidecar_duration = float(rec["sidecar"].get("RecordingDuration", n_samples / sfreq))
@@ -530,6 +590,11 @@ class DortmundPipeline:
             summary["error"] = f"{type(exc).__name__}: {exc}"; validation["error"] = summary["error"]
             self.errors.append(f"[{now_iso()}] {rec['subject_id']} {rec['source_path']}\n{traceback.format_exc()}\n")
             self.issue("error", "recording_processing", "recording_failed_closed", summary["error"], "Exclude recording from main Lance", rec)
+            print(
+                f"[recording failed] {rec['subject_id']} {rec['eyes_condition']}: {summary['error']}",
+                file=sys.stderr,
+                flush=True,
+            )
         finally:
             self.rows["recording_processing_summary.csv"].append(summary)
             self.rows["recording_validation.csv"].append(validation)
@@ -542,6 +607,23 @@ class DortmundPipeline:
             self.process_one(rec)
         after = _snapshot_raw_files(self.data_dir, self.selected_paths)
         if self.first_lance_write:
+            self.issue(
+                "error",
+                "window_qc",
+                "no_hard_qc_passing_windows",
+                "No selected recording produced a hard-QC-passing window",
+                "Inspect recording_validation.csv, recording_processing_summary.csv, preprocessing_issues.csv, and preprocessing_errors.log",
+            )
+            diagnostic_roundtrip = {
+                "row_count": 0,
+                "sample_id_unique": True,
+                "schema_matches": False,
+                "all_rows_valid": False,
+                "forbidden_fields_absent": True,
+                "dataset_present": False,
+                "schema": str(self.schema),
+            }
+            self.write_outputs(before, after, diagnostic_roundtrip)
             raise RuntimeError("No hard-QC-passing windows were written")
         roundtrip = validate_dortmund_lance(self.lance_path, self.written_rows)
         self.write_outputs(before, after, roundtrip)
@@ -556,7 +638,8 @@ class DortmundPipeline:
         (self.output_dir / "preprocessing_errors.log").write_text("timestamp\tstage\tsubject_id\tsource_path\terror\n" + "".join(self.errors), encoding="utf-8")
         source_unchanged = before == after
         qc_pass_windows = sum(str(row["qc_pass"]).lower() == "true" or row["qc_pass"] is True for row in self.rows["window_inventory.csv"])
-        summary = {"dataset_id": DATASET_ID, "profile": "A", "run_mode": "smoke" if self.args.smoke else "full", "smoke": self.args.smoke, "selected_subjects": sorted(self.subjects), "selected_subject_count": len(self.subjects), "selected_recordings": len(self.recordings), "profile_a_total_subjects": len({r['subject_id'] for r in self.all_profile_recordings}), "profile_a_total_recordings": len(self.all_profile_recordings), "theoretical_complete_windows": sum(int(r.get("theoretical_complete_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "emitted_windows": len(self.rows["window_inventory.csv"]), "written_windows": self.written_rows, "smoke_truncated_windows": sum(int(r.get("smoke_truncated_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "real_dropped_tail_seconds": sum(float(r.get("real_dropped_tail_seconds", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "qc_pass_windows": qc_pass_windows, "qc_fail_windows": len(self.rows["window_inventory.csv"]) - qc_pass_windows, "recording_success_count": sum(bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "recording_failure_count": sum(not bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "blocking_error_count": sum(r["severity"] == "error" for r in self.issues), "warning_count": sum(r["severity"] == "warning" for r in self.issues), "age_min": min(r["age"] for r in self.subjects.values()), "age_max": max(r["age"] for r in self.subjects.values()), "age_distribution": dict(Counter(r["age"] for r in self.subjects.values())), "eyes_open_windows": sum(r["eyes_condition"] == "eyes_open" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "eyes_closed_windows": sum(r["eyes_condition"] == "eyes_closed" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "source_files_unchanged": source_unchanged, "source_files_modified": not source_unchanged, "source_files_deleted": bool(set(before) - set(after)), "source_files_added": bool(set(after) - set(before)), "status_absent_from_eeg": True, "ses2_absent": all(r["session_id"] == "ses-1" for r in self.recordings), "post_cognitive_absent": all(r["acquisition"] == "pre" for r in self.recordings), "split_absent": "split" not in self.schema.names, "fbmae_tokens_absent": "model_tokens" not in self.schema.names and "electrode_ids" not in self.schema.names, "source_reference": SOURCE_REFERENCE, "source_ground": SOURCE_GROUND, "rereference_applied": False, "processing_reference": "unchanged", "channel_layout": "dataset_level", "native_channel_names": DORTMUND_CHANNELS, "roundtrip": roundtrip, "lance_row_count_matches_qc_pass": self.written_rows == qc_pass_windows == roundtrip["row_count"], "generated_at": now_iso()}
+        dataset_written = self.lance_path.exists() and self.written_rows > 0
+        summary = {"dataset_id": DATASET_ID, "profile": "A", "run_mode": "smoke" if self.args.smoke else "full", "smoke": self.args.smoke, "selected_subjects": sorted(self.subjects), "selected_subject_count": len(self.subjects), "selected_recordings": len(self.recordings), "profile_a_total_subjects": len({r['subject_id'] for r in self.all_profile_recordings}), "profile_a_total_recordings": len(self.all_profile_recordings), "theoretical_complete_windows": sum(int(r.get("theoretical_complete_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "emitted_windows": len(self.rows["window_inventory.csv"]), "written_windows": self.written_rows, "dataset_written": dataset_written, "smoke_truncated_windows": sum(int(r.get("smoke_truncated_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "real_dropped_tail_seconds": sum(float(r.get("real_dropped_tail_seconds", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "qc_pass_windows": qc_pass_windows, "qc_fail_windows": len(self.rows["window_inventory.csv"]) - qc_pass_windows, "recording_success_count": sum(bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "recording_failure_count": sum(not bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "blocking_error_count": sum(r["severity"] == "error" for r in self.issues), "warning_count": sum(r["severity"] == "warning" for r in self.issues), "age_min": min(r["age"] for r in self.subjects.values()), "age_max": max(r["age"] for r in self.subjects.values()), "age_distribution": dict(Counter(r["age"] for r in self.subjects.values())), "eyes_open_windows": sum(r["eyes_condition"] == "eyes_open" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "eyes_closed_windows": sum(r["eyes_condition"] == "eyes_closed" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "source_files_unchanged": source_unchanged, "source_files_modified": not source_unchanged, "source_files_deleted": bool(set(before) - set(after)), "source_files_added": bool(set(after) - set(before)), "status_absent_from_eeg": True, "ses2_absent": all(r["session_id"] == "ses-1" for r in self.recordings), "post_cognitive_absent": all(r["acquisition"] == "pre" for r in self.recordings), "split_absent": "split" not in self.schema.names, "fbmae_tokens_absent": "model_tokens" not in self.schema.names and "electrode_ids" not in self.schema.names, "source_reference": SOURCE_REFERENCE, "source_ground": SOURCE_GROUND, "rereference_applied": False, "processing_reference": "unchanged", "channel_layout": "dataset_level", "native_channel_names": DORTMUND_CHANNELS, "roundtrip": roundtrip, "lance_row_count_matches_qc_pass": dataset_written and self.written_rows == qc_pass_windows == roundtrip["row_count"], "generated_at": now_iso()}
         (self.output_dir / "preprocessing_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         resolved = f'''[preprocessing]\ntarget_sfreq = {float(self.pre["target_sfreq"])}\nwindow_seconds = {float(self.pre["window_seconds"])}\nhop_seconds = {float(self.pre["hop_seconds"])}\nsegment_samples = {int(self.pre["segment_samples"])}\nbandpass_low = {float(self.pre["bandpass_low"])}\nbandpass_high = {float(self.pre["bandpass_high"])}\nnotch_hz = {float(self.pre["notch_hz"])}\nunit_before_normalization = "uV"\nnormalization = "clip_divide_200"\nnormalization_detail = "x_uV / 200, then clip to [-1, 1]"\n\n[windowing]\ndrop_incomplete_tail = true\npadding = false\n\n[source_expectations]\nformat = "EDF"\nsampling_rate_hz = 1000.0\nn_eeg_channels = 64\nstatus_channel = "Status"\n'''
         (self.output_dir / "resolved_config.toml").write_text(resolved, encoding="utf-8")
