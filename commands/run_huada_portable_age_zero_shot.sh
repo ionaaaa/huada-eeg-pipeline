@@ -2,6 +2,34 @@
 set -Eeuo pipefail
 exec 2>&1
 
+on_error() {
+  local status=$?
+  local line="${BASH_LINENO[0]:-unknown}"
+  local command="${BASH_COMMAND:-unknown}"
+  printf 'ERROR: portable zero-shot entrypoint failed status=%s line=%s command=%q\n' \
+    "$status" "$line" "$command" >&2
+  exit "$status"
+}
+trap on_error ERR
+
+require_directory() {
+  local path="$1"
+  local label="$2"
+  [[ -d "$path" ]] || {
+    printf 'ERROR: missing %s directory: %s\n' "$label" "$path" >&2
+    return 2
+  }
+}
+
+require_file() {
+  local path="$1"
+  local label="$2"
+  [[ -f "$path" ]] || {
+    printf 'ERROR: missing %s file: %s\n' "$label" "$path" >&2
+    return 2
+  }
+}
+
 : "${HUADA_ROOT:?Set HUADA_ROOT to the Huada repository root}"
 : "${PYTHON_BIN:?Set PYTHON_BIN to the model-forward Python runtime}"
 : "${MODEL_FAMILY:?Set MODEL_FAMILY to labram or reve}"
@@ -30,17 +58,17 @@ case "$MODEL_FAMILY" in
   *) echo "ERROR: MODEL_FAMILY must be labram or reve" >&2; exit 2 ;;
 esac
 
-test -x "$PYTHON_BIN"
-test -d "$HUADA_ROOT"
-test -d "$NATIVE_CACHE_RUN_ROOT"
-test -f "$NATIVE_CACHE_RUN_ROOT/_SUCCESS"
-test -f "$SUBJECT_MANIFEST"
-test -f "$TARGET_INPUT_CONTRACT"
-test -f "$PORTABLE_CHECKPOINT"
-test -f "${PORTABLE_CHECKPOINT}.manifest.json"
-test -f "$PORTABLE_SIDECAR"
-test -d "$DYNAMIC_PARITY_DIR"
-test -f "$DYNAMIC_PARITY_DIR/_SUCCESS"
+[[ -x "$PYTHON_BIN" ]] || { echo "ERROR: Python is not executable: $PYTHON_BIN" >&2; exit 2; }
+require_directory "$HUADA_ROOT" "Huada repository"
+require_directory "$NATIVE_CACHE_RUN_ROOT" "native cache run"
+require_file "$NATIVE_CACHE_RUN_ROOT/_SUCCESS" "native cache success marker"
+require_file "$SUBJECT_MANIFEST" "subject manifest"
+require_file "$TARGET_INPUT_CONTRACT" "target input contract"
+require_file "$PORTABLE_CHECKPOINT" "portable checkpoint"
+require_file "${PORTABLE_CHECKPOINT}.manifest.json" "portable manifest"
+require_file "$PORTABLE_SIDECAR" "portable sidecar"
+require_directory "$DYNAMIC_PARITY_DIR" "dynamic parity result"
+require_file "$DYNAMIC_PARITY_DIR/_SUCCESS" "dynamic parity success marker"
 mkdir -p "$OUTPUT_ROOT"
 
 RUN_OUTPUT="$OUTPUT_ROOT/huada_${MODEL_FAMILY}_dortmund_age_strict_zero_shot_${RUN_ID}"
@@ -69,14 +97,14 @@ ARGS=(
   --expected-source-age-std "$EXPECTED_SOURCE_AGE_STD"
 )
 
-test -d "$FBMAE_ZERO_SHOT_DIR"
-test -f "$FBMAE_ZERO_SHOT_DIR/_SUCCESS"
+require_directory "$FBMAE_ZERO_SHOT_DIR" "FBMAE strict zero-shot result"
+require_file "$FBMAE_ZERO_SHOT_DIR/_SUCCESS" "FBMAE strict zero-shot success marker"
 ARGS+=(--comparison-result "fbmae=$FBMAE_ZERO_SHOT_DIR")
 
 if [[ -n "${PEER_ZERO_SHOT_DIR:-}" ]]; then
   : "${PEER_MODEL_FAMILY:?Set PEER_MODEL_FAMILY when PEER_ZERO_SHOT_DIR is set}"
-  test -d "$PEER_ZERO_SHOT_DIR"
-  test -f "$PEER_ZERO_SHOT_DIR/_SUCCESS"
+  require_directory "$PEER_ZERO_SHOT_DIR" "peer strict zero-shot result"
+  require_file "$PEER_ZERO_SHOT_DIR/_SUCCESS" "peer strict zero-shot success marker"
   ARGS+=(--comparison-result "${PEER_MODEL_FAMILY}=$PEER_ZERO_SHOT_DIR")
 fi
 

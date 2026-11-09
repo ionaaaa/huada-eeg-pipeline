@@ -1,0 +1,32 @@
+﻿subject_id,source_path,field,authoritative_value,header_value,conflict_type,severity,description
+SUB1,SUB1_31_M/BGI_EEG_20261023172343/20261023172343.bdf,subject_id,SUB1,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB1,SUB1_31_M/BGI_EEG_20261023172343/20261023172343.bdf,sex,male,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB1,SUB1_31_M/BGI_EEG_20261023172343/20261023172343.bdf,birthday,,2026-10-23,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB1,SUB1_31_M/BGI_EEG_20261023172343/20261023172343.bdf,age,31,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.
+SUB2,SUB2_29_F/BGI_EEG_20261026150143/20261026150143.bdf,subject_id,SUB2,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB2,SUB2_29_F/BGI_EEG_20261026150143/20261026150143.bdf,sex,female,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB2,SUB2_29_F/BGI_EEG_20261026150143/20261026150143.bdf,birthday,,2026-10-26,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB2,SUB2_29_F/BGI_EEG_20261026150143/20261026150143.bdf,age,29,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.
+SUB3,SUB3_26_F/BGI_EEG_20261026152405/20261026152405.bdf,subject_id,SUB3,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB3,SUB3_26_F/BGI_EEG_20261026152405/20261026152405.bdf,sex,female,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB3,SUB3_26_F/BGI_EEG_20261026152405/20261026152405.bdf,birthday,,2026-10-26,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB3,SUB3_26_F/BGI_EEG_20261026152405/20261026152405.bdf,age,26,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.
+SUB4,SUB4_26_F/BGI_EEG_20261026155541/20261026155541.bdf,subject_id,SUB4,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB4,SUB4_26_F/BGI_EEG_20261026155541/20261026155541.bdf,sex,female,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB4,SUB4_26_F/BGI_EEG_20261026155541/20261026155541.bdf,birthday,,2026-10-26,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB4,SUB4_26_F/BGI_EEG_20261026155541/20261026155541.bdf,age,26,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.
+SUB5,SUB5_M/BGI_EEG_20261026161903/20261026161903.bdf,subject_id,SUB5,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB5,SUB5_M/BGI_EEG_20261026161903/20261026161903.bdf,sex,male,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB5,SUB5_M/BGI_EEG_20261026161903/20261026161903.bdf,birthday,,2026-10-26,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB6,SUB6_28_M/BGI_EEG_20261026163827/20261026163827.bdf,subject_id,SUB6,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB6,SUB6_28_M/BGI_EEG_20261026163827/20261026163827.bdf,sex,male,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB6,SUB6_28_M/BGI_EEG_20261026163827/20261026163827.bdf,birthday,,2026-10-26,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB6,SUB6_28_M/BGI_EEG_20261026163827/20261026163827.bdf,age,28,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.
+SUB7,SUB7_28_F/BGI_EEG_20261029145112/20261029145112.bdf,subject_id,SUB7,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB7,SUB7_28_F/BGI_EEG_20261029145112/20261029145112.bdf,sex,female,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB7,SUB7_28_F/BGI_EEG_20261029145112/20261029145112.bdf,birthday,,2026-10-29,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB7,SUB7_28_F/BGI_EEG_20261029145112/20261029145112.bdf,age,28,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.
+SUB8,SUB8_22_M/BGI_EEG_20261029160859/20261029160859.bdf,subject_id,SUB8,X,anonymous_placeholder,warning,BDF his_id is missing or an anonymous placeholder; directory value remains authoritative.
+SUB8,SUB8_22_M/BGI_EEG_20261029160859/20261029160859.bdf,sex,male,0,anonymous_or_unknown,warning,BDF sex is unknown; directory value remains authoritative.
+SUB8,SUB8_22_M/BGI_EEG_20261029160859/20261029160859.bdf,birthday,,2026-10-29,anonymous_placeholder,warning,BDF birthday equals the measurement date and appears to be an anonymous placeholder.
+SUB8,SUB8_22_M/BGI_EEG_20261029160859/20261029160859.bdf,age,22,0,value_conflict,warning,Age implied by BDF birthday conflicts with directory age; directory age remains authoritative.

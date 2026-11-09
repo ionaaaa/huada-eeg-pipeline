@@ -1,0 +1,9 @@
+﻿subject_id,subject_number,age,sex,original_directory_name,source_directory,metadata_source,metadata_status,notes
+SUB1,1,31,male,SUB1_31_M,SUB1_31_M,directory_name,complete,Authoritative demographic metadata parsed from directory name.
+SUB2,2,29,female,SUB2_29_F,SUB2_29_F,directory_name,complete,Authoritative demographic metadata parsed from directory name.
+SUB3,3,26,female,SUB3_26_F,SUB3_26_F,directory_name,complete,Authoritative demographic metadata parsed from directory name.
+SUB4,4,26,female,SUB4_26_F,SUB4_26_F,directory_name,complete,Authoritative demographic metadata parsed from directory name.
+SUB5,5,,male,SUB5_M,SUB5_M,directory_name,age_missing,Age is absent from the directory name and remains null by policy.
+SUB6,6,28,male,SUB6_28_M,SUB6_28_M,directory_name,complete,Authoritative demographic metadata parsed from directory name.
+SUB7,7,28,female,SUB7_28_F,SUB7_28_F,directory_name,complete,Authoritative demographic metadata parsed from directory name.
+SUB8,8,22,male,SUB8_22_M,SUB8_22_M,directory_name,complete,Authoritative demographic metadata parsed from directory name.

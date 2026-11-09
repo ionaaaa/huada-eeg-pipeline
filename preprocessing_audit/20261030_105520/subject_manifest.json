@@ -1,0 +1,90 @@
+[
+  {
+    "subject_id": "SUB1",
+    "subject_number": 1,
+    "age": 31,
+    "sex": "male",
+    "original_directory_name": "SUB1_31_M",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB1_31_M"
+  },
+  {
+    "subject_id": "SUB2",
+    "subject_number": 2,
+    "age": 29,
+    "sex": "female",
+    "original_directory_name": "SUB2_29_F",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB2_29_F"
+  },
+  {
+    "subject_id": "SUB3",
+    "subject_number": 3,
+    "age": 26,
+    "sex": "female",
+    "original_directory_name": "SUB3_26_F",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB3_26_F"
+  },
+  {
+    "subject_id": "SUB4",
+    "subject_number": 4,
+    "age": 26,
+    "sex": "female",
+    "original_directory_name": "SUB4_26_F",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB4_26_F"
+  },
+  {
+    "subject_id": "SUB5",
+    "subject_number": 5,
+    "age": null,
+    "sex": "male",
+    "original_directory_name": "SUB5_M",
+    "metadata_source": "directory_name",
+    "metadata_status": "age_missing",
+    "notes": "Age is absent from the directory name and remains null by policy.",
+    "source_directory": "SUB5_M"
+  },
+  {
+    "subject_id": "SUB6",
+    "subject_number": 6,
+    "age": 28,
+    "sex": "male",
+    "original_directory_name": "SUB6_28_M",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB6_28_M"
+  },
+  {
+    "subject_id": "SUB7",
+    "subject_number": 7,
+    "age": 28,
+    "sex": "female",
+    "original_directory_name": "SUB7_28_F",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB7_28_F"
+  },
+  {
+    "subject_id": "SUB8",
+    "subject_number": 8,
+    "age": 22,
+    "sex": "male",
+    "original_directory_name": "SUB8_22_M",
+    "metadata_source": "directory_name",
+    "metadata_status": "complete",
+    "notes": "Authoritative demographic metadata parsed from directory name.",
+    "source_directory": "SUB8_22_M"
+  }
+]

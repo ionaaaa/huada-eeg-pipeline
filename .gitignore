@@ -6,7 +6,7 @@ data/
 # 处理产物
 preprocessed_common/
 preprocessed_common_smoke/
-preprocessing_audit/
+
 audit_resting_state/
 audit_dortmund_age/
 audit_tdbrain_age_sample/

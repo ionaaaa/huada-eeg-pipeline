@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-10-30T10:55:23+08:00",
+  "data_dir": "D:\\repo\\华大\\data\\resting_state",
+  "config_path": "D:\\repo\\华大\\configs\\huada_resting_preprocessing.toml",
+  "output_dir": "D:\\repo\\华大\\preprocessing_audit\\20261030_105520",
+  "actual_command": "D:\\miniconda\\python.exe D:\\repo\\华大\\scripts\\validate_huada_raw_bdf.py --data-dir D:\\repo\\华大\\data\\resting_state --config D:\\repo\\华大\\configs\\huada_resting_preprocessing.toml --output-dir D:\\repo\\华大\\preprocessing_audit\\20261030_105520 --chunk-seconds 30",
+  "raw_data_modified": false,
+  "scope": [
+    "fixed configuration validation",
+    "authoritative directory-name subject manifest",
+    "read-only BDF file-level validation"
+  ],
+  "excluded_operations": [
+    "filtering",
+    "notch filtering",
+    "resampling",
+    "windowing",
+    "normalization",
+    "bad-channel modification",
+    "label export",
+    "Lance conversion"
+  ],
+  "config_validation_pass": true,
+  "manifest_subject_count": 8,
+  "recording_count": 8,
+  "recording_pass_count": 8,
+  "recording_fail_count": 0,
+  "reference_channel_file": "SUB1_31_M/BGI_EEG_20261023172343/20261023172343.bdf",
+  "reference_unknown_count": 8,
+  "montage_unknown_count": 8,
+  "unit_conversion_status_counts": {
+    "pass": 8
+  },
+  "severity_counts": {
+    "warning": 58
+  },
+  "python_version": "3.14.7 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 10:12:46) [MSC v.1942 64 bit (AMD64)]",
+  "mne_version": "1.13.2",
+  "header_reader": "MNE read_raw_bdf plus parsed raw._raw_extras header fields",
+  "pyedflib_used": false,
+  "pyedflib_note": "Not installed; MNE exposed all required fields for these files, so no installation was needed."
+}
