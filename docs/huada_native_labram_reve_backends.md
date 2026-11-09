@@ -108,3 +108,33 @@ using the full-precision scaler in the portable checkpoint.
 
 Expected outputs are LaBraM `[B,129,200]` and REVE `[B,128,512]`. Backend input
 is strictly finite float32 `[B,64,400]`; a 10-second FBMAE window is rejected.
+
+## Strict Dortmund-age zero-shot
+
+`scripts.native_backends.run_huada_portable_age_zero_shot` consumes only a
+completed native full-recording cache, its exact frozen Huada target contract,
+a formal portable checkpoint plus both sidecars, and a passed NeuralBench
+dynamic-parity directory. It refuses fixture checkpoints, incomplete caches,
+SHA drift, family drift, source-checkpoint drift, or parity that is not passed.
+
+Every recording is sliced into non-overlapping float32 `[64,400]` windows.
+Only the window tensor enters the backend. The fixed Huada subject ages are
+attached after forward; SUB5 remains null and is retained in prediction output
+but excluded from every metric. The primary result is the mean of window-level
+age predictions per subject. Reported metrics are MAE, RMSE, R-squared,
+Pearson, Spearman, and signed bias over the seven labeled subjects. The fixed
+27.5-year Dortmund source-mean baseline is always emitted.
+
+The entry point contains no optimizer, scheduler, backward, calibration, or
+prediction clipping path. It independently reconstructs each age as
+`predicted_z * checkpoint_std + checkpoint_mean`, checks the backend result,
+and fingerprints the model and native cache before and after inference.
+
+Cloud wrappers are:
+
+- `commands/run_huada_labram_dortmund_age_zero_shot.sh`;
+- `commands/run_huada_reve_dortmund_age_zero_shot.sh`.
+
+Both require the already-passed FBMAE strict zero-shot result. The REVE wrapper
+also requires the completed LaBraM result, so its output contains the final
+FBMAE/LaBraM/REVE subject-mean comparison without rerunning either reference.
