@@ -216,16 +216,8 @@ def _cache_snapshot(cache_root: Path) -> dict[str, Any]:
     return {"cache_root": str(cache_root.resolve()), "files": rows}
 
 
-def load_subject_age_manifest(
-    path: str | Path, *, expected_file_sha256: str
-) -> dict[str, float | None]:
+def load_subject_age_manifest(path: str | Path) -> dict[str, float | None]:
     candidate = _regular_file(path, "Huada subject manifest")
-    expected_sha = _require_sha256(expected_file_sha256, "subject manifest SHA256")
-    actual_sha = sha256_file(candidate)
-    if actual_sha != expected_sha:
-        raise NativeZeroShotError(
-            f"subject manifest SHA mismatch: expected={expected_sha}, actual={actual_sha}"
-        )
     raw = _json_read(candidate, "Huada subject manifest")
     if type(raw) is not list or any(type(row) is not dict for row in raw):
         raise NativeZeroShotError("Huada subject manifest must be a JSON list of objects")
@@ -492,7 +484,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-family", required=True, choices=("labram", "reve"))
     parser.add_argument("--native-cache-run-root", required=True)
     parser.add_argument("--subject-manifest", required=True)
-    parser.add_argument("--expected-subject-manifest-sha256", required=True)
     parser.add_argument("--target-input-contract", required=True)
     parser.add_argument("--expected-target-contract-file-sha256", required=True)
     parser.add_argument("--portable-checkpoint", required=True)
@@ -519,7 +510,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         (args.expected_target_contract_file_sha256, "target contract SHA256"),
         (args.expected_portable_checkpoint_sha256, "portable checkpoint SHA256"),
         (args.expected_source_checkpoint_sha256, "source checkpoint SHA256"),
-        (args.expected_subject_manifest_sha256, "subject manifest SHA256"),
     ):
         try:
             _require_sha256(value, label)
@@ -582,10 +572,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         family = args.model_family
         logging.info("[stage 1/8] validate target contract and native caches")
-        subject_ages = load_subject_age_manifest(
-            args.subject_manifest,
-            expected_file_sha256=args.expected_subject_manifest_sha256,
-        )
+        subject_manifest_path = _regular_file(args.subject_manifest, "Huada subject manifest")
+        subject_ages = load_subject_age_manifest(subject_manifest_path)
+        subject_manifest_sha = sha256_file(subject_manifest_path)
         contract_path = _regular_file(args.target_input_contract, "target input contract")
         expected_contract_file_sha = _require_sha256(
             args.expected_target_contract_file_sha256, "target contract SHA256"
@@ -743,8 +732,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "source_checkpoint_sha256": expected_source_sha,
             "source_scaler": {"mean": source_mean, "std": source_std, "target_unit": "year"},
             "native_cache_run_root": str(cache_root.resolve()),
-            "subject_manifest": str(Path(args.subject_manifest).resolve()),
-            "subject_manifest_sha256": args.expected_subject_manifest_sha256,
+            "subject_manifest": str(subject_manifest_path.resolve()),
+            "subject_manifest_sha256": subject_manifest_sha,
+            "subject_manifest_validation": "semantic_subject_ids_and_frozen_ages",
             "target_contract_file_sha256": expected_contract_file_sha,
             "dynamic_parity_dir": str(Path(args.dynamic_parity_dir).resolve()),
             "device": str(device),

@@ -125,6 +125,12 @@ age predictions per subject. Reported metrics are MAE, RMSE, R-squared,
 Pearson, Spearman, and signed bias over the seven labeled subjects. The fixed
 27.5-year Dortmund source-mean baseline is always emitted.
 
+The subject manifest is validated semantically rather than by raw file SHA:
+it must contain exactly SUB1--SUB8 with the frozen protocol ages and SUB5 age
+must remain null. This intentionally tolerates Git CRLF/LF normalization while
+still failing closed on missing, duplicate, unknown, changed, or non-finite
+subject ages. Its observed file SHA is retained in result provenance only.
+
 The entry point contains no optimizer, scheduler, backward, calibration, or
 prediction clipping path. It independently reconstructs each age as
 `predicted_z * checkpoint_std + checkpoint_mean`, checks the backend result,

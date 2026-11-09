@@ -134,7 +134,6 @@ def test_parse_args_requires_full_hashes_and_exact_positive_scaler():
         "--model-family", "labram",
         "--native-cache-run-root", "cache",
         "--subject-manifest", "subjects.json",
-        "--expected-subject-manifest-sha256", "0" * 64,
         "--target-input-contract", "contract.json",
         "--expected-target-contract-file-sha256", "1" * 64,
         "--portable-checkpoint", "portable.pt",
@@ -155,7 +154,6 @@ def test_dry_run_does_not_open_inputs_or_construct_model(capsys):
         "--model-family", "reve",
         "--native-cache-run-root", "missing-cache",
         "--subject-manifest", "missing-subjects.json",
-        "--expected-subject-manifest-sha256", "0" * 64,
         "--target-input-contract", "missing-contract",
         "--expected-target-contract-file-sha256", "1" * 64,
         "--portable-checkpoint", "missing.pt",
@@ -177,16 +175,17 @@ def test_dry_run_does_not_open_inputs_or_construct_model(capsys):
     assert payload["prediction_clipping_enabled"] is False
 
 
-def test_subject_manifest_is_sha_bound_and_sub5_stays_null(tmp_path):
+def test_subject_manifest_is_semantically_validated_and_sub5_stays_null(tmp_path):
     source = Path("preprocessing_audit/20261030_105520/subject_manifest.json")
     copied = tmp_path / "subject_manifest.json"
     copied.write_bytes(source.read_bytes())
-    sha = zero.sha256_file(copied)
-    assert zero.load_subject_age_manifest(
-        copied, expected_file_sha256=sha
-    ) == zero.EXPECTED_SUBJECT_AGES
-    with pytest.raises(zero.NativeZeroShotError, match="SHA mismatch"):
-        zero.load_subject_age_manifest(copied, expected_file_sha256="f" * 64)
+    assert zero.load_subject_age_manifest(copied) == zero.EXPECTED_SUBJECT_AGES
+
+    rows = json.loads(copied.read_text(encoding="utf-8"))
+    next(row for row in rows if row["subject_id"] == "SUB5")["age"] = 25
+    copied.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(zero.NativeZeroShotError, match="frozen Huada protocol"):
+        zero.load_subject_age_manifest(copied)
 
 
 def test_entrypoint_has_no_training_or_prediction_clip_path():
