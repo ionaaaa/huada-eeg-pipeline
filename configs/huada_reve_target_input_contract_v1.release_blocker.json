@@ -1,0 +1,11 @@
+{
+  "schema_name": "huada_reve_target_input_contract_release_blocker",
+  "schema_version": 1,
+  "status": "blocked",
+  "reason": "The released REVE positions.json asset is not present in this local repository, so a Huada-ordered 64x3 bank cannot be embedded and fingerprinted locally without inventing geometry.",
+  "required_source_asset": "brain-bzh/reve-positions positions.json",
+  "required_source_asset_sha256": "f62ca8d7dd4b88e1422ea17348440a41ed0b73b9ff7d12c3b1229492c9b448a5",
+  "freeze_command": "python -m scripts.native_backends.freeze_huada_target_contract --model-family reve --reve-position-source <verified_positions.json> --output configs/huada_reve_target_input_contract_v1.json",
+  "dortmund_position_bank_reuse_allowed": false,
+  "formal_backend_behavior": "fail_closed_until_released_contract_exists"
+}

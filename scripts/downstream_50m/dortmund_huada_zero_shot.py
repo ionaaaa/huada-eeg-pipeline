@@ -21,8 +21,10 @@ from scipy import stats
 
 try:
     from .model import EEGPretrainModel
+    from .neuralbench_checkpoint import tensor_state_fingerprint
 except ImportError:
     from model import EEGPretrainModel
+    from neuralbench_checkpoint import tensor_state_fingerprint
 
 
 CHECKPOINT_KIND = "dortmund_age_50m_full_finetune"
@@ -102,14 +104,7 @@ def sha256_file(path: str | Path) -> str:
 
 
 def model_state_fingerprint(model: torch.nn.Module) -> str:
-    digest = hashlib.sha256()
-    for key, tensor in sorted(model.state_dict().items()):
-        value = tensor.detach().cpu().contiguous()
-        digest.update(key.encode("utf-8"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+    return tensor_state_fingerprint(model.state_dict())
 
 
 def _finite_float(value: Any, name: str) -> float:

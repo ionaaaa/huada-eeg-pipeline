@@ -1,0 +1,30 @@
+{
+  "canonical_key_policy": "explicit family mapping; no suffix or wrapper-prefix guessing",
+  "checkpoint_kind": "portable_age_full_finetuned",
+  "metadata_hash": "UTF-8 canonical JSON sort_keys=True separators=(comma,colon) allow_nan=False",
+  "model_families": [
+    "fbmae",
+    "labram",
+    "reve"
+  ],
+  "required_top_level_fields": [
+    "age_probe_state_dict",
+    "backbone_state_dict",
+    "checkpoint_kind",
+    "input_contract",
+    "integrity",
+    "model",
+    "provenance",
+    "representation_contract",
+    "schema_name",
+    "schema_version",
+    "source_checkpoint",
+    "source_training",
+    "target_transform",
+    "task",
+    "validation_mode"
+  ],
+  "schema_name": "portable_age_full_checkpoint",
+  "schema_version": 1,
+  "tensor_fingerprint": "sorted key UTF-8 + torch dtype ASCII + tuple(shape) ASCII + contiguous CPU bytes"
+}

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -45,6 +44,7 @@ try:
         regression_metrics, sha256_file, validate_checkpoint_payload,
     )
     from .largeScale_fineTune import CachedFeatureClassifier
+    from .neuralbench_checkpoint import tensor_state_fingerprint
     from .run_logging import log_event, setup_run_logging
 except ImportError:
     import age_cv7
@@ -58,6 +58,7 @@ except ImportError:
         regression_metrics, sha256_file, validate_checkpoint_payload,
     )
     from largeScale_fineTune import CachedFeatureClassifier
+    from neuralbench_checkpoint import tensor_state_fingerprint
     from run_logging import log_event, setup_run_logging
 
 
@@ -132,15 +133,6 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[s
         writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
         writer.writeheader(); writer.writerows(rows)
     os.replace(temporary, path)
-
-
-def tensor_state_fingerprint(state: Mapping[str, torch.Tensor]) -> str:
-    digest = hashlib.sha256()
-    for key, tensor in sorted(state.items()):
-        value = tensor.detach().cpu().contiguous()
-        digest.update(key.encode()); digest.update(str(value.dtype).encode())
-        digest.update(str(tuple(value.shape)).encode()); digest.update(value.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
 
 
 class FixedSourceScaler:

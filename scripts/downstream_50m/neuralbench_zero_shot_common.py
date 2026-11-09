@@ -12,9 +12,11 @@ import torch
 try:  # package import
     from .largeScale_fineTune import EEGDownstreamClassifier
     from .model import EEGPretrainModel
+    from .neuralbench_checkpoint import tensor_state_fingerprint
 except ImportError:  # direct script execution
     from largeScale_fineTune import EEGDownstreamClassifier
     from model import EEGPretrainModel
+    from neuralbench_checkpoint import tensor_state_fingerprint
 
 
 POOLING = "mean"
@@ -56,14 +58,7 @@ def build_meta_zero_shot_model(output_dim: int) -> EEGDownstreamClassifier:
 
 
 def model_state_fingerprint(model: torch.nn.Module) -> str:
-    digest = hashlib.sha256()
-    for key, tensor in sorted(model.state_dict().items()):
-        value = tensor.detach().cpu().contiguous()
-        digest.update(key.encode("utf-8"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+    return tensor_state_fingerprint(model.state_dict())
 
 
 def path_content_fingerprint(path: str | Path) -> str:

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -42,6 +41,7 @@ try:
         KEY_REMAP_VERSION,
         load_neuralbench_sex_model_state,
         safe_load_neuralbench_checkpoint,
+        tensor_state_fingerprint,
     )
     from .run_logging import log_event, setup_run_logging
     from .run_neuralbench_sex_zero_shot import (
@@ -63,6 +63,7 @@ except ImportError:
         KEY_REMAP_VERSION,
         load_neuralbench_sex_model_state,
         safe_load_neuralbench_checkpoint,
+        tensor_state_fingerprint,
     )
     from run_logging import log_event, setup_run_logging
     from run_neuralbench_sex_zero_shot import (
@@ -164,17 +165,6 @@ def _code_fingerprint(project_root: Path) -> str:
         "scripts/downstream_50m/run_neuralbench_sex_probe_transfer_cv4.py",
     ]
     return cache.sha256_json({path: cache.sha256_file(project_root / path) for path in relative_paths})
-
-
-def tensor_state_fingerprint(state: Mapping[str, torch.Tensor]) -> str:
-    digest = hashlib.sha256()
-    for key, tensor in sorted(state.items()):
-        value = tensor.detach().cpu().contiguous()
-        digest.update(str(key).encode("utf-8"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
 
 
 def load_source_probe_state(checkpoint_path: str | Path, expected_sha256: str):

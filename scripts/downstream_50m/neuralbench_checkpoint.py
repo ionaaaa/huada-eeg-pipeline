@@ -43,6 +43,19 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def tensor_state_fingerprint(state: Mapping[str, torch.Tensor]) -> str:
+    """Stable state hash shared by strict checkpoint consumers."""
+
+    digest = hashlib.sha256()
+    for key, tensor in sorted(state.items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(str(key).encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def verify_checkpoint_sha256(path: str | Path, expected_sha256: str) -> dict[str, Any]:
     """Check existence and SHA before any deserialization is allowed."""
 
