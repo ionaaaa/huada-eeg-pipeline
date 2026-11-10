@@ -144,3 +144,57 @@ Cloud wrappers are:
 Both require the already-passed FBMAE strict zero-shot result. The REVE wrapper
 also requires the completed LaBraM result, so its output contains the final
 FBMAE/LaBraM/REVE subject-mean comparison without rerunning either reference.
+
+## Zero-initialized age-probe CV7
+
+`scripts.native_backends.run_huada_portable_age_zero_init_probe_cv7` applies
+the existing FBMAE `age_subject_cv7` protocol to either native family. The
+eligible cohort is the same seven labeled Huada subjects; SUB5 remains outside
+all training, validation, test, and metric sets. With split seed 42, the exact
+existing numeric-subject shuffle and next-subject validation algorithm is
+used, giving 5 train / 1 validation / 1 test subject per fold and exactly one
+OOF test appearance per labeled subject.
+
+The portable Dortmund age probe is not used. The portable backbone is frozen
+and forwarded only while building one label-free feature cache. That cache
+contains the model's audited mean representation (`200` features for LaBraM,
+`512` for REVE), contains no age or sex fields, and is reused unchanged by all
+seven folds. Its identity binds the portable file,
+backbone fingerprint, frozen Huada target contract, native recording-cache
+snapshot, family, representation shape, and pooling rule. A changed input or
+backbone therefore produces a different cache key rather than silently
+reusing features.
+
+Every candidate creates a fresh `Linear(feature_dim, 1)` with both weight and
+bias set to exact float32 zero. Training follows the FBMAE age-CV7 semantics:
+
+- the full-precision Dortmund source z-score transform embedded in the
+  portable checkpoint, with no Huada scaler fit;
+- AdamW with the FBMAE transfer defaults (`lr=1e-5`, weight decay 0), both
+  explicitly overridable for a declared follow-up experiment;
+- no scheduler, calibration, or prediction clipping;
+- validation subject-mean MAE, then validation-window MAE, then z-MSE, then
+  earlier epoch for selection;
+- all seven validation searches and all seven selections finish before any
+  test fold is evaluated;
+- each selected test fold is evaluated exactly once.
+
+The Dortmund scaler is reused exactly: target ages are transformed to source z
+for loss, and predictions are inverse-transformed with the same stored mean and
+full-precision standard deviation. A zero probe therefore starts at the fixed
+Dortmund mean prediction (27.5 years). No Huada scaler is fitted. Checkpoints contain
+only the linear head and strict cache/fold/candidate metadata; backbone,
+optimizer, scheduler, and RNG state are forbidden.
+
+Primary artifacts include `age_cv7_folds.json`, `age_fold_assignments.csv`,
+`fold_search_results.csv`, `fold_selected_configs.csv`,
+`global_validation_ranking.csv`, per-fold candidate histories and head-only
+checkpoints, OOF window/subject predictions, subject-mean metrics, fixed-27.5
+and fold-train-mean baselines, provenance, and `_SUCCESS`. The run also
+compares the completed OOF result with the corresponding strict zero-shot
+result after CV7 completion; that comparison never participates in selection.
+
+Cloud wrappers are thin family selectors over one implementation:
+
+- `commands/run_huada_labram_zero_init_probe_cv7.sh`;
+- `commands/run_huada_reve_zero_init_probe_cv7.sh`.
