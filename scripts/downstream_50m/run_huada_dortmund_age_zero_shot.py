@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import traceback
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -22,8 +23,8 @@ from torch.utils.data import DataLoader, Dataset
 
 try:
     from .dortmund_huada_zero_shot import (
-        EXPECTED_CHECKPOINT_SHA256, EXPECTED_SUBJECTS, MASK_SEMANTICS_VERSION,
-        SOURCE_AGE_MEAN, SOURCE_AGE_STD, ZeroShotValidationError,
+        EXPECTED_SUBJECTS, FORMAL_CHECKPOINT_CONTRACT, MASK_SEMANTICS_VERSION,
+        ZeroShotValidationError,
         aggregate_subjects, compute_metric_bundle, fingerprint_model,
         infer_label_blind, json_safe, label_blind_collate, load_strict_checkpoint,
         prediction_range_diagnostics, recompute_from_csv, sha256_file,
@@ -31,8 +32,8 @@ try:
     )
 except ImportError:
     from dortmund_huada_zero_shot import (
-        EXPECTED_CHECKPOINT_SHA256, EXPECTED_SUBJECTS, MASK_SEMANTICS_VERSION,
-        SOURCE_AGE_MEAN, SOURCE_AGE_STD, ZeroShotValidationError,
+        EXPECTED_SUBJECTS, FORMAL_CHECKPOINT_CONTRACT, MASK_SEMANTICS_VERSION,
+        ZeroShotValidationError,
         aggregate_subjects, compute_metric_bundle, fingerprint_model,
         infer_label_blind, json_safe, label_blind_collate, load_strict_checkpoint,
         prediction_range_diagnostics, recompute_from_csv, sha256_file,
@@ -72,25 +73,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-lance", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--expected-checkpoint-sha256", default=EXPECTED_CHECKPOINT_SHA256)
+    parser.add_argument(
+        "--expected-checkpoint-sha256",
+        help="Optional 64-hex checkpoint identity lock. If omitted, the actual SHA256 is still computed and recorded.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--expected-source-age-mean", type=float, default=SOURCE_AGE_MEAN)
-    parser.add_argument("--expected-source-age-std", type=float, default=SOURCE_AGE_STD)
+    parser.add_argument(
+        "--expected-source-age-mean", type=float,
+        help="Optional checkpoint source-scaler lock; must be supplied together with --expected-source-age-std.",
+    )
+    parser.add_argument(
+        "--expected-source-age-std", type=float,
+        help="Optional checkpoint source-scaler lock; must be supplied together with --expected-source-age-mean.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
-    if len(args.expected_checkpoint_sha256) != 64 or any(c not in "0123456789abcdefABCDEF" for c in args.expected_checkpoint_sha256):
+    if args.expected_checkpoint_sha256 is not None and (
+        len(args.expected_checkpoint_sha256) != 64
+        or any(c not in "0123456789abcdefABCDEF" for c in args.expected_checkpoint_sha256)
+    ):
         parser.error("--expected-checkpoint-sha256 must be 64 hex characters")
-    if not np.isfinite(args.expected_source_age_mean) or not np.isfinite(args.expected_source_age_std) or args.expected_source_age_std <= 0:
+    expected_scaler = (args.expected_source_age_mean, args.expected_source_age_std)
+    if (expected_scaler[0] is None) != (expected_scaler[1] is None):
+        parser.error("--expected-source-age-mean and --expected-source-age-std must be supplied together")
+    if expected_scaler[0] is not None and (
+        not np.isfinite(expected_scaler[0])
+        or not np.isfinite(expected_scaler[1])
+        or expected_scaler[1] <= 0
+    ):
         parser.error("Expected source age mean/std are invalid")
-    if args.expected_source_age_mean != SOURCE_AGE_MEAN or not np.isclose(args.expected_source_age_std, SOURCE_AGE_STD, rtol=0, atol=5e-7):
-        parser.error("CLI source scaler does not match the fixed Dortmund protocol")
     return args
 
 
@@ -306,9 +324,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         logging.info("[stage 2/7] validate checkpoint")
         device = torch.device(args.device)
-        model, checkpoint_report, payload = load_strict_checkpoint(checkpoint_path, args.expected_checkpoint_sha256, device)
-        if not np.isclose(checkpoint_report["source_age_mean"], args.expected_source_age_mean, rtol=0, atol=1e-12) or not np.isclose(checkpoint_report["source_age_std"], args.expected_source_age_std, rtol=0, atol=5e-7):
-            raise ZeroShotValidationError("Checkpoint scaler differs from expected CLI contract")
+        model, checkpoint_report, payload = load_strict_checkpoint(
+            checkpoint_path,
+            args.expected_checkpoint_sha256,
+            device,
+            contract=replace(FORMAL_CHECKPOINT_CONTRACT, best_epoch=None),
+            expected_source_mean=args.expected_source_age_mean,
+            expected_source_std=args.expected_source_age_std,
+        )
+        checkpoint_report["sha256_expectation_enforced"] = args.expected_checkpoint_sha256 is not None
+        checkpoint_report["source_scaler_expectation_enforced"] = args.expected_source_age_mean is not None
         contract = _input_contract(input_path, lance_ds, checkpoint_report, payload)
         compatibility = validate_input_compatibility(checkpoint_report=checkpoint_report, input_contract=contract)
         checkpoint_report["input_compatibility"] = compatibility
@@ -338,7 +363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _csv(output / "window_predictions.csv", rows, WINDOW_FIELDS)
 
         logging.info("[stage 5/7] aggregate subject predictions")
-        bundle = compute_metric_bundle(rows)
+        bundle = compute_metric_bundle(rows, source_mean=checkpoint_report["source_age_mean"])
         _csv(output / "subject_predictions_all.csv", bundle["subject_rows_all"], SUBJECT_FIELDS)
         _csv(output / "subject_predictions_labeled.csv", bundle["subject_rows_labeled"], SUBJECT_FIELDS)
 

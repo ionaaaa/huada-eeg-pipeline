@@ -58,7 +58,11 @@ class CheckpointContract:
     head_parameter_count: int = 513
     head_weight_shape: tuple[int, ...] = (1, 512)
     head_bias_shape: tuple[int, ...] = (1,)
-    best_epoch: int = EXPECTED_BEST_EPOCH
+    # ``None`` accepts any non-negative selected epoch.  The original formal
+    # checkpoint contract keeps epoch 20 as its default, while callers that
+    # consume a newly trained Dortmund checkpoint can opt into metadata-driven
+    # validation without weakening the architecture/state-dict checks.
+    best_epoch: int | None = EXPECTED_BEST_EPOCH
     probe_layer_idx: int = PROBE_LAYER_IDX
     feature_dim: int = FEATURE_DIM
 
@@ -195,8 +199,8 @@ def validate_checkpoint_payload(
     *,
     model: torch.nn.Module,
     contract: CheckpointContract = FORMAL_CHECKPOINT_CONTRACT,
-    expected_source_mean: float = SOURCE_AGE_MEAN,
-    expected_source_std: float = SOURCE_AGE_STD,
+    expected_source_mean: float | None = SOURCE_AGE_MEAN,
+    expected_source_std: float | None = SOURCE_AGE_STD,
 ) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ZeroShotValidationError("Checkpoint root must be a mapping")
@@ -207,7 +211,10 @@ def validate_checkpoint_payload(
         raise ZeroShotValidationError("NeuralBench/Lightning or head-only checkpoint is not accepted")
     if payload.get("checkpoint_kind") != CHECKPOINT_KIND:
         raise ZeroShotValidationError(f"checkpoint_kind mismatch: {payload.get('checkpoint_kind')!r}")
-    if int(payload.get("best_epoch", -1)) != int(contract.best_epoch):
+    best_epoch = int(payload.get("best_epoch", -1))
+    if best_epoch < 0:
+        raise ZeroShotValidationError("best_epoch must be non-negative")
+    if contract.best_epoch is not None and best_epoch != int(contract.best_epoch):
         raise ZeroShotValidationError("best_epoch mismatch")
     architecture = payload.get("model_architecture_config")
     if not isinstance(architecture, Mapping):
@@ -234,9 +241,9 @@ def validate_checkpoint_payload(
         raise ZeroShotValidationError("target transform was not train-subject equal ddof=0")
     source_mean = _finite_float(transform.get("source_age_mean"), "source_age_mean")
     source_std = _finite_float(transform.get("source_age_std"), "source_age_std")
-    if not math.isclose(source_mean, expected_source_mean, rel_tol=0.0, abs_tol=1e-12):
+    if expected_source_mean is not None and not math.isclose(source_mean, expected_source_mean, rel_tol=0.0, abs_tol=1e-12):
         raise ZeroShotValidationError("source_age_mean mismatch")
-    if not math.isclose(source_std, expected_source_std, rel_tol=0.0, abs_tol=5e-7):
+    if expected_source_std is not None and not math.isclose(source_std, expected_source_std, rel_tol=0.0, abs_tol=5e-7):
         raise ZeroShotValidationError("source_age_std mismatch")
     if source_std <= 0:
         raise ZeroShotValidationError("source_age_std must be positive")
@@ -264,7 +271,7 @@ def validate_checkpoint_payload(
     if tuple(head["weight"].shape) != contract.head_weight_shape or tuple(head["bias"].shape) != contract.head_bias_shape:
         raise ZeroShotValidationError("age head must be Linear(512,1)")
     return {
-        "checkpoint_kind": CHECKPOINT_KIND, "best_epoch": int(payload["best_epoch"]),
+        "checkpoint_kind": CHECKPOINT_KIND, "best_epoch": best_epoch,
         "backbone": backbone_report, "age_head": head_report,
         "probe_layer_idx": int(architecture["probe_layer_idx"]),
         "pooling": architecture["pooling"], "feature_dim": int(architecture["feature_dim"]),
@@ -282,24 +289,32 @@ def validate_checkpoint_payload(
 
 def load_strict_checkpoint(
     checkpoint: str | Path,
-    expected_sha256: str,
+    expected_sha256: str | None,
     device: torch.device,
     *,
     model_factory: Callable[[], torch.nn.Module] = build_formal_model,
     contract: CheckpointContract = FORMAL_CHECKPOINT_CONTRACT,
+    expected_source_mean: float | None = SOURCE_AGE_MEAN,
+    expected_source_std: float | None = SOURCE_AGE_STD,
 ) -> tuple[torch.nn.Module, dict[str, Any], Mapping[str, Any]]:
     path = Path(checkpoint)
     if path.name == "last_training_checkpoint.pt":
         raise ZeroShotValidationError("last_training_checkpoint.pt is forbidden")
     actual_sha = sha256_file(path)
-    if actual_sha.lower() != str(expected_sha256).lower():
+    if expected_sha256 is not None and actual_sha.lower() != str(expected_sha256).lower():
         raise ZeroShotValidationError(f"checkpoint SHA256 mismatch: {actual_sha}")
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError as exc:
         raise ZeroShotValidationError("PyTorch weights_only=True support is required") from exc
     model = model_factory()
-    report = validate_checkpoint_payload(payload, model=model, contract=contract)
+    report = validate_checkpoint_payload(
+        payload,
+        model=model,
+        contract=contract,
+        expected_source_mean=expected_source_mean,
+        expected_source_std=expected_source_std,
+    )
     model.backbone.load_state_dict(payload["backbone_state_dict"], strict=True, assign=True)
     model.head.load_state_dict(payload["age_probe_state_dict"], strict=True, assign=True)
     for parameter in model.parameters():
@@ -487,7 +502,9 @@ def aggregate_subjects(window_rows: Sequence[Mapping[str, Any]]) -> list[dict[st
     return output
 
 
-def compute_metric_bundle(window_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def compute_metric_bundle(
+    window_rows: Sequence[Mapping[str, Any]], *, source_mean: float = SOURCE_AGE_MEAN,
+) -> dict[str, Any]:
     subject_all = aggregate_subjects(window_rows)
     subject_labeled = [row for row in subject_all if row["included_in_metrics"]]
     labeled_windows = [row for row in window_rows if row["metrics_eligible"]]
@@ -499,8 +516,9 @@ def compute_metric_bundle(window_rows: Sequence[Mapping[str, Any]]) -> dict[str,
         [float(row["predicted_age_years"]) for row in labeled_windows],
     )
     window["level"] = "window_auxiliary_non_independent"
-    baseline = regression_metrics(truth, [SOURCE_AGE_MEAN] * len(truth))
-    baseline.update({"baseline_prediction": SOURCE_AGE_MEAN, "source": "dortmund_train_subject_mean"})
+    source_mean = _finite_float(source_mean, "source_mean")
+    baseline = regression_metrics(truth, [source_mean] * len(truth))
+    baseline.update({"baseline_prediction": source_mean, "source": "dortmund_train_subject_mean"})
     delta_mae = subject_mean["mae"] - baseline["mae"]
     comparison = {
         "delta_MAE": delta_mae,
@@ -569,7 +587,7 @@ def recompute_from_csv(
             "num_valid_tokens": int(row["num_valid_tokens"]),
         })
     finalized = finalize_prediction_rows(rows, source_mean=source_mean, source_std=source_std)
-    bundle = compute_metric_bundle(finalized)
+    bundle = compute_metric_bundle(finalized, source_mean=source_mean)
     coverage = None if expected_sample_ids is None else validate_coverage(finalized, expected_sample_ids)
     return {
         "row_count": len(finalized), "sample_ids": [row["sample_id"] for row in finalized],

@@ -539,16 +539,22 @@ bash commands/run_dortmund_age_preprocessing_full.sh
 ```bash
 set -euo pipefail
 
-export HUADA\_ROOT="/opt/ml/cfs\_input"
-export PYTHON\_BIN="python"
-export DORTMUND\_COMMON\_DIR="/opt/ml/cfs\_input/data/preprocess\_common/dortmund\_age\_preprocessing\_full\_20261103\_022751"
-export DORTMUND\_COMMON\_LANCE=""
-export DORTMUND\_SOURCE\_URI="cos\://jianyu-1442740494/huada/preprocessed\_common/dortmund\_age\_preprocessing\_full\_20261103\_022751/"
-export ADAPTER\_OUTPUT\_DIR="/opt/ml/cfs\_input/data/model\_tokens\_full/fbmae\_tokens\_smoke/$(date +%Y%m%d\_%H%M%S)"
-export ADAPTER\_BATCH\_SIZE="8"
-export ADAPTER\_NUM\_WORKERS="4"
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
+export DORTMUND_COMMON_DIR="/opt/ml/cfs_input/data/preprocess_common/dortmund_age_preprocessing_age20_44_ses1_pre_profile_a_20261112_054059"
+export DORTMUND_COMMON_LANCE="${DORTMUND_COMMON_DIR}/dataset.lance"
+export DORTMUND_SOURCE_URI="cos://jianyu-1442740494/dortmund_age_preprocessing_age20_44_ses1_pre_profile_a_20261112_054059"
+export ADAPTER_OUTPUT_DIR="/opt/ml/cfs_input/data/model_tokens_full/fbmae_tokens_smoke/$(date +%Y%m%d_%H%M%S)"
+export ADAPTER_BATCH_SIZE="8"
+export ADAPTER_NUM_WORKERS="4"
 
-bash "${HUADA\_ROOT}/commands/run\_dortmund\_fbmae\_adapter\_smoke.sh"
+export DORTMUND_MIN_AGE=20
+export DORTMUND_MAX_AGE=44
+export DORTMUND_COHORT_ID="age20_44_ses1_pre_profile_a"
+export DORTMUND_EXPECTED_SUBJECTS=291
+export DORTMUND_EXPECTED_RECORDINGS=582
+
+bash "${HUADA_ROOT}/commands/run_dortmund_fbmae_adapter_smoke.sh"
 ```
 
 #### Dortmund 原样命令 4：FBMAE token 正式生成
@@ -824,29 +830,93 @@ bash commands/run\_dortmund\_age\_full\_finetune\_smoke.sh
 
 #### Dortmund 原样命令 10：年龄正式 full-finetune
 
-- 任务：`train-1709457907739536128`
+- 任务：`train-1715993349867046656`
 
 ```bash
 set -euo pipefail
 
-export HUADA\_ROOT="/opt/ml/cfs\_input"
-export PRETRAINED\_50M\_CKPT="/opt/ml/cfs\_input/data/checkpoint/pretrain\_checkpoint\_4.pt"
-export SPLIT\_MANIFEST="/opt/ml/cfs\_input/downstream\_output/dortmund\_age\_split\_seed42\_20261103\_153000/subject\_split\_manifest.csv"
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
 
-export NPROC\_PER\_NODE="4"
-export PER\_DEVICE\_BATCH\_SIZE="4"
-export ACCUMULATION\_STEPS="4"
+# 必须指向包含新增被试的新 token Lance
+export INPUT_LANCE="$HUADA_ROOT/data/model_tokens_full/fbmae_tokens/20261112_142653/dortmund_fbmae_tokens.lance"
 
-export BACKBONE\_LR="5e-6"
-export HEAD\_LR="5e-5"
-export FULL\_EPOCHS="40"
+export PRETRAINED_50M_CKPT="$HUADA_ROOT/data/checkpoint/pretrain_checkpoint_4.pt"
 
-# Lance 必须使用 0，避免 fork worker segmentation fault
+export TRAIN_RATIO="0.8"
+export VALIDATION_RATIO="0.1"
+export TEST_RATIO="0.1"
+export SPLIT_SEED="42"
 
-export NUM\_WORKERS="0"
+# 必须生成新的冻结 split，不能继续使用旧的 214 人 manifest
+export SPLIT_OUTPUT="$HUADA_ROOT/downstream_output/dortmund_age_split_seed${SPLIT_SEED}_$(date +%Y%m%d_%H%M%S)"
 
-cd "$HUADA\_ROOT"
-bash commands/run\_dortmund\_age\_full\_finetune\_full.sh
+test -d "$HUADA_ROOT"
+test -d "$INPUT_LANCE"
+test -f "$PRETRAINED_50M_CKPT"
+test ! -e "$SPLIT_OUTPUT"
+
+cd "$HUADA_ROOT"
+
+bash commands/create_dortmund_age_split.sh
+
+export SPLIT_MANIFEST="$SPLIT_OUTPUT/subject_split_manifest.csv"
+test -f "$SPLIT_MANIFEST"
+
+# 强制确认 token Lance 和新 manifest 的被试集合完全一致
+"$PYTHON_BIN" - "$INPUT_LANCE" "$SPLIT_MANIFEST" <<'PY'
+import csv
+import sys
+import lance
+
+lance_path, manifest_path = sys.argv[1:]
+
+ds = lance.dataset(lance_path)
+token_subjects = {
+    str(x)
+    for x in ds.to_table(columns=["subject_id"])["subject_id"].to_pylist()
+}
+
+with open(manifest_path, encoding="utf-8-sig", newline="") as f:
+    manifest_rows = list(csv.DictReader(f))
+
+manifest_subjects = {row["subject_id"].strip() for row in manifest_rows}
+
+print("token_subject_count =", len(token_subjects))
+print("manifest_subject_count =", len(manifest_subjects))
+print("token_only =", sorted(token_subjects - manifest_subjects))
+print("manifest_only =", sorted(manifest_subjects - token_subjects))
+
+assert token_subjects == manifest_subjects, \
+    "Token Lance and split manifest subject sets differ"
+
+split_counts = {}
+for row in manifest_rows:
+    split_counts[row["split"]] = split_counts.get(row["split"], 0) + 1
+
+print("split_counts =", split_counts)
+assert all(split_counts.get(x, 0) > 0 for x in ("train", "validation", "test"))
+
+print("NEW SPLIT MANIFEST VALIDATION PASSED")
+PY
+
+export NPROC_PER_NODE="4"
+export PER_DEVICE_BATCH_SIZE="4"
+export ACCUMULATION_STEPS="4"
+
+export BACKBONE_LR="5e-6"
+export HEAD_LR="5e-5"
+export FULL_EPOCHS="40"
+
+# Lance 必须保持 0
+export NUM_WORKERS="0"
+
+# 不要让新数据错误关联旧的审计报告。
+# 如果已有针对新 token Lance 的审计，请把这里换成其 audit_summary.json。
+# 这个不存在的路径会让当前 record_only 入口不附加旧审计。
+export AUDIT_SUMMARY="$HUADA_ROOT/audit_dortmund_fbmae_tokens/NO_MATCHING_AUDIT_SUPPLIED.json"
+
+bash commands/run_dortmund_age_full_finetune_full.sh
 ```
 
 ### 3. 华大 FBMAE strict zero-shot 与 probe transfer
@@ -1524,3 +1594,6 @@ train-<task-id>/log_<task-id>_..._<export-id>.tar.gz
 ```
 
 文中任务状态以 `download_manifest_20261110_124317_093.json` 为准；实验含义和产物路径以对应归档中的 stdout/stderr 为准。
+
+## 目前实验结果(age)
+![FBMAE+labram+reve](downstream_output\age_model_comparison_20261110\age_prediction_vs_ground_truth.png)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,28 @@ def test_sha_mismatch_and_last_checkpoint_fail_closed(tmp_path):
     last, digest = save_fixture_checkpoint(tmp_path, name="last_training_checkpoint.pt")
     with pytest.raises(ZeroShotValidationError, match="forbidden"):
         load_strict_checkpoint(last, digest, torch.device("cpu"), model_factory=TinyWrapper, contract=tiny_contract())
+
+
+def test_new_checkpoint_can_use_recorded_sha_epoch_and_source_scaler(tmp_path):
+    payload = fixture_payload()
+    payload["best_epoch"] = 7
+    payload["target_transform"]["source_age_mean"] = 28.125
+    payload["target_transform"]["source_age_std"] = 3.75
+    path, digest = save_fixture_checkpoint(tmp_path, payload=payload)
+    model, report, _ = load_strict_checkpoint(
+        path,
+        None,
+        torch.device("cpu"),
+        model_factory=TinyWrapper,
+        contract=replace(tiny_contract(), best_epoch=None),
+        expected_source_mean=None,
+        expected_source_std=None,
+    )
+    assert not model.training
+    assert report["checkpoint_sha256"] == digest
+    assert report["best_epoch"] == 7
+    assert report["source_age_mean"] == pytest.approx(28.125)
+    assert report["source_age_std"] == pytest.approx(3.75)
 
 
 @pytest.mark.parametrize(
@@ -231,6 +254,23 @@ def test_subject_mean_median_no_clip_or_calibration():
     assert min(row["predicted_age_years"] for row in rows) < 22.0  # proves no Huada-range clipping
 
 
+def test_source_mean_baseline_uses_checkpoint_mean():
+    rows = finalize_prediction_rows(
+        [
+            {
+                "sample_id": "SUB1_0", "subject_id": "SUB1", "recording_id": "r",
+                "window_index": 0, "true_age_years": 22.0, "predicted_z": 0.0,
+                "predicted_age_years": 28.125, "num_valid_tokens": 640,
+                "checkpoint_sha256": "x",
+            }
+        ],
+        source_mean=28.125,
+        source_std=3.75,
+    )
+    bundle = compute_metric_bundle(rows, source_mean=28.125)
+    assert bundle["source_mean_baseline_metrics"]["baseline_prediction"] == pytest.approx(28.125)
+
+
 def test_coverage_and_nonfinite_fail_closed():
     samples = artificial_samples(); batch = label_blind_collate(samples)
     rows = infer_label_blind(LabelBlindSpy(), [batch], device=torch.device("cpu"), source_mean=SOURCE_AGE_MEAN, source_std=SOURCE_AGE_STD, checkpoint_sha256="x")
@@ -263,7 +303,6 @@ def test_dry_run_does_not_touch_paths_checkpoint_model_or_output(tmp_path, monke
     monkeypatch.setattr(entry, "HuadaAllSubjectDataset", lambda *a, **k: (_ for _ in ()).throw(AssertionError("dataset touched")))
     result = zero_shot_main([
         "--input-lance", "NONEXISTENT_REAL_LANCE", "--checkpoint", "NONEXISTENT_REAL_CHECKPOINT",
-        "--expected-checkpoint-sha256", "3e44d9e7942d20d3d004e191a077ac636eeea770a6d185149591b683c5b3f13e",
         "--output-dir", str(output), "--dry-run",
     ])
     assert result == 0 and not output.exists()
