@@ -952,7 +952,7 @@ bash commands/run_dortmund_age_full_finetune_full.sh
 
 ### FBMAE：华大 strict zero-shot 与 probe transfer
 
-#### `train-1709495944922652544`：Dortmund 年龄数据集在FBMAE上fft后在华大数据集上的 strict zero-shot
+#### `train-1716024027476929280`：Dortmund 年龄数据集在FBMAE上fft后在华大数据集上的 strict zero-shot
 
 - 任务：`train-1709495944922652544`
 - 产物：`/opt/ml/cfs_input/downstream_output/50m_dortmund_age_huada_zero_shot_20261103_154351`
@@ -960,23 +960,28 @@ bash commands/run_dortmund_age_full_finetune_full.sh
 ```bash
 set -euo pipefail
 
-export HUADA\_ROOT="/opt/ml/cfs\_input"
-export PYTHONPATH="$HUADA\_ROOT/scripts/downstream\_50m:${PYTHONPATH:-}"
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
 
-cd "$HUADA\_ROOT"
+export HUADA_TOKEN_LANCE="/opt/ml/cfs_input/model_tokens_full/20261030_140104/huada_model_tokens_8sub.lance"
 
-RUN\_OUTPUT="$HUADA\_ROOT/downstream\_output/50m\_dortmund\_age\_huada\_zero\_shot\_$(date +%Y%m%d\_%H%M%S)"
+# 改成新训练输出的 best_full_checkpoint.pt
+export DORTMUND_AGE_CKPT="/opt/ml/cfs_input/downstream_output/dortmund_age_full_finetune_20261112_145413/checkpoints/best_full_checkpoint.pt"
 
-python scripts/downstream\_50m/run\_huada\_dortmund\_age\_zero\_shot.py \
-\--input-lance "/opt/ml/cfs\_input/model\_tokens\_full/20261030\_140104/huada\_model\_tokens\_8sub.lance" \
-\--checkpoint "/opt/ml/cfs\_input/downstream\_output/dortmund\_age\_full\_finetune\_20261103\_142815/checkpoints/best\_full\_checkpoint.pt" \
-\--expected-checkpoint-sha256 "3e44d9e7942d20d3d004e191a077ac636eeea770a6d185149591b683c5b3f13e" \
-\--output-dir "$RUN\_OUTPUT" \
-\--device cuda \
-\--batch-size 8 \
-\--num-workers 4 \
-\--expected-source-age-mean 27.5 \
-\--expected-source-age-std 4.218591
+export OUTPUT_ROOT="/opt/ml/cfs_input/downstream_output"
+export DEVICE="cuda"
+export BATCH_SIZE="8"
+
+# Lance 建议保持 0
+export NUM_WORKERS="0"
+
+test -d "$HUADA_ROOT"
+test -d "$HUADA_TOKEN_LANCE"
+test -f "$DORTMUND_AGE_CKPT"
+
+cd "$HUADA_ROOT"
+
+bash commands/run_huada_dortmund_age_zero_shot.sh
 ```
 
 #### `train-1709512505019205376`：Dortmund source probe 初始化的华大年龄 probe-transfer CV7（不是从0训练probe）

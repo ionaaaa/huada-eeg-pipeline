@@ -23,6 +23,7 @@ import time
 import traceback
 import uuid
 from collections import Counter, defaultdict
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -38,9 +39,9 @@ try:
     from .dataset import collate_fn
     from .dortmund_huada_zero_shot import (
         CHECKPOINT_KIND as SOURCE_CHECKPOINT_KIND,
-        EXPECTED_CHECKPOINT_SHA256, FEATURE_DIM, MASK_SEMANTICS_VERSION,
+        FEATURE_DIM, FORMAL_CHECKPOINT_CONTRACT, MASK_SEMANTICS_VERSION,
         POOLING as CHECKPOINT_POOLING, PROBE_LAYER_IDX, SOURCE_AGE_MEAN,
-        SOURCE_AGE_STD, build_formal_model, load_strict_checkpoint,
+        build_formal_model, load_strict_checkpoint,
         regression_metrics, sha256_file, validate_checkpoint_payload,
     )
     from .largeScale_fineTune import CachedFeatureClassifier
@@ -52,9 +53,9 @@ except ImportError:
     from dataset import collate_fn
     from dortmund_huada_zero_shot import (
         CHECKPOINT_KIND as SOURCE_CHECKPOINT_KIND,
-        EXPECTED_CHECKPOINT_SHA256, FEATURE_DIM, MASK_SEMANTICS_VERSION,
+        FEATURE_DIM, FORMAL_CHECKPOINT_CONTRACT, MASK_SEMANTICS_VERSION,
         POOLING as CHECKPOINT_POOLING, PROBE_LAYER_IDX, SOURCE_AGE_MEAN,
-        SOURCE_AGE_STD, build_formal_model, load_strict_checkpoint,
+        build_formal_model, load_strict_checkpoint,
         regression_metrics, sha256_file, validate_checkpoint_payload,
     )
     from largeScale_fineTune import CachedFeatureClassifier
@@ -85,7 +86,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-lance", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--expected-checkpoint-sha256", default=EXPECTED_CHECKPOINT_SHA256)
+    parser.add_argument(
+        "--expected-checkpoint-sha256",
+        help="Optional 64-hex checkpoint identity lock. If omitted, the actual SHA256 is computed and recorded.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--feature-cache-root", required=True)
     parser.add_argument("--feature-cache-build-root")
@@ -102,8 +106,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--expected-source-age-mean", type=float, default=SOURCE_AGE_MEAN)
-    parser.add_argument("--expected-source-age-std", type=float, default=SOURCE_AGE_STD)
+    parser.add_argument("--expected-source-age-mean", type=float)
+    parser.add_argument("--expected-source-age-std", type=float)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -112,12 +116,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.num_workers < 0 or args.head_lr <= 0 or args.weight_decay < 0:
         parser.error("num-workers/head-lr/weight-decay values are invalid")
-    if len(args.expected_checkpoint_sha256) != 64 or any(c not in "0123456789abcdefABCDEF" for c in args.expected_checkpoint_sha256):
+    if args.expected_checkpoint_sha256 is not None and (
+        len(args.expected_checkpoint_sha256) != 64
+        or any(c not in "0123456789abcdefABCDEF" for c in args.expected_checkpoint_sha256)
+    ):
         parser.error("--expected-checkpoint-sha256 must be 64 hexadecimal characters")
-    if not math.isclose(args.expected_source_age_mean, SOURCE_AGE_MEAN, rel_tol=0, abs_tol=1e-12):
-        parser.error("source age mean is fixed by the Dortmund checkpoint protocol")
-    if not math.isclose(args.expected_source_age_std, SOURCE_AGE_STD, rel_tol=0, abs_tol=5e-7):
-        parser.error("source age std is fixed by the Dortmund checkpoint protocol")
+    if (args.expected_source_age_mean is None) != (args.expected_source_age_std is None):
+        parser.error("--expected-source-age-mean and --expected-source-age-std must be supplied together")
+    if args.expected_source_age_mean is not None and (
+        not math.isfinite(args.expected_source_age_mean)
+        or not math.isfinite(args.expected_source_age_std)
+        or args.expected_source_age_std <= 0
+    ):
+        parser.error("expected source age mean/std are invalid")
     return args
 
 
@@ -155,22 +166,39 @@ class FixedSourceScaler:
         }
 
 
-def load_source_probe_state(checkpoint_path: str | Path, expected_sha256: str):
+def load_source_probe_state(
+    checkpoint_path: str | Path,
+    expected_sha256: str | None,
+    expected_source_mean: float | None = None,
+    expected_source_std: float | None = None,
+):
     """Strictly re-read and validate the authoritative full checkpoint per fold."""
     path = Path(checkpoint_path)
     if path.name == "last_training_checkpoint.pt":
         raise RuntimeError("last_training_checkpoint.pt is forbidden")
     actual = sha256_file(path)
-    if actual.lower() != str(expected_sha256).lower():
+    if expected_sha256 is not None and actual.lower() != str(expected_sha256).lower():
         raise RuntimeError(f"Checkpoint SHA256 mismatch: {actual}")
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    report = validate_checkpoint_payload(payload, model=build_formal_model())
+    report = validate_checkpoint_payload(
+        payload,
+        model=build_formal_model(),
+        contract=replace(FORMAL_CHECKPOINT_CONTRACT, best_epoch=None),
+        expected_source_mean=expected_source_mean,
+        expected_source_std=expected_source_std,
+    )
     state = payload["age_probe_state_dict"]
     probe = {"weight": state["weight"].detach().cpu().clone(), "bias": state["bias"].detach().cpu().clone()}
     if tuple(probe["weight"].shape) != (1, 512) or tuple(probe["bias"].shape) != (1,):
         raise RuntimeError("Source age probe must be [1,512]+[1]")
     scaler = FixedSourceScaler(report["source_age_mean"], report["source_age_std"], int(payload["target_transform"]["ddof"]))
-    return probe, tensor_state_fingerprint(probe), {**report, "sha256": actual, "path": str(path.resolve())}, scaler
+    return probe, tensor_state_fingerprint(probe), {
+        **report,
+        "sha256": actual,
+        "path": str(path.resolve()),
+        "sha256_expectation_enforced": expected_sha256 is not None,
+        "source_scaler_expectation_enforced": expected_source_mean is not None,
+    }, scaler
 
 
 def build_source_initialized_probe(state: Mapping[str, torch.Tensor], device: torch.device):
@@ -399,7 +427,8 @@ def _load_best_head(model, path, device, expected_sha256=None, **validation):
 
 
 def run_fold(
-    *, fold_info, dataset, checkpoint_path, expected_sha256, cache_info,
+    *, fold_info, dataset, checkpoint_path, expected_sha256,
+    expected_source_mean=None, expected_source_std=None, cache_info,
     split_manifest_sha256, output_dir, device, batch_size, num_workers, seed,
     head_lr, weight_decay, epochs, patience, logger, provenance=None,
 ):
@@ -415,7 +444,14 @@ def run_fold(
     if set(train_indices) & set(validation_indices) or set(train_indices) & set(test_indices) or set(validation_indices) & set(test_indices):
         raise RuntimeError("Fold sample indices overlap")
     # Required full-checkpoint re-read; previous fold state can never enter.
-    source_state, source_fingerprint, checkpoint_info, scaler = load_source_probe_state(checkpoint_path, expected_sha256)
+    if expected_source_mean is None and expected_source_std is None:
+        source_state, source_fingerprint, checkpoint_info, scaler = load_source_probe_state(
+            checkpoint_path, expected_sha256,
+        )
+    else:
+        source_state, source_fingerprint, checkpoint_info, scaler = load_source_probe_state(
+            checkpoint_path, expected_sha256, expected_source_mean, expected_source_std,
+        )
     model = build_source_initialized_probe(source_state, device)
     initial_fingerprint = tensor_state_fingerprint(probe_state_cpu(model))
     if initial_fingerprint != source_fingerprint: raise RuntimeError("Initial probe differs from source")
@@ -552,7 +588,12 @@ def build_dortmund_cache_identity(
 def ensure_dortmund_mean_cache(args, logger):
     project_root = Path(__file__).resolve().parents[2]
     input_fingerprint, input_info = cache.lance_fingerprint(args.input_lance)
-    _, _, checkpoint_report, _ = load_source_probe_state(args.checkpoint, args.expected_checkpoint_sha256)
+    _, _, checkpoint_report, _ = load_source_probe_state(
+        args.checkpoint,
+        args.expected_checkpoint_sha256,
+        args.expected_source_age_mean,
+        args.expected_source_age_std,
+    )
     git_commit, git_dirty = cache.get_git_state(project_root)
     critical = _critical_code_hashes(project_root); code_sha = cache.sha256_json(critical)
     identity, cache_key = build_dortmund_cache_identity(
@@ -564,7 +605,14 @@ def ensure_dortmund_mean_cache(args, logger):
     if reused:
         if manifest.get("requested_poolings") != ["mean"] or (final_dir / cache.FLATTEN_CACHE_NAME).exists():
             raise RuntimeError("Dortmund age transfer requires a mean-only cache")
-        return {"feature_cache_key": cache_key, "feature_cache_path": str(final_dir), "feature_cache_reused": True, "manifest": manifest, "identity": identity}
+        return {
+            "feature_cache_key": cache_key,
+            "feature_cache_path": str(final_dir),
+            "feature_cache_reused": True,
+            "manifest": manifest,
+            "identity": identity,
+            "checkpoint_report": checkpoint_report,
+        }
     build_root = Path(args.feature_cache_build_root or (Path(tempfile.gettempdir()) / "huada_dortmund_age_cache_build")).resolve()
     build_root.mkdir(parents=True, exist_ok=True); root.mkdir(parents=True, exist_ok=True)
     if build_root == root or root in build_root.parents:
@@ -572,7 +620,14 @@ def ensure_dortmund_mean_cache(args, logger):
     temporary = build_root / f".{cache_key}.building.{uuid.uuid4().hex}"
     source = cache.TokenFeatureSourceDataset(args.input_lance)
     device = torch.device(args.device)
-    model, full_report, payload = load_strict_checkpoint(args.checkpoint, args.expected_checkpoint_sha256, device)
+    model, full_report, payload = load_strict_checkpoint(
+        args.checkpoint,
+        args.expected_checkpoint_sha256,
+        device,
+        contract=replace(FORMAL_CHECKPOINT_CONTRACT, best_epoch=None),
+        expected_source_mean=args.expected_source_age_mean,
+        expected_source_std=args.expected_source_age_std,
+    )
     # Reuse the zero-shot semantic channel compatibility validator.
     try:
         from run_huada_dortmund_age_zero_shot import _input_contract
@@ -617,7 +672,14 @@ def ensure_dortmund_mean_cache(args, logger):
         del model
         if torch.cuda.is_available(): torch.cuda.empty_cache()
     if (final_dir / cache.FLATTEN_CACHE_NAME).exists(): raise RuntimeError("Unexpected flatten cache")
-    return {"feature_cache_key": cache_key, "feature_cache_path": str(final_dir), "feature_cache_reused": False, "manifest": manifest, "identity": identity}
+    return {
+        "feature_cache_key": cache_key,
+        "feature_cache_path": str(final_dir),
+        "feature_cache_reused": False,
+        "manifest": manifest,
+        "identity": identity,
+        "checkpoint_report": checkpoint_report,
+    }
 
 
 def build_split_artifacts(dataset, split_seed: int, output_dir: Path):
@@ -655,6 +717,7 @@ def aggregate_oof_artifacts(
     *, output_dir: Path, split_payload: Mapping[str, Any], subject_ages: Mapping[str, float],
     sample_subject: Mapping[str, str], fold_summaries: Sequence[Mapping[str, Any]],
     oof_rows: Sequence[Mapping[str, Any]], epoch_rows: Sequence[Mapping[str, Any]],
+    source_age_mean: float = SOURCE_AGE_MEAN,
 ) -> dict[str, Any]:
     subject_test_folds = {str(fold["test_subject"]): int(fold["fold"]) for fold in split_payload["folds"]}
     age_cv7.validate_oof_coverage(oof_rows, sample_subject, subject_test_folds)
@@ -687,9 +750,12 @@ def aggregate_oof_artifacts(
     _write_json(output_dir / "oof_subject_mean_metrics.json", mean_metrics)
     _write_json(output_dir / "oof_subject_median_metrics.json", median_metrics)
 
-    source_baseline = regression_metrics(truth, [SOURCE_AGE_MEAN] * len(truth))
+    source_age_mean = float(source_age_mean)
+    if not math.isfinite(source_age_mean):
+        raise RuntimeError("Checkpoint source age mean is not finite")
+    source_baseline = regression_metrics(truth, [source_age_mean] * len(truth))
     source_baseline.update({
-        "baseline": "fixed_dortmund_source_mean", "prediction_years": SOURCE_AGE_MEAN,
+        "baseline": "fixed_dortmund_source_mean", "prediction_years": source_age_mean,
         "target_statistics_from_huada": False,
     })
     fold_baseline_predictions = []
@@ -792,8 +858,11 @@ def _resolved_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **vars(args), "run_mode": RUN_MODE, "probe_layer_idx": PROBE_LAYER_IDX,
         "pooling": "masked_mean", "cache_pooling": POOLING, "feature_dim": FEATURE_DIM,
-        "target_transform": "fixed_source_zscore", "source_age_mean": SOURCE_AGE_MEAN,
-        "source_age_std_expected": SOURCE_AGE_STD, "target_scaler_fitted_on_huada": False,
+        "target_transform": "fixed_source_zscore",
+        "source_scaler_from_checkpoint": True,
+        "expected_source_age_mean": args.expected_source_age_mean,
+        "expected_source_age_std": args.expected_source_age_std,
+        "target_scaler_fitted_on_huada": False,
         "source_probe_reloaded_per_fold": True, "backbone_frozen": True,
         "selection_tolerance": SELECTION_TOLERANCE, "scheduler": "none",
     }
@@ -860,7 +929,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for fold_info in split_payload["folds"]:
             summary, rows, epochs = run_fold(
                 fold_info=fold_info, dataset=dataset, checkpoint_path=checkpoint_path,
-                expected_sha256=args.expected_checkpoint_sha256, cache_info=cache_info,
+                expected_sha256=args.expected_checkpoint_sha256,
+                expected_source_mean=args.expected_source_age_mean,
+                expected_source_std=args.expected_source_age_std,
+                cache_info=cache_info,
                 split_manifest_sha256=split_sha, output_dir=output_dir, device=device,
                 batch_size=args.batch_size, num_workers=args.num_workers, seed=args.seed,
                 head_lr=args.head_lr, weight_decay=args.weight_decay, epochs=args.epochs,
@@ -871,6 +943,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             output_dir=output_dir, split_payload=split_payload, subject_ages=subject_ages,
             sample_subject=sample_subject, fold_summaries=fold_summaries,
             oof_rows=oof_rows, epoch_rows=all_epochs,
+            source_age_mean=cache_info["checkpoint_report"]["source_age_mean"],
         )
         zero_shot_comparison = compare_zero_shot_reference(args.zero_shot_reference_dir, aggregate["oof_subject_mean_metrics"])
         _write_json(output_dir / "zero_shot_comparison.json", zero_shot_comparison)
@@ -879,10 +952,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "run_mode": RUN_MODE, "started_at": started.isoformat(), "completed_at": datetime.now(timezone.utc).isoformat(),
             "input_lance": str(input_path.resolve()), "input_lance_fingerprint": cache_info["identity"]["input_lance_fingerprint"],
             "source_full_checkpoint": str(checkpoint_path.resolve()),
-            "source_full_checkpoint_sha256": args.expected_checkpoint_sha256,
-            "source_checkpoint_best_epoch": 20, "source_target_scaler": {
-                "mean": SOURCE_AGE_MEAN, "std": fold_summaries[0]["source_scaler"]["source_age_std"],
-                "ddof": 0, "full_precision_from_checkpoint": True,
+            "source_full_checkpoint_sha256": cache_info["checkpoint_report"]["sha256"],
+            "source_checkpoint_sha256_expectation_enforced": args.expected_checkpoint_sha256 is not None,
+            "source_checkpoint_best_epoch": cache_info["checkpoint_report"]["best_epoch"],
+            "source_target_scaler": {
+                "mean": cache_info["checkpoint_report"]["source_age_mean"],
+                "std": cache_info["checkpoint_report"]["source_age_std"],
+                "ddof": fold_summaries[0]["source_scaler"]["ddof"],
+                "full_precision_from_checkpoint": True,
             },
             "feature_cache_key": cache_info["feature_cache_key"], "feature_cache_path": cache_info["feature_cache_path"],
             "split_manifest_sha256": split_sha,
@@ -909,6 +986,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "feature_cache_key": cache_info["feature_cache_key"], "feature_cache_reused": cache_info["feature_cache_reused"],
             "source_probe_initialization_identical_across_folds": True,
             "source_scaler_reused": True, "target_scaler_fitted_on_huada": False,
+            "source_full_checkpoint_sha256": cache_info["checkpoint_report"]["sha256"],
+            "source_checkpoint_best_epoch": cache_info["checkpoint_report"]["best_epoch"],
+            "source_age_mean": cache_info["checkpoint_report"]["source_age_mean"],
+            "source_age_std": cache_info["checkpoint_report"]["source_age_std"],
             "backbone_trainable_parameter_count": 0, "fold_trainable_parameter_count": PROBE_PARAMETER_COUNT,
             "backbone_forward_count_during_fold_training": 0,
             "test_access_before_selection": False, "test_evaluations": 7,

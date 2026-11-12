@@ -8,7 +8,6 @@ set -euo pipefail
 : "${OUTPUT_ROOT:?Set OUTPUT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-EXPECTED_CKPT_SHA256="${EXPECTED_CKPT_SHA256:-3e44d9e7942d20d3d004e191a077ac636eeea770a6d185149591b683c5b3f13e}"
 HEAD_LR="${HEAD_LR:-1e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
 EPOCHS="${EPOCHS:-100}"
@@ -26,7 +25,8 @@ test -d "$HUADA_TOKEN_LANCE"
 test -f "$DORTMUND_AGE_CKPT"
 test "$(basename "$DORTMUND_AGE_CKPT")" = "best_full_checkpoint.pt"
 
-printf '%s  %s\n' "$EXPECTED_CKPT_SHA256" "$DORTMUND_AGE_CKPT" | sha256sum -c -
+actual_sha256="$(sha256sum "$DORTMUND_AGE_CKPT" | awk '{print $1}')"
+printf 'checkpoint_sha256=%s\n' "$actual_sha256"
 
 RUN_ID="$(date -u +%Y%m%d_%H%M%S)"
 RUN_OUTPUT="$OUTPUT_ROOT/50m_dortmund_age_probe_transfer_cv7_$RUN_ID"
@@ -39,7 +39,6 @@ ARGS=(
   scripts/downstream_50m/run_huada_dortmund_age_probe_transfer_cv7.py
   --input-lance "$HUADA_TOKEN_LANCE"
   --checkpoint "$DORTMUND_AGE_CKPT"
-  --expected-checkpoint-sha256 "$EXPECTED_CKPT_SHA256"
   --feature-cache-root "$FEATURE_CACHE_ROOT"
   --feature-cache-policy "$FEATURE_CACHE_POLICY"
   --feature-cache-batch-size "$FEATURE_CACHE_BATCH_SIZE"
@@ -54,6 +53,10 @@ ARGS=(
   --seed "$TRAIN_SEED"
   --split-seed "$SPLIT_SEED"
 )
+
+if test -n "${EXPECTED_CKPT_SHA256:-}"; then
+  ARGS+=(--expected-checkpoint-sha256 "$EXPECTED_CKPT_SHA256")
+fi
 
 if test -n "${FEATURE_CACHE_BUILD_ROOT:-}"; then
   ARGS+=(--feature-cache-build-root "$FEATURE_CACHE_BUILD_ROOT")

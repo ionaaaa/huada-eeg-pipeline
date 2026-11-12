@@ -67,12 +67,36 @@ def test_source_probe_strict_extraction_uses_full_precision_scaler(tmp_path, mon
     torch.save(payload, path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     monkeypatch.setattr(transfer, "build_formal_model", lambda: object())
-    monkeypatch.setattr(transfer, "validate_checkpoint_payload", lambda value, model: {
-        "source_age_mean": 27.5, "source_age_std": 4.218591123456,
+    monkeypatch.setattr(transfer, "validate_checkpoint_payload", lambda value, model, **kwargs: {
+        "source_age_mean": 27.5, "source_age_std": 4.218591123456, "best_epoch": 20,
     })
     state, fingerprint, report, scaler = transfer.load_source_probe_state(path, digest)
     assert set(state) == {"weight", "bias"} and len(fingerprint) == 64
     assert report["sha256"] == digest and scaler.std == 4.218591123456
+
+
+def test_new_source_checkpoint_uses_recorded_sha_epoch_and_scaler(tmp_path, monkeypatch):
+    path = tmp_path / "best_full_checkpoint.pt"
+    payload = {"age_probe_state_dict": source_state(), "target_transform": {"ddof": 0}}
+    torch.save(payload, path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    received = {}
+    monkeypatch.setattr(transfer, "build_formal_model", lambda: object())
+
+    def validate(value, model, **kwargs):
+        received.update(kwargs)
+        return {"source_age_mean": 28.125, "source_age_std": 3.75, "best_epoch": 7}
+
+    monkeypatch.setattr(transfer, "validate_checkpoint_payload", validate)
+    _, _, report, scaler = transfer.load_source_probe_state(path, None)
+    assert report["sha256"] == digest
+    assert report["sha256_expectation_enforced"] is False
+    assert report["best_epoch"] == 7
+    assert scaler.mean == pytest.approx(28.125)
+    assert scaler.std == pytest.approx(3.75)
+    assert received["expected_source_mean"] is None
+    assert received["expected_source_std"] is None
+    assert received["contract"].best_epoch is None
 
 
 def test_fixed_source_scaler_round_trip_and_no_huada_fit():
@@ -275,6 +299,8 @@ def test_cloud_entry_is_formal_probe_transfer_only():
     text = (ROOT / "commands" / "run_huada_dortmund_age_probe_transfer_cv7.sh").read_text(encoding="utf-8")
     assert "set -euo pipefail" in text
     assert "run_huada_dortmund_age_probe_transfer_cv7.py" in text
-    assert "sha256sum -c" in text and "best_full_checkpoint.pt" in text
+    assert "checkpoint_sha256=" in text and "best_full_checkpoint.pt" in text
+    assert "sha256sum -c" not in text
+    assert 'if test -n "${EXPECTED_CKPT_SHA256:-}"' in text
     for forbidden in ("--overwrite", "last_training_checkpoint.pt", "full_finetune", "calibration", "clip"):
         assert forbidden not in text
