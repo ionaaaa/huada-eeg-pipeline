@@ -325,3 +325,11 @@ def test_adapter_shell_entries_support_dynamic_cohort(name):
     assert '--cohort-id "${DORTMUND_COHORT_ID}"' in text
     assert '--expected-subjects "${DORTMUND_EXPECTED_SUBJECTS}"' in text
     assert '--expected-recordings "${DORTMUND_EXPECTED_RECORDINGS}"' in text
+    assert "DORTMUND_COMMON_DIR does not exist" in text
+    assert "DORTMUND_COMMON_LANCE does not exist or is not a directory" in text
+    assert '"${PYTHON_BIN}" -u "${args[@]}"' in text
+    for artifact in (
+        "adaptation_errors.log", "adapter_summary.json", "input_issues.csv",
+        "adaptation_issues.csv",
+    ):
+        assert artifact in text

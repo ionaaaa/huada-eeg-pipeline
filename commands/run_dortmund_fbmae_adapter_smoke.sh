@@ -40,19 +40,6 @@ if [[ -z "${DORTMUND_EXPECTED_RECORDINGS:-}" ]]; then
   fi
 fi
 
-command -v "${PYTHON_BIN}" >/dev/null 2>&1
-test -f "${ADAPTER_SCRIPT}"
-test -f "${CHANNEL_PROFILE}"
-test -f "${ELECTRODE_VOCAB}"
-test -d "${DORTMUND_COMMON_DIR}"
-if [[ -n "${DORTMUND_COMMON_LANCE}" ]]; then
-  test -d "${DORTMUND_COMMON_LANCE}"
-fi
-if [[ -e "${OUTPUT_DIR}" ]]; then
-  echo "Refusing to overwrite existing output: ${OUTPUT_DIR}" >&2
-  exit 2
-fi
-
 echo "HUADA_ROOT=${HUADA_ROOT}"
 echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "DORTMUND_COMMON_DIR=${DORTMUND_COMMON_DIR}"
@@ -69,6 +56,23 @@ echo "ADAPTER_BATCH_SIZE=${ADAPTER_BATCH_SIZE}"
 echo "ADAPTER_NUM_WORKERS=${ADAPTER_NUM_WORKERS}"
 echo "ADAPTER_SMOKE_SUBJECTS=${ADAPTER_SMOKE_SUBJECTS:-<auto-select and record basis>}"
 echo "ADAPTER_SMOKE_MAX_WINDOWS=${ADAPTER_SMOKE_MAX_WINDOWS}"
+
+if [[ "${PYTHON_BIN}" == */* ]]; then
+  [[ -x "${PYTHON_BIN}" ]] || fail "PYTHON_BIN is not executable: ${PYTHON_BIN}"
+else
+  command -v "${PYTHON_BIN}" >/dev/null 2>&1 \
+    || fail "PYTHON_BIN is not on PATH: ${PYTHON_BIN}"
+fi
+[[ -f "${ADAPTER_SCRIPT}" ]] || fail "adapter script does not exist: ${ADAPTER_SCRIPT}"
+[[ -f "${CHANNEL_PROFILE}" ]] || fail "channel profile does not exist: ${CHANNEL_PROFILE}"
+[[ -f "${ELECTRODE_VOCAB}" ]] || fail "electrode vocabulary does not exist: ${ELECTRODE_VOCAB}"
+[[ -d "${DORTMUND_COMMON_DIR}" ]] \
+  || fail "DORTMUND_COMMON_DIR does not exist: ${DORTMUND_COMMON_DIR}"
+if [[ -n "${DORTMUND_COMMON_LANCE}" ]]; then
+  [[ -d "${DORTMUND_COMMON_LANCE}" ]] \
+    || fail "DORTMUND_COMMON_LANCE does not exist or is not a directory: ${DORTMUND_COMMON_LANCE}"
+fi
+[[ ! -e "${OUTPUT_DIR}" ]] || fail "refusing to overwrite existing output: ${OUTPUT_DIR}"
 
 args=(
   "${ADAPTER_SCRIPT}"
@@ -94,5 +98,20 @@ if [[ -n "${ADAPTER_SMOKE_SUBJECTS}" ]]; then
   args+=(--smoke-subjects "${ADAPTER_SMOKE_SUBJECTS}")
 fi
 
-"${PYTHON_BIN}" "${args[@]}"
+if "${PYTHON_BIN}" -u "${args[@]}"; then
+  :
+else
+  status=$?
+  echo "[dortmund-fbmae-smoke] ERROR: adapter exited with status ${status}" >&2
+  for artifact in adaptation_errors.log adapter_summary.json input_issues.csv adaptation_issues.csv; do
+    if [[ -s "${OUTPUT_DIR}/${artifact}" ]]; then
+      echo "[dortmund-fbmae-smoke] ${artifact}:" >&2
+      tail -n 100 "${OUTPUT_DIR}/${artifact}" >&2
+    fi
+  done
+  if [[ ! -d "${OUTPUT_DIR}" ]]; then
+    echo "[dortmund-fbmae-smoke] no finalized output directory was created: ${OUTPUT_DIR}" >&2
+  fi
+  exit "${status}"
+fi
 echo "Dortmund FBMAE smoke completed: ${OUTPUT_DIR}"
