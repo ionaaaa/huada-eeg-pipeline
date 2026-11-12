@@ -58,8 +58,7 @@ from preprocess_huada_common_windows import (
 from validate_huada_raw_bdf import load_and_validate_config, unit_to_uv_multiplier
 
 
-SCRIPT_VERSION = "1.0.0"
-DATASET_ID = "ds005385_huada_age_20_35_profile_a"
+SCRIPT_VERSION = "1.1.0"
 DEFAULT_SOURCE_URI = "cos://jianyu-1442740494/huada/data/Dortmund_Vital_Study"
 SOURCE_SFREQ = 1000.0
 N_EEG_CHANNELS = 64
@@ -97,6 +96,25 @@ CSV_FIELDS: dict[str, list[str]] = {
     "preprocessing_issues.csv": ["severity", "stage", "subject_id", "recording_id", "source_path", "sample_id", "channel_name", "issue_type", "description", "action"],
     "source_snapshot_before.csv": ["relative_path", "size_bytes", "mtime_ns"],
     "source_snapshot_after.csv": ["relative_path", "size_bytes", "mtime_ns"],
+}
+
+INVENTORY_CSV_FIELDS: dict[str, list[str]] = {
+    "candidate_subjects.csv": [
+        "subject_id", "age", "sex", "handedness", "profile_recording_count",
+        "eyes_open_count", "eyes_closed_count", "eligible", "exclusion_reason",
+    ],
+    "eligible_subjects.csv": [
+        "subject_id", "age", "sex", "handedness", "profile_recording_count",
+        "eyes_open_count", "eyes_closed_count",
+    ],
+    "eligible_recordings.csv": [
+        "subject_id", "session_id", "task", "acquisition", "eyes_condition",
+        "run_id", "recording_id", "source_path", "sidecar_path", "channels_path",
+        "age", "label",
+    ],
+    "excluded_subjects.csv": [
+        "subject_id", "age", "sex", "handedness", "exclusion_reason",
+    ],
 }
 
 
@@ -139,14 +157,32 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
-def parse_numeric_age(value: Any) -> int:
+def parse_individual_numeric_age(value: Any) -> int:
     text = str(value).strip()
     if not re.fullmatch(r"\d+(?:\.0+)?", text):
         raise ValueError(f"Age must be an unbinned integer-year value, got {value!r}")
-    age = int(float(text))
-    if not 20 <= age <= 35:
-        raise ValueError(f"Age outside Profile-A range 20-35: {age}")
+    return int(float(text))
+
+
+def parse_numeric_age(value: Any, min_age: int = 20, max_age: int = 35) -> int:
+    """Parse a documented integer-year age and enforce the configured cohort."""
+    age = parse_individual_numeric_age(value)
+    if not min_age <= age <= max_age:
+        raise ValueError(f"Age outside configured range {min_age}-{max_age}: {age}")
     return age
+
+
+def build_cohort_id(min_age: int, max_age: int, cohort_id: str | None = None) -> str:
+    value = cohort_id or f"age{min_age}_{max_age}_ses1_pre_profile_a"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise ValueError(
+            "cohort_id must contain only letters, digits, dot, underscore, or hyphen"
+        )
+    return value
+
+
+def build_dataset_id(cohort_id: str) -> str:
+    return f"ds005385_dortmund_{cohort_id}"
 
 
 def validate_full_read(actual_samples: int, header_samples: int, has_nan: bool, has_inf: bool) -> None:
@@ -360,7 +396,9 @@ def dortmund_lance_schema() -> pa.Schema:
     ])
 
 
-def validate_dortmund_lance(path: Path, expected_rows: int) -> dict[str, Any]:
+def validate_dortmund_lance(
+    path: Path, expected_rows: int, min_age: int = 20, max_age: int = 35
+) -> dict[str, Any]:
     dataset = lance.dataset(path)
     schema = dataset.schema
     if schema != dortmund_lance_schema():
@@ -383,7 +421,7 @@ def validate_dortmund_lance(path: Path, expected_rows: int) -> dict[str, Any]:
             bad = np.asarray(batch.column("bad_channel_mask")[i].values, dtype=bool)
             age = float(batch.column("age")[i].as_py())
             label = float(batch.column("label")[i].as_py())
-            valid = shape == [64, 2000] and data.dtype == np.float32 and np.isfinite(data).all() and data.min() >= -1 and data.max() <= 1 and channel_mask.shape == (64,) and channel_mask.all() and bad.shape == (64,) and (not bad.any() or np.all(data[bad] == 0)) and age == label and 20 <= age <= 35
+            valid = shape == [64, 2000] and data.dtype == np.float32 and np.isfinite(data).all() and data.min() >= -1 and data.max() <= 1 and channel_mask.shape == (64,) and channel_mask.all() and bad.shape == (64,) and (not bad.any() or np.all(data[bad] == 0)) and age == label and min_age <= age <= max_age
             all_valid &= bool(valid)
             if not valid:
                 raise AssertionError(f"Invalid Lance row {sample_id}")
@@ -407,6 +445,8 @@ class DortmundPipeline:
         self.data_dir = args.data_dir.resolve()
         self.dataset_root = resolve_dataset_root(self.data_dir)
         self.output_dir = args.output_dir.resolve()
+        self.cohort_id = build_cohort_id(args.min_age, args.max_age, args.cohort_id)
+        self.dataset_id = build_dataset_id(self.cohort_id)
         self.config = load_and_validate_config(args.config)
         self.pre = self.config["preprocessing"]
         self.windowing = self.config["windowing"]
@@ -422,6 +462,7 @@ class DortmundPipeline:
         self.recordings: list[dict[str, Any]] = []
         self.written_rows = 0
         self.selected_paths: list[str] = []
+        self.inventory_rows = {name: [] for name in INVENTORY_CSV_FIELDS}
 
     def issue(self, severity: str, stage: str, issue_type: str, description: str, action: str, rec: dict[str, Any] | None = None, channel: str = "", sample_id: str = "") -> None:
         rec = rec or {}
@@ -431,11 +472,32 @@ class DortmundPipeline:
         participants_path = find_participants_file(self.data_dir, self.dataset_root)
         participants = {row["participant_id"]: row for row in read_tsv(participants_path)}
         selected: list[dict[str, Any]] = []
+        downloaded_in_scope: dict[str, dict[str, Any]] = {}
+        excluded_subjects: dict[str, dict[str, Any]] = {}
         for edf in sorted(self.dataset_root.rglob("*.edf"), key=lambda p: p.as_posix().lower()):
             entities = parse_bids_edf(edf)
             if not entities:
                 self.issue("error", "profile_selection", "bids_entities_invalid", f"Cannot parse {edf.name}", "Fix BIDS filename")
                 continue
+            rel = edf.relative_to(self.data_dir).as_posix()
+            sid = entities["subject"]
+            recording_id = edf.stem
+            if sid not in participants:
+                raise ValueError(f"Downloaded subject missing participants metadata: {sid}")
+            source = participants[sid]
+            try:
+                age = parse_individual_numeric_age(source.get("age"))
+            except ValueError as exc:
+                raise ValueError(f"Invalid age metadata for downloaded subject {sid}: {exc}") from exc
+            if not self.args.min_age <= age <= self.args.max_age:
+                self.rows["excluded_recordings.csv"].append({"subject_id": sid, "session_id": entities["session"], "recording_id": recording_id, "source_path": rel, "entity_type": "recording", "entity_name": recording_id, "exclusion_reason": "excluded_age_out_of_scope"})
+                excluded_subjects[sid] = {
+                    "subject_id": sid, "age": age, "sex": source.get("sex", ""),
+                    "handedness": source.get("handedness", ""),
+                    "exclusion_reason": "excluded_age_out_of_scope",
+                }
+                continue
+            downloaded_in_scope[sid] = source
             stem = edf.name[:-8]
             sidecar_path = edf.with_name(stem + "_eeg.json")
             channels_path = edf.with_name(stem + "_channels.tsv")
@@ -443,15 +505,9 @@ class DortmundPipeline:
                 raise FileNotFoundError(f"Missing sidecar/channels file for {edf}")
             sidecar = read_json(sidecar_path)
             is_selected, reason = profile_a_decision(entities, sidecar)
-            rel = edf.relative_to(self.data_dir).as_posix()
-            sid = entities["subject"]
-            recording_id = edf.stem
             if not is_selected:
                 self.rows["excluded_recordings.csv"].append({"subject_id": sid, "session_id": entities["session"], "recording_id": recording_id, "source_path": rel, "entity_type": "recording", "entity_name": recording_id, "exclusion_reason": reason})
                 continue
-            if sid not in participants:
-                raise ValueError(f"Selected subject missing participants metadata: {sid}")
-            age = parse_numeric_age(participants[sid].get("age"))
             condition = condition_from_entities(entities)
             rec = {"subject_id": sid, "session_id": entities["session"], "task": entities["task"], "acquisition": entities["acquisition"], "eyes_condition": condition, "run_id": entities.get("run") or "run-01", "recording_id": recording_id, "source_path": rel, "sidecar_path": sidecar_path.relative_to(self.data_dir).as_posix(), "channels_path": channels_path.relative_to(self.data_dir).as_posix(), "age": age, "label": age, "selected_reason": reason, "absolute_path": edf, "sidecar": sidecar}
             selected.append(rec)
@@ -460,14 +516,53 @@ class DortmundPipeline:
         selected_subject_ids = sorted({r["subject_id"] for r in self.recordings})
         for sid in selected_subject_ids:
             source = participants[sid]
-            age = parse_numeric_age(source.get("age"))
+            age = parse_numeric_age(source.get("age"), self.args.min_age, self.args.max_age)
             count = sum(r["subject_id"] == sid for r in self.recordings)
             self.subjects[sid] = {"subject_id": sid, "age": age, "label": age, "age_dtype": "integer", "age_unit": "year", "age_scope": "baseline/ses-1", "age_status": "valid_numeric_baseline", "sex": source.get("sex", ""), "handedness": source.get("handedness", ""), "selected_profile": "A", "recording_count": count, "eligible": count == 2}
         self.rows["subject_manifest.csv"] = list(self.subjects.values())
         self.rows["recording_manifest.csv"] = [{key: value for key, value in rec.items() if key not in {"absolute_path", "sidecar"}} for rec in self.recordings]
         for rec in self.recordings:
                 self.rows["excluded_recordings.csv"].append({"subject_id": rec["subject_id"], "session_id": rec["session_id"], "recording_id": rec["recording_id"], "source_path": rec["source_path"], "entity_type": "channel", "entity_name": STATUS_NAME, "exclusion_reason": "excluded_non_eeg_channel"})
-        if not self.args.smoke:
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in selected:
+            grouped[row["subject_id"]].append(row)
+        eligible_subject_ids: set[str] = set()
+        for sid, source in sorted(downloaded_in_scope.items()):
+            rows = grouped.get(sid, [])
+            conditions = Counter(row["eyes_condition"] for row in rows)
+            eligible = conditions == Counter({"eyes_open": 1, "eyes_closed": 1})
+            if eligible:
+                eligible_subject_ids.add(sid)
+            reason = "" if eligible else (
+                "no_profile_a_recording" if not rows else "profile_a_pair_missing_or_duplicate"
+            )
+            candidate = {
+                "subject_id": sid,
+                "age": parse_numeric_age(source.get("age"), self.args.min_age, self.args.max_age),
+                "sex": source.get("sex", ""),
+                "handedness": source.get("handedness", ""),
+                "profile_recording_count": len(rows),
+                "eyes_open_count": conditions.get("eyes_open", 0),
+                "eyes_closed_count": conditions.get("eyes_closed", 0),
+                "eligible": eligible,
+                "exclusion_reason": reason,
+            }
+            self.inventory_rows["candidate_subjects.csv"].append(candidate)
+            if eligible:
+                self.inventory_rows["eligible_subjects.csv"].append(
+                    {key: candidate[key] for key in INVENTORY_CSV_FIELDS["eligible_subjects.csv"]}
+                )
+            else:
+                excluded_subjects[sid] = {
+                    "subject_id": sid, "age": candidate["age"], "sex": candidate["sex"],
+                    "handedness": candidate["handedness"], "exclusion_reason": reason,
+                }
+        self.inventory_rows["eligible_recordings.csv"] = [
+            {key: row[key] for key in INVENTORY_CSV_FIELDS["eligible_recordings.csv"]}
+            for row in selected if row["subject_id"] in eligible_subject_ids
+        ]
+        self.inventory_rows["excluded_subjects.csv"] = list(excluded_subjects.values())
+        if not self.args.smoke and not self.args.inventory_only:
             try:
                 validate_profile_a_counts(selected, self.args.expected_subjects, self.args.expected_recordings)
             except ValueError as exc:
@@ -583,6 +678,42 @@ class DortmundPipeline:
         if bad.all():
             raise RuntimeError("All 64 EEG channels are bad")
         return bad, inventory, np.array([read_samples], dtype=np.int64)
+
+    def run_inventory(self) -> dict[str, Any]:
+        """Resolve cohort/profile membership without opening any EDF signal."""
+        self.build_manifests()
+        for name, fields in INVENTORY_CSV_FIELDS.items():
+            _write_csv(self.output_dir / name, self.inventory_rows[name], fields)
+        eligible_subjects = self.inventory_rows["eligible_subjects.csv"]
+        eligible_recordings = self.inventory_rows["eligible_recordings.csv"]
+        summary = {
+            "run_mode": "inventory_only",
+            "inventory_only": True,
+            "cohort_id": self.cohort_id,
+            "dataset_id": self.dataset_id,
+            "min_age": self.args.min_age,
+            "max_age": self.args.max_age,
+            "candidate_subject_count": len(self.inventory_rows["candidate_subjects.csv"]),
+            "eligible_subject_count": len(eligible_subjects),
+            "eligible_recording_count": len(eligible_recordings),
+            "excluded_subject_count": len(self.inventory_rows["excluded_subjects.csv"]),
+            "expected_subjects": self.args.expected_subjects,
+            "expected_recordings": self.args.expected_recordings,
+            "expected_counts_match": (
+                self.args.expected_subjects is not None
+                and self.args.expected_recordings is not None
+                and len(eligible_subjects) == self.args.expected_subjects
+                and len(eligible_recordings) == self.args.expected_recordings
+            ),
+            "edf_signal_opened": False,
+            "lance_generated": False,
+            "generated_at": now_iso(),
+        }
+        (self.output_dir / "inventory_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return summary
 
     def process_one(self, rec: dict[str, Any]) -> None:
         summary = {"subject_id": rec["subject_id"], "recording_id": rec["recording_id"], "source_path": rec["source_path"], "eyes_condition": rec["eyes_condition"], "run_mode": "smoke" if self.args.smoke else "full", "processing_success": False, "error": ""}
@@ -734,7 +865,9 @@ class DortmundPipeline:
             }
             self.write_outputs(before, after, diagnostic_roundtrip)
             raise RuntimeError("No hard-QC-passing windows were written")
-        roundtrip = validate_dortmund_lance(self.lance_path, self.written_rows)
+        roundtrip = validate_dortmund_lance(
+            self.lance_path, self.written_rows, self.args.min_age, self.args.max_age
+        )
         self.write_outputs(before, after, roundtrip)
         return before, after, roundtrip
 
@@ -748,14 +881,14 @@ class DortmundPipeline:
         source_unchanged = before == after
         qc_pass_windows = sum(str(row["qc_pass"]).lower() == "true" or row["qc_pass"] is True for row in self.rows["window_inventory.csv"])
         dataset_written = self.lance_path.exists() and self.written_rows > 0
-        summary = {"dataset_id": DATASET_ID, "profile": "A", "run_mode": "smoke" if self.args.smoke else "full", "smoke": self.args.smoke, "selected_subjects": sorted(self.subjects), "selected_subject_count": len(self.subjects), "selected_recordings": len(self.recordings), "profile_a_total_subjects": len({r['subject_id'] for r in self.all_profile_recordings}), "profile_a_total_recordings": len(self.all_profile_recordings), "theoretical_complete_windows": sum(int(r.get("theoretical_complete_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "emitted_windows": len(self.rows["window_inventory.csv"]), "written_windows": self.written_rows, "dataset_written": dataset_written, "smoke_truncated_windows": sum(int(r.get("smoke_truncated_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "real_dropped_tail_seconds": sum(float(r.get("real_dropped_tail_seconds", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "qc_pass_windows": qc_pass_windows, "qc_fail_windows": len(self.rows["window_inventory.csv"]) - qc_pass_windows, "recording_success_count": sum(bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "recording_failure_count": sum(not bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "blocking_error_count": sum(r["severity"] == "error" for r in self.issues), "warning_count": sum(r["severity"] == "warning" for r in self.issues), "age_min": min(r["age"] for r in self.subjects.values()), "age_max": max(r["age"] for r in self.subjects.values()), "age_distribution": dict(Counter(r["age"] for r in self.subjects.values())), "eyes_open_windows": sum(r["eyes_condition"] == "eyes_open" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "eyes_closed_windows": sum(r["eyes_condition"] == "eyes_closed" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "source_files_unchanged": source_unchanged, "source_files_modified": not source_unchanged, "source_files_deleted": bool(set(before) - set(after)), "source_files_added": bool(set(after) - set(before)), "status_absent_from_eeg": True, "ses2_absent": all(r["session_id"] == "ses-1" for r in self.recordings), "post_cognitive_absent": all(r["acquisition"] == "pre" for r in self.recordings), "split_absent": "split" not in self.schema.names, "fbmae_tokens_absent": "model_tokens" not in self.schema.names and "electrode_ids" not in self.schema.names, "source_reference": SOURCE_REFERENCE, "source_ground": SOURCE_GROUND, "rereference_applied": False, "processing_reference": "unchanged", "channel_layout": "dataset_level", "native_channel_names": DORTMUND_CHANNELS, "roundtrip": roundtrip, "lance_row_count_matches_qc_pass": dataset_written and self.written_rows == qc_pass_windows == roundtrip["row_count"], "generated_at": now_iso()}
+        summary = {"dataset_id": self.dataset_id, "cohort_id": self.cohort_id, "configured_min_age": self.args.min_age, "configured_max_age": self.args.max_age, "profile": "A", "run_mode": "smoke" if self.args.smoke else "full", "smoke": self.args.smoke, "selected_subjects": sorted(self.subjects), "selected_subject_count": len(self.subjects), "selected_recordings": len(self.recordings), "profile_a_total_subjects": len({r['subject_id'] for r in self.all_profile_recordings}), "profile_a_total_recordings": len(self.all_profile_recordings), "theoretical_complete_windows": sum(int(r.get("theoretical_complete_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "emitted_windows": len(self.rows["window_inventory.csv"]), "written_windows": self.written_rows, "dataset_written": dataset_written, "smoke_truncated_windows": sum(int(r.get("smoke_truncated_windows", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "real_dropped_tail_seconds": sum(float(r.get("real_dropped_tail_seconds", 0) or 0) for r in self.rows["recording_processing_summary.csv"]), "qc_pass_windows": qc_pass_windows, "qc_fail_windows": len(self.rows["window_inventory.csv"]) - qc_pass_windows, "recording_success_count": sum(bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "recording_failure_count": sum(not bool(r.get("processing_success")) for r in self.rows["recording_processing_summary.csv"]), "blocking_error_count": sum(r["severity"] == "error" for r in self.issues), "warning_count": sum(r["severity"] == "warning" for r in self.issues), "age_min": min(r["age"] for r in self.subjects.values()), "age_max": max(r["age"] for r in self.subjects.values()), "age_distribution": dict(Counter(r["age"] for r in self.subjects.values())), "eyes_open_windows": sum(r["eyes_condition"] == "eyes_open" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "eyes_closed_windows": sum(r["eyes_condition"] == "eyes_closed" and r["written_to_lance"] for r in self.rows["window_inventory.csv"]), "source_files_unchanged": source_unchanged, "source_files_modified": not source_unchanged, "source_files_deleted": bool(set(before) - set(after)), "source_files_added": bool(set(after) - set(before)), "status_absent_from_eeg": True, "ses2_absent": all(r["session_id"] == "ses-1" for r in self.recordings), "post_cognitive_absent": all(r["acquisition"] == "pre" for r in self.recordings), "split_absent": "split" not in self.schema.names, "fbmae_tokens_absent": "model_tokens" not in self.schema.names and "electrode_ids" not in self.schema.names, "source_reference": SOURCE_REFERENCE, "source_ground": SOURCE_GROUND, "rereference_applied": False, "processing_reference": "unchanged", "channel_layout": "dataset_level", "native_channel_names": DORTMUND_CHANNELS, "roundtrip": roundtrip, "lance_row_count_matches_qc_pass": dataset_written and self.written_rows == qc_pass_windows == roundtrip["row_count"], "generated_at": now_iso()}
         (self.output_dir / "preprocessing_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         resolved = f'''[preprocessing]\ntarget_sfreq = {float(self.pre["target_sfreq"])}\nwindow_seconds = {float(self.pre["window_seconds"])}\nhop_seconds = {float(self.pre["hop_seconds"])}\nsegment_samples = {int(self.pre["segment_samples"])}\nbandpass_low = {float(self.pre["bandpass_low"])}\nbandpass_high = {float(self.pre["bandpass_high"])}\nnotch_hz = {float(self.pre["notch_hz"])}\nunit_before_normalization = "uV"\nnormalization = "clip_divide_200"\nnormalization_detail = "x_uV / 200, then clip to [-1, 1]"\n\n[windowing]\ndrop_incomplete_tail = true\npadding = false\n\n[source_expectations]\nformat = "EDF"\nsampling_rate_hz = 1000.0\nn_eeg_channels = 64\nstatus_channel = "Status"\n'''
         (self.output_dir / "resolved_config.toml").write_text(resolved, encoding="utf-8")
-        provenance = {"created_at": now_iso(), "source_uri": self.args.source_uri, "resolved_local_data_dir": str(self.data_dir), "dataset_root": str(self.dataset_root), "output_dir": str(self.output_dir), "run_mode": summary["run_mode"], "selected_subjects": summary["selected_subjects"], "smoke_max_windows_per_recording": self.args.smoke_max_windows_per_recording if self.args.smoke else None, "python_version": platform.python_version(), "mne_version": mne.__version__, "numpy_version": np.__version__, "scipy_version": scipy.__version__, "pyarrow_version": pa.__version__, "lance_version": lance.__version__, "script_path": str(Path(__file__).resolve()), "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "config_path": str(self.args.config.resolve()), "config_sha256": self.config_hash, "actual_command": self.args.actual_command, "filter_parameters": FILTER_PARAMETERS, "actual_processing_order": ["MNE V to uV", "recording hard QC", "50 Hz notch", "0.3-75 Hz bandpass", "1000 to 200 Hz polyphase resample", "10 s non-overlap window", "window hard QC", "bad channel zero", "clip_divide_200"], "source_reference": SOURCE_REFERENCE, "source_ground": SOURCE_GROUND, "rereference_applied": False, "processing_reference": "unchanged", "montage": SOURCE_MONTAGE, "channel_layout": "dataset_level", "fbmae_channel_mapping": "pending", "source_snapshot_before": before, "source_snapshot_after": after, "source_files_unchanged": source_unchanged}
+        provenance = {"created_at": now_iso(), "source_uri": self.args.source_uri, "resolved_local_data_dir": str(self.data_dir), "dataset_root": str(self.dataset_root), "output_dir": str(self.output_dir), "run_mode": summary["run_mode"], "cohort_id": self.cohort_id, "dataset_id": self.dataset_id, "min_age": self.args.min_age, "max_age": self.args.max_age, "expected_subjects": self.args.expected_subjects, "expected_recordings": self.args.expected_recordings, "selected_subjects": summary["selected_subjects"], "smoke_max_windows_per_recording": self.args.smoke_max_windows_per_recording if self.args.smoke else None, "python_version": platform.python_version(), "mne_version": mne.__version__, "numpy_version": np.__version__, "scipy_version": scipy.__version__, "pyarrow_version": pa.__version__, "lance_version": lance.__version__, "script_path": str(Path(__file__).resolve()), "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "config_path": str(self.args.config.resolve()), "config_sha256": self.config_hash, "actual_command": self.args.actual_command, "filter_parameters": FILTER_PARAMETERS, "actual_processing_order": ["MNE V to uV", "recording hard QC", "50 Hz notch", "0.3-75 Hz bandpass", "1000 to 200 Hz polyphase resample", "10 s non-overlap window", "window hard QC", "bad channel zero", "clip_divide_200"], "source_reference": SOURCE_REFERENCE, "source_ground": SOURCE_GROUND, "rereference_applied": False, "processing_reference": "unchanged", "montage": SOURCE_MONTAGE, "channel_layout": "dataset_level", "fbmae_channel_mapping": "pending", "source_snapshot_before": before, "source_snapshot_after": after, "source_files_unchanged": source_unchanged}
         provenance.update(_git_metadata(Path(__file__).resolve().parents[1]))
         (self.output_dir / "processing_provenance.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        metadata = f'''spec_version = "0.1.0"\nprofile = "base"\ndataset_id = "{DATASET_ID}"\nmodality = "eeg"\nsample_unit = "window"\ntask_type = "regression"\ntarget_name = "age"\ntarget_unit = "year"\nchannel_layout = "dataset_level"\nsource_reference = "FCz"\nsource_ground = "AFz"\nrereference_applied = false\nprocessing_reference = "unchanged"\nfbmae_channel_mapping = "pending"\n'''
+        metadata = f'''spec_version = "0.1.0"\nprofile = "base"\ndataset_id = "{self.dataset_id}"\ncohort_id = "{self.cohort_id}"\nmin_age = {self.args.min_age}\nmax_age = {self.args.max_age}\nmodality = "eeg"\nsample_unit = "window"\ntask_type = "regression"\ntarget_name = "age"\ntarget_unit = "year"\nchannel_layout = "dataset_level"\nsource_reference = "FCz"\nsource_ground = "AFz"\nrereference_applied = false\nprocessing_reference = "unchanged"\nfbmae_channel_mapping = "pending"\n'''
         (self.output_dir / "metadata.toml").write_text(metadata, encoding="utf-8")
         (self.output_dir / "versions.toml").write_text(f'script_version = "{SCRIPT_VERSION}"\nmne = "{mne.__version__}"\nnumpy = "{np.__version__}"\nscipy = "{scipy.__version__}"\npyarrow = "{pa.__version__}"\nlance = "{lance.__version__}"\n', encoding="utf-8")
         (self.output_dir / "description.toml").write_text('title = "Dortmund Vital Study adult age Profile A"\ndescription = "ses-1 pre-cognitive eyes-open/eyes-closed 10-second EEG windows"\nsource_dataset = "OpenNeuro ds005385"\n', encoding="utf-8")
@@ -768,7 +901,7 @@ class DortmundPipeline:
         shutil.copy2(self.output_dir / "preprocessing_report.md", report_dir / "preprocessing_report.md")
 
     def render_report(self, summary: dict[str, Any]) -> str:
-        return f'''# Dortmund Vital Study 成人年龄公共预处理报告\n\n- 运行模式：{summary["run_mode"]}\n- Profile A 总范围：{summary["profile_a_total_subjects"]} 名被试，{summary["profile_a_total_recordings"]} 条 recording。\n- 本次选择：{summary["selected_subject_count"]} 名被试，{summary["selected_recordings"]} 条 recording。\n- 理论完整窗口：{summary["theoretical_complete_windows"]}；实际发出：{summary["emitted_windows"]}；写入 Lance：{summary["written_windows"]}。\n- eyes-open / eyes-closed：{summary["eyes_open_windows"]} / {summary["eyes_closed_windows"]}。\n- QC pass/fail：{summary["qc_pass_windows"]} / {summary["qc_fail_windows"]}。\n- smoke 截断窗口：{summary["smoke_truncated_windows"]}；真实 dropped tail：{summary["real_dropped_tail_seconds"]:.3f} 秒。\n- 年龄范围：{summary["age_min"]}–{summary["age_max"]}；age 与 label 均为逐被试 baseline 整数年龄。\n\n## 固定语义\n\n仅包含 ses-1、pre-cognitive、eyes-open/eyes-closed。ses-2、post-cognitive 和 Status 不进入主数据。source_reference=FCz，source_ground=AFz，rereference_applied=false，processing_reference=unchanged。保留 Dortmund 原生 64 通道顺序；FBMAE channel mapping=pending。\n\n## 处理链\n\nMNE V→µV → recording 硬 QC → 50 Hz notch → 0.3–75 Hz bandpass → 1000→200 Hz polyphase → 10 秒无重叠窗口 → window 硬 QC → 坏道置零 → x/200 clip[-1,1]。没有重参考、ICA、插值、padding、split 或模型 token。\n\nsub-230 的 60 秒 EyesClosed/pre recording 在完整读取与硬 QC 通过时保留并产生 6 窗。sub-600 的 duration 冲突以 EDF 实际可读样本为准，只记录 metadata warning，不补零。\n\n## 验收\n\n- Lance round-trip：{summary["roundtrip"]["all_rows_valid"]}\n- Lance 行数=window_inventory QC pass=summary written_windows：{summary["lance_row_count_matches_qc_pass"]}\n- 原始文件大小/mtime 未改变：{summary["source_files_unchanged"]}\n- blocking errors：{summary["blocking_error_count"]}；warnings：{summary["warning_count"]}\n'''
+        return f'''# Dortmund Vital Study 成人年龄公共预处理报告\n\n- 运行模式：{summary["run_mode"]}\n- cohort_id：{summary["cohort_id"]}；配置年龄范围：{summary["configured_min_age"]}–{summary["configured_max_age"]}。\n- Profile A 总范围：{summary["profile_a_total_subjects"]} 名被试，{summary["profile_a_total_recordings"]} 条 recording。\n- 本次选择：{summary["selected_subject_count"]} 名被试，{summary["selected_recordings"]} 条 recording。\n- 理论完整窗口：{summary["theoretical_complete_windows"]}；实际发出：{summary["emitted_windows"]}；写入 Lance：{summary["written_windows"]}。\n- eyes-open / eyes-closed：{summary["eyes_open_windows"]} / {summary["eyes_closed_windows"]}。\n- QC pass/fail：{summary["qc_pass_windows"]} / {summary["qc_fail_windows"]}。\n- smoke 截断窗口：{summary["smoke_truncated_windows"]}；真实 dropped tail：{summary["real_dropped_tail_seconds"]:.3f} 秒。\n- 实际年龄范围：{summary["age_min"]}–{summary["age_max"]}；age 与 label 均为逐被试 baseline 整数年龄。\n\n## 固定语义\n\n仅包含 ses-1、pre-cognitive、eyes-open/eyes-closed。ses-2、post-cognitive、年龄范围外被试和 Status 不进入主数据。source_reference=FCz，source_ground=AFz，rereference_applied=false，processing_reference=unchanged。保留 Dortmund 原生 64 通道顺序；FBMAE channel mapping=pending。\n\n## 处理链\n\nMNE V→µV → recording 硬 QC → 50 Hz notch → 0.3–75 Hz bandpass → 1000→200 Hz polyphase → 10 秒无重叠窗口 → window 硬 QC → 坏道置零 → x/200 clip[-1,1]。没有重参考、ICA、插值、padding、split 或模型 token。\n\nsub-230 的 60 秒 EyesClosed/pre recording 在完整读取与硬 QC 通过时保留并产生 6 窗。sub-600 的 duration 冲突以 EDF 实际可读样本为准，只记录 metadata warning，不补零。\n\n## 验收\n\n- Lance round-trip：{summary["roundtrip"]["all_rows_valid"]}\n- Lance 行数=window_inventory QC pass=summary written_windows：{summary["lance_row_count_matches_qc_pass"]}\n- 原始文件大小/mtime 未改变：{summary["source_files_unchanged"]}\n- blocking errors：{summary["blocking_error_count"]}；warnings：{summary["warning_count"]}\n'''
 
 
 def write_empty_outputs(output_dir: Path) -> None:
@@ -782,6 +915,8 @@ def run_synthetic_smoke(args: argparse.Namespace) -> dict[str, Any]:
     write_empty_outputs(args.output_dir)
     config = load_and_validate_config(args.config); pre = config["preprocessing"]
     schema = dortmund_lance_schema(); lance_path = args.output_dir / "dataset.lance"
+    cohort_id = build_cohort_id(args.min_age, args.max_age, args.cohort_id)
+    dataset_id = build_dataset_id(cohort_id)
     rng = np.random.default_rng(385)
     rows = []
     subject_rows: list[dict[str, Any]] = []
@@ -789,7 +924,12 @@ def run_synthetic_smoke(args: argparse.Namespace) -> dict[str, Any]:
     processing_rows: list[dict[str, Any]] = []
     window_rows: list[dict[str, Any]] = []
     tail_rows: list[dict[str, Any]] = []
-    subjects = [("sub-synth001", 24), ("sub-230", 30), ("sub-600", 35)]
+    midpoint_age = (args.min_age + args.max_age) // 2
+    subjects = [
+        ("sub-synth001", args.min_age),
+        ("sub-230", midpoint_age),
+        ("sub-600", args.max_age),
+    ]
     for subject_id, age in subjects:
         subject_rows.append({"subject_id": subject_id, "age": age, "label": age, "age_dtype": "integer", "age_unit": "year", "age_scope": "baseline/ses-1", "age_status": "valid_numeric_baseline", "sex": "synthetic", "handedness": "synthetic", "selected_profile": "A", "recording_count": 2, "eligible": True})
         for condition in ("eyes_open", "eyes_closed"):
@@ -810,17 +950,19 @@ def run_synthetic_smoke(args: argparse.Namespace) -> dict[str, Any]:
             processing_rows.append({"subject_id": subject_id, "recording_id": recording_id, "source_path": f"synthetic/{subject_id}/{condition}.edf", "eyes_condition": condition, "run_mode": "synthetic_smoke", "source_samples": 31000, "source_duration_seconds": 31.0, "resampled_samples": filtered.shape[1], "theoretical_complete_windows": len(possible), "emitted_windows": len(slices), "written_windows": len(slices), "smoke_truncated_windows": len(possible) - len(slices), "real_dropped_tail_samples": tail_samples, "real_dropped_tail_seconds": tail_seconds, "recording_bad_channels": "", "qc_pass_windows": len(slices), "qc_fail_windows": 0, "mean_clip_fraction": 0.0, "max_clip_fraction": 0.0, "processing_success": True, "error": ""})
             tail_rows.append({"subject_id": subject_id, "recording_id": recording_id, "source_path": f"synthetic/{subject_id}/{condition}.edf", "source_samples": 31000, "resampled_samples": filtered.shape[1], "theoretical_complete_windows": len(possible), "emitted_windows": len(slices), "smoke_truncated_windows": len(possible) - len(slices), "real_dropped_tail_samples": tail_samples, "real_dropped_tail_seconds": tail_seconds})
     _write_lance_batch(lance_path, rows, True, schema)
-    roundtrip = validate_dortmund_lance(lance_path, len(rows))
+    roundtrip = validate_dortmund_lance(
+        lance_path, len(rows), args.min_age, args.max_age
+    )
     _write_csv(args.output_dir / "subject_manifest.csv", subject_rows, CSV_FIELDS["subject_manifest.csv"])
     _write_csv(args.output_dir / "recording_manifest.csv", recording_rows, CSV_FIELDS["recording_manifest.csv"])
     _write_csv(args.output_dir / "recording_processing_summary.csv", processing_rows, CSV_FIELDS["recording_processing_summary.csv"])
     _write_csv(args.output_dir / "window_inventory.csv", window_rows, CSV_FIELDS["window_inventory.csv"])
     _write_csv(args.output_dir / "dropped_tails.csv", tail_rows, CSV_FIELDS["dropped_tails.csv"])
-    summary = {"synthetic": True, "smoke": True, "selected_subject_count": 3, "selected_recordings": 6, "theoretical_complete_windows": sum(r["theoretical_complete_windows"] for r in processing_rows), "emitted_windows": len(rows), "written_windows": len(rows), "smoke_truncated_windows": sum(r["smoke_truncated_windows"] for r in processing_rows), "real_dropped_tail_seconds": sum(r["real_dropped_tail_seconds"] for r in processing_rows), "window_inventory_qc_pass": sum(r["qc_pass"] for r in window_rows), "source_files_unchanged": True, "roundtrip": roundtrip, "formal_dortmund_data_processed_locally": False}
+    summary = {"synthetic": True, "smoke": True, "cohort_id": cohort_id, "dataset_id": dataset_id, "configured_min_age": args.min_age, "configured_max_age": args.max_age, "selected_subject_count": 3, "selected_recordings": 6, "theoretical_complete_windows": sum(r["theoretical_complete_windows"] for r in processing_rows), "emitted_windows": len(rows), "written_windows": len(rows), "smoke_truncated_windows": sum(r["smoke_truncated_windows"] for r in processing_rows), "real_dropped_tail_seconds": sum(r["real_dropped_tail_seconds"] for r in processing_rows), "window_inventory_qc_pass": sum(r["qc_pass"] for r in window_rows), "source_files_unchanged": True, "roundtrip": roundtrip, "formal_dortmund_data_processed_locally": False}
     (args.output_dir / "preprocessing_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (args.output_dir / "processing_provenance.json").write_text(json.dumps({"run_mode": "synthetic_smoke", "source_uri": None, "resolved_local_data_dir": str(args.data_dir.resolve()), "formal_data_opened": False, "actual_processing_order": ["notch", "bandpass", "resample", "window", "normalize"], "created_at": now_iso()}, indent=2) + "\n", encoding="utf-8")
+    (args.output_dir / "processing_provenance.json").write_text(json.dumps({"run_mode": "synthetic_smoke", "cohort_id": cohort_id, "dataset_id": dataset_id, "min_age": args.min_age, "max_age": args.max_age, "source_uri": None, "resolved_local_data_dir": str(args.data_dir.resolve()), "formal_data_opened": False, "actual_processing_order": ["notch", "bandpass", "resample", "window", "normalize"], "created_at": now_iso()}, indent=2) + "\n", encoding="utf-8")
     (args.output_dir / "resolved_config.toml").write_text(Path(args.config).read_text(encoding="utf-8"), encoding="utf-8")
-    (args.output_dir / "metadata.toml").write_text(f'spec_version = "0.1.0"\nprofile = "base"\ndataset_id = "{DATASET_ID}"\ntask_type = "regression"\n', encoding="utf-8")
+    (args.output_dir / "metadata.toml").write_text(f'spec_version = "0.1.0"\nprofile = "base"\ndataset_id = "{dataset_id}"\ncohort_id = "{cohort_id}"\nmin_age = {args.min_age}\nmax_age = {args.max_age}\ntask_type = "regression"\n', encoding="utf-8")
     (args.output_dir / "versions.toml").write_text(f'script_version = "{SCRIPT_VERSION}"\n', encoding="utf-8")
     (args.output_dir / "description.toml").write_text('description = "synthetic smoke only"\n', encoding="utf-8")
     (args.output_dir / "preprocessing_report.md").write_text("# Dortmund synthetic smoke\n\n正式 Dortmund EDF 未在本地打开。Lance round-trip 通过。\n", encoding="utf-8")
@@ -837,8 +979,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-uri", default=os.environ.get("DORTMUND_SOURCE_URI", DEFAULT_SOURCE_URI))
     parser.add_argument("--chunk-seconds", type=float, default=30.0)
-    parser.add_argument("--expected-subjects", type=int, default=PROFILE_A_SUBJECTS)
-    parser.add_argument("--expected-recordings", type=int, default=PROFILE_A_RECORDINGS)
+    parser.add_argument("--min-age", type=int, default=20)
+    parser.add_argument("--max-age", type=int, default=35)
+    parser.add_argument("--cohort-id", default=None)
+    parser.add_argument("--expected-subjects", type=int, default=None)
+    parser.add_argument("--expected-recordings", type=int, default=None)
+    parser.add_argument("--inventory-only", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--smoke-subjects", nargs="+", default=None)
     parser.add_argument("--smoke-max-windows-per-recording", type=int, default=None)
@@ -847,6 +993,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     tokens = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(tokens)
     if args.chunk_seconds <= 0: parser.error("--chunk-seconds must be >0")
+    if args.min_age < 0 or args.max_age < args.min_age:
+        parser.error("require 0 <= --min-age <= --max-age")
+    try:
+        args.cohort_id = build_cohort_id(args.min_age, args.max_age, args.cohort_id)
+    except ValueError as exc:
+        parser.error(str(exc))
+    default_cohort = args.min_age == 20 and args.max_age == 35
+    if args.expected_subjects is None and default_cohort:
+        args.expected_subjects = PROFILE_A_SUBJECTS
+    if args.expected_recordings is None and default_cohort:
+        args.expected_recordings = PROFILE_A_RECORDINGS
+    if not (args.smoke or args.synthetic_smoke or args.inventory_only):
+        if args.expected_subjects is None:
+            parser.error("--expected-subjects is required for a non-default age range")
+        if args.expected_recordings is None:
+            parser.error("--expected-recordings is required for a non-default age range")
+    if args.expected_subjects is not None and args.expected_subjects <= 0:
+        parser.error("--expected-subjects must be >0")
+    if args.expected_recordings is not None and args.expected_recordings <= 0:
+        parser.error("--expected-recordings must be >0")
+    if args.inventory_only and (args.smoke or args.synthetic_smoke):
+        parser.error("--inventory-only cannot be combined with smoke modes")
     if args.synthetic_smoke:
         args.smoke = True
     if args.smoke:
@@ -870,8 +1038,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         else:
             _prepare_output_dir(args.output_dir, args.overwrite, args.data_dir)
             pipeline = DortmundPipeline(args)
-            pipeline.run()
-            summary = json.loads((args.output_dir / "preprocessing_summary.json").read_text(encoding="utf-8"))
+            if args.inventory_only:
+                summary = pipeline.run_inventory()
+            else:
+                pipeline.run()
+                summary = json.loads((args.output_dir / "preprocessing_summary.json").read_text(encoding="utf-8"))
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
         return 0 if summary.get("blocking_error_count", 0) == 0 and summary.get("source_files_unchanged", True) else 2
     except Exception:

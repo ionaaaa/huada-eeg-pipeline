@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import csv
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -82,6 +84,27 @@ def write_synthetic_edf_header(path: Path) -> None:
     path.write_bytes(fixed + signal_header)
 
 
+def write_inventory_fixture(root: Path) -> None:
+    (root / "participants.tsv").write_text(
+        "participant_id\tage\tsex\thandedness\n"
+        "sub-001\t25\tM\tR\n"
+        "sub-040\t40\tF\tL\n",
+        encoding="utf-8",
+    )
+    for subject in ("sub-001", "sub-040"):
+        eeg_dir = root / subject / "ses-1" / "eeg"
+        eeg_dir.mkdir(parents=True)
+        for task in ("EyesOpen", "EyesClosed"):
+            prefix = f"{subject}_ses-1_task-{task}_acq-pre"
+            (eeg_dir / f"{prefix}_eeg.edf").write_bytes(b"not-opened-in-inventory")
+            (eeg_dir / f"{prefix}_eeg.json").write_text(
+                json.dumps({"TaskName": "RestingState"}), encoding="utf-8"
+            )
+            (eeg_dir / f"{prefix}_channels.tsv").write_text(
+                "name\ttype\tunits\n", encoding="utf-8"
+            )
+
+
 def test_profile_a_selects_only_ses1_pre():
     assert dortmund.profile_a_decision({"session": "ses-1", "acquisition": "pre", "task": "EyesOpen"}, {"TaskName": "RestingState"}) == (True, "selected_profile_a")
 
@@ -121,6 +144,83 @@ def test_numeric_age_reading(value, expected):
 def test_invalid_age_rejected(value):
     with pytest.raises(ValueError):
         dortmund.parse_numeric_age(value)
+
+
+def test_configured_age_range_accepts_expanded_cohort():
+    assert dortmund.parse_numeric_age(40, 20, 44) == 40
+    assert dortmund.build_cohort_id(20, 44) == "age20_44_ses1_pre_profile_a"
+    assert dortmund.build_dataset_id("age20_44_ses1_pre_profile_a") == (
+        "ds005385_dortmund_age20_44_ses1_pre_profile_a"
+    )
+
+
+def test_nondefault_full_requires_explicit_count_gates(tmp_path):
+    with pytest.raises(SystemExit):
+        dortmund.parse_args([
+            "--data-dir", str(tmp_path), "--config", str(tmp_path / "c.toml"),
+            "--output-dir", str(tmp_path / "out"), "--min-age", "20",
+            "--max-age", "44",
+        ])
+
+
+def test_default_cli_preserves_20_35_and_214_428(tmp_path):
+    args = dortmund.parse_args([
+        "--data-dir", str(tmp_path), "--config", str(tmp_path / "c.toml"),
+        "--output-dir", str(tmp_path / "out"),
+    ])
+    assert (args.min_age, args.max_age) == (20, 35)
+    assert (args.expected_subjects, args.expected_recordings) == (214, 428)
+    assert args.cohort_id == "age20_35_ses1_pre_profile_a"
+
+
+def test_inventory_only_excludes_out_of_scope_before_edf_open(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    write_inventory_fixture(data)
+    output = tmp_path / "inventory"
+    config = Path(__file__).resolve().parents[1] / "configs" / "huada_resting_preprocessing.toml"
+
+    def forbidden_edf_open(*args, **kwargs):
+        raise AssertionError("inventory-only must not open EDF signals")
+
+    monkeypatch.setattr(dortmund.mne.io, "read_raw_edf", forbidden_edf_open)
+    result = dortmund.main([
+        "--data-dir", str(data), "--config", str(config),
+        "--output-dir", str(output), "--inventory-only",
+        "--min-age", "20", "--max-age", "35",
+    ])
+    assert result == 0
+    summary = json.loads((output / "inventory_summary.json").read_text(encoding="utf-8"))
+    assert summary["eligible_subject_count"] == 1
+    assert summary["eligible_recording_count"] == 2
+    assert summary["edf_signal_opened"] is False
+    with (output / "excluded_subjects.csv").open(encoding="utf-8-sig", newline="") as handle:
+        excluded = list(csv.DictReader(handle))
+    assert excluded[0]["subject_id"] == "sub-040"
+    assert excluded[0]["exclusion_reason"] == "excluded_age_out_of_scope"
+    assert not (output / "dataset.lance").exists()
+    assert {path.name for path in output.iterdir()} == {
+        "candidate_subjects.csv", "eligible_subjects.csv", "eligible_recordings.csv",
+        "excluded_subjects.csv", "inventory_summary.json",
+    }
+
+
+def test_inventory_only_expanded_range_discovers_new_subjects(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    write_inventory_fixture(data)
+    output = tmp_path / "inventory"
+    config = Path(__file__).resolve().parents[1] / "configs" / "huada_resting_preprocessing.toml"
+    assert dortmund.main([
+        "--data-dir", str(data), "--config", str(config),
+        "--output-dir", str(output), "--inventory-only",
+        "--min-age", "20", "--max-age", "44",
+        "--cohort-id", "age20_44_ses1_pre_profile_a",
+    ]) == 0
+    summary = json.loads((output / "inventory_summary.json").read_text(encoding="utf-8"))
+    assert summary["eligible_subject_count"] == 2
+    assert summary["eligible_recording_count"] == 4
+    assert summary["dataset_id"] == "ds005385_dortmund_age20_44_ses1_pre_profile_a"
 
 
 def test_age_and_label_equal_in_schema_row():
@@ -258,6 +358,15 @@ def test_lance_roundtrip(tmp_path):
     assert result["all_rows_valid"] and result["sample_id_unique"]
 
 
+def test_lance_roundtrip_uses_configured_age_range(tmp_path):
+    path = tmp_path / "dataset.lance"
+    _write_lance_batch(path, [cache_row(age=40)], True, dortmund.dortmund_lance_schema())
+    with pytest.raises(AssertionError, match="Invalid Lance row"):
+        dortmund.validate_dortmund_lance(path, 1)
+    result = dortmund.validate_dortmund_lance(path, 1, 20, 44)
+    assert result["all_rows_valid"]
+
+
 def test_regression_label_schema_and_no_split_or_tokens():
     schema = dortmund.dortmund_lance_schema()
     assert schema.field("label").type == pa.float32() and schema.field("age").type == pa.float32()
@@ -318,3 +427,15 @@ def test_tione_shell_entry_is_read_only_and_scoped(name, smoke_expected):
     assert "preprocess_dortmund_age_windows.py" in text
     assert "coscli" not in text and " rm " not in text and "--overwrite" not in text
     assert ("--smoke" in text) is smoke_expected
+
+
+def test_full_shell_supports_dynamic_cohort_environment():
+    text = (Path(__file__).resolve().parents[1] / "commands" / "run_dortmund_age_preprocessing_full.sh").read_text(encoding="utf-8")
+    for name in (
+        "DORTMUND_MIN_AGE", "DORTMUND_MAX_AGE", "DORTMUND_EXPECTED_SUBJECTS",
+        "DORTMUND_EXPECTED_RECORDINGS", "DORTMUND_COHORT_ID", "DORTMUND_OUTPUT_DIR",
+    ):
+        assert name in text
+    assert '--min-age "$DORTMUND_MIN_AGE"' in text
+    assert '--max-age "$DORTMUND_MAX_AGE"' in text
+    assert '--cohort-id "$DORTMUND_COHORT_ID"' in text
