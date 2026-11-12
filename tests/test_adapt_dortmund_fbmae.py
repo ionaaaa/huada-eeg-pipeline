@@ -58,10 +58,10 @@ def common_row(subject="sub-020", age=20.0, condition="eyes_open", window=0, bad
     }
 
 
-def write_input_fixture(root: Path, windows=2) -> tuple[Path, list[dict]]:
+def write_input_fixture(root: Path, windows=2, subjects=None) -> tuple[Path, list[dict]]:
     root.mkdir()
     rows = []
-    subjects = [("sub-020", 20.0, "female"), ("sub-270", 27.0, "male"), ("sub-350", 35.0, "female")]
+    subjects = subjects or [("sub-020", 20.0, "female"), ("sub-270", 27.0, "male"), ("sub-350", 35.0, "female")]
     for subject, age, _ in subjects:
         for condition in ("eyes_open", "eyes_closed"):
             for window in range(windows):
@@ -161,6 +161,16 @@ def test_eo_ec_remain_separate_and_smoke_selection_limits_each_recording():
         adapter.choose_smoke_indices(rows, ["sub-does-not-exist"], 2)
 
 
+def test_expanded_cohort_auto_smoke_uses_dynamic_age_anchors():
+    rows = []
+    for subject, age in (("sub-360", 36), ("sub-400", 40), ("sub-440", 44)):
+        rows.extend(common_row(subject, age, condition, 0) for condition in ("eyes_open", "eyes_closed"))
+    indices, detail = adapter.choose_smoke_indices(rows, [], 1, 36, 44)
+    selected_subjects = {rows[index]["subject_id"] for index in indices}
+    assert selected_subjects == {"sub-360", "sub-400", "sub-440"}
+    assert detail["subjects"] == ["sub-360", "sub-400", "sub-440"]
+
+
 def test_huada_default_path_has_no_regression_from_channel_parameterization():
     source = {
         "sample_id": "SUB1__r__w000", "subject_id": "SUB1", "source_path": "x.bdf",
@@ -210,6 +220,52 @@ def test_end_to_end_fixture_smoke_audits_roundtrip_loader_and_source_protection(
     assert adapter.REQUIRED_OUTPUTS.issubset({item.name for item in output.iterdir()})
 
 
+def test_expanded_age_cohort_end_to_end(tmp_path):
+    input_dir = tmp_path / "input"
+    subjects = [
+        ("sub-360", 36.0, "female"),
+        ("sub-400", 40.0, "male"),
+        ("sub-440", 44.0, "female"),
+    ]
+    lance_path, _ = write_input_fixture(input_dir, windows=1, subjects=subjects)
+    output = tmp_path / "output"
+    code = adapter.main([
+        "--input-lance", str(lance_path), "--input-dir", str(input_dir),
+        "--output-dir", str(output), "--source-uri", "cos://fixture/dortmund/",
+        "--channel-profile", str(PROFILE), "--electrode-vocab", str(VOCAB),
+        "--min-age", "36", "--max-age", "44",
+        "--cohort-id", "age36_44_ses1_pre_profile_a",
+        "--expected-subjects", "3", "--expected-recordings", "6",
+        "--batch-size", "2",
+    ])
+    assert code == 0
+    summary = json.loads((output / "adapter_summary.json").read_text(encoding="utf-8"))
+    assert summary["cohort_id"] == "age36_44_ses1_pre_profile_a"
+    assert summary["configured_min_age"] == 36
+    assert summary["configured_max_age"] == 44
+    assert summary["input"]["age_min"] == 36
+    assert summary["input"]["age_max"] == 44
+    assert summary["adapter_ready"] is True
+
+
+def test_adapter_cli_default_cohort_is_backward_compatible(tmp_path):
+    args = adapter.parse_args([
+        "--input-dir", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+        "--source-uri", "cos://fixture/",
+    ])
+    assert (args.min_age, args.max_age) == (20, 35)
+    assert (args.expected_subjects, args.expected_recordings) == (214, 428)
+    assert args.cohort_id == "age20_35_ses1_pre_profile_a"
+
+
+def test_adapter_nondefault_cohort_requires_explicit_count_gates(tmp_path):
+    with pytest.raises(SystemExit):
+        adapter.parse_args([
+            "--input-dir", str(tmp_path), "--output-dir", str(tmp_path / "out"),
+            "--source-uri", "cos://fixture/", "--min-age", "20", "--max-age", "44",
+        ])
+
+
 def test_batch_size_does_not_change_selected_token_rows(tmp_path):
     input_dir = tmp_path / "input"
     lance_path, _ = write_input_fixture(input_dir, windows=1)
@@ -250,3 +306,22 @@ def test_auto_discovery_fails_closed_on_multiple_formal_lance_datasets(tmp_path)
     shutil.copytree(first, second)
     with pytest.raises(RuntimeError, match="exactly one"):
         adapter.discover_input_lance(tmp_path)
+
+
+@pytest.mark.parametrize("name", [
+    "run_dortmund_fbmae_adapter_full.sh",
+    "run_dortmund_fbmae_adapter_smoke.sh",
+])
+def test_adapter_shell_entries_support_dynamic_cohort(name):
+    text = (ROOT / "commands" / name).read_text(encoding="utf-8")
+    for variable in (
+        "DORTMUND_MIN_AGE", "DORTMUND_MAX_AGE", "DORTMUND_COHORT_ID",
+        "DORTMUND_EXPECTED_SUBJECTS", "DORTMUND_EXPECTED_RECORDINGS",
+        "DORTMUND_COMMON_LANCE",
+    ):
+        assert variable in text
+    assert '--min-age "${DORTMUND_MIN_AGE}"' in text
+    assert '--max-age "${DORTMUND_MAX_AGE}"' in text
+    assert '--cohort-id "${DORTMUND_COHORT_ID}"' in text
+    assert '--expected-subjects "${DORTMUND_EXPECTED_SUBJECTS}"' in text
+    assert '--expected-recordings "${DORTMUND_EXPECTED_RECORDINGS}"' in text

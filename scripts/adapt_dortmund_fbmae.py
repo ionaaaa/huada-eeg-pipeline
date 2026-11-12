@@ -36,11 +36,12 @@ from preprocess_dortmund_age_windows import (
     DORTMUND_CHANNELS,
     PROFILE_A_RECORDINGS,
     PROFILE_A_SUBJECTS,
+    build_cohort_id,
     dortmund_lance_schema,
 )
 
 
-VERSION = "dortmund-fbmae-adapter-v1"
+VERSION = "dortmund-fbmae-adapter-v1.1"
 REQUIRED_OUTPUTS = {
     "adapter_report.md", "adapter_summary.json", "processing_provenance.json",
     "resolved_config.json", "input_dataset_audit.json", "input_schema.json",
@@ -151,6 +152,8 @@ def choose_smoke_indices(
     metadata: Sequence[dict[str, Any]],
     requested_subjects: Sequence[str],
     max_windows_per_recording: int,
+    min_age: int = 20,
+    max_age: int = 35,
 ) -> tuple[list[int], dict[str, Any]]:
     if max_windows_per_recording <= 0:
         raise ValueError("--smoke-max-windows-per-recording must be positive")
@@ -162,7 +165,8 @@ def choose_smoke_indices(
         # Deterministic age representatives; include known edge cases when present.
         chosen = [subject for subject in ("sub-230", "sub-600") if subject in by_subject]
         subject_age = {subject: float(rows[0][1]["age"]) for subject, rows in by_subject.items()}
-        for target in (20.0, 27.0, 35.0):
+        midpoint = (float(min_age) + float(max_age)) / 2.0
+        for target in (float(min_age), midpoint, float(max_age)):
             candidate = min(subject_age, key=lambda subject: (abs(subject_age[subject] - target), subject))
             if candidate not in chosen:
                 chosen.append(candidate)
@@ -197,6 +201,8 @@ def audit_input(
     data_indices: Sequence[int] | None,
     expected_subjects: int,
     expected_recordings: int,
+    min_age: int = 20,
+    max_age: int = 35,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, str]], list[dict[str, Any]]]:
     issues: list[dict[str, Any]] = []
 
@@ -256,7 +262,7 @@ def audit_input(
             issue("error", "duration", str(row.get("duration")), sample_id, sid)
         age = float(row["age"])
         label = float(row["label"])
-        if not 20 <= age <= 35 or age != label:
+        if not min_age <= age <= max_age or age != label:
             issue("error", "age_label", f"age={age} label={label}", sample_id, sid)
         masks = np.asarray(row["channel_mask"], dtype=bool)
         bad = np.asarray(row["bad_channel_mask"], dtype=bool)
@@ -330,6 +336,9 @@ def audit_input(
     audit = {
         "status": "passed" if not hard_errors and data_indices is None else "passed_smoke_scope" if not hard_errors else "failed",
         "data_validation_scope": "all_rows" if data_indices is None else "selected_smoke_rows",
+        "configured_min_age": min_age, "configured_max_age": max_age,
+        "expected_subject_count": expected_subjects,
+        "expected_recording_count": expected_recordings,
         "schema_matches": dataset.schema == expected_schema,
         "row_count": len(metadata), "subject_count": len(subject_rows), "recording_count": len(recording_rows),
         "sample_id_unique": len(sample_ids) == len(set(sample_ids)), "age_min": min(float(row["age"]) for row in metadata),
@@ -597,6 +606,9 @@ def finalize_reports(
         "# Dortmund → 50M FBMAE adapter report", "",
         f"- adapter_ready: {summary.get('adapter_ready')}",
         f"- run_success: {summary.get('run_success')}",
+        f"- cohort_id: `{summary.get('cohort_id')}`",
+        f"- configured age range: {summary.get('configured_min_age')}–{summary.get('configured_max_age')}",
+        f"- expected subjects/recordings: {summary.get('expected_subject_count')}/{summary.get('expected_recording_count')}",
         f"- actual input: `{provenance.get('actual_input_local_path', 'not_resolved')}`",
         f"- source URI: `{provenance.get('source_uri')}`",
         f"- input data fingerprint: `{provenance.get('input_data_fingerprint_sha256')}` ({provenance.get('input_data_fingerprint_scope')})",
@@ -635,9 +647,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smoke-max-windows-per-recording", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--expected-subjects", type=int, default=PROFILE_A_SUBJECTS)
-    parser.add_argument("--expected-recordings", type=int, default=PROFILE_A_RECORDINGS)
-    return parser.parse_args(argv)
+    parser.add_argument("--min-age", type=int, default=20)
+    parser.add_argument("--max-age", type=int, default=35)
+    parser.add_argument("--cohort-id", default=None)
+    parser.add_argument("--expected-subjects", type=int, default=None)
+    parser.add_argument("--expected-recordings", type=int, default=None)
+    args = parser.parse_args(argv)
+    if args.min_age < 0 or args.max_age < args.min_age:
+        parser.error("require 0 <= --min-age <= --max-age")
+    try:
+        args.cohort_id = build_cohort_id(args.min_age, args.max_age, args.cohort_id)
+    except ValueError as exc:
+        parser.error(str(exc))
+    default_cohort = args.min_age == 20 and args.max_age == 35
+    if args.expected_subjects is None and default_cohort:
+        args.expected_subjects = PROFILE_A_SUBJECTS
+    if args.expected_recordings is None and default_cohort:
+        args.expected_recordings = PROFILE_A_RECORDINGS
+    if args.expected_subjects is None:
+        parser.error("--expected-subjects is required for a non-default age range")
+    if args.expected_recordings is None:
+        parser.error("--expected-recordings is required for a non-default age range")
+    if args.expected_subjects <= 0:
+        parser.error("--expected-subjects must be >0")
+    if args.expected_recordings <= 0:
+        parser.error("--expected-recordings must be >0")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -663,11 +698,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     input_lance: Path | None = None
     source_before: dict[str, Any] = {}
     source_after: dict[str, Any] = {}
-    summary: dict[str, Any] = {"adapter_ready": False, "smoke_passed": False, "run_success": False, "blocked_by_channel_mapping": False, "stages": {"input_audit": "not_performed", "channel_semantic_audit": "not_performed", "token_smoke": "not_performed", "full_conversion": "not_performed", "model_forward_smoke": "not_performed", "downstream_training": "not_performed"}}
+    summary: dict[str, Any] = {"adapter_ready": False, "smoke_passed": False, "run_success": False, "blocked_by_channel_mapping": False, "cohort_id": args.cohort_id, "configured_min_age": args.min_age, "configured_max_age": args.max_age, "expected_subject_count": args.expected_subjects, "expected_recording_count": args.expected_recordings, "stages": {"input_audit": "not_performed", "channel_semantic_audit": "not_performed", "token_smoke": "not_performed", "full_conversion": "not_performed", "model_forward_smoke": "not_performed", "downstream_training": "not_performed"}}
     resolved_config = vars(args).copy()
     resolved_config = {key: str(value) if isinstance(value, Path) else value for key, value in resolved_config.items()}
     provenance: dict[str, Any] = {
         "version": VERSION, "created_at": now_iso(), "source_uri": args.source_uri,
+        "cohort_id": args.cohort_id, "min_age": args.min_age, "max_age": args.max_age,
+        "expected_subjects": args.expected_subjects, "expected_recordings": args.expected_recordings,
         "git": git_metadata(project_root), "rereference_applied": False, "processing_reference": "unchanged",
         "source_reference": "FCz", "ground": "AFz", "reference_channel_present_in_data": False,
         "full_conversion_performed": False, "model_forward_smoke": "not_performed",
@@ -701,11 +738,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         smoke_selection = None
         if args.smoke:
             smoke_indices, smoke_selection = choose_smoke_indices(
-                metadata_preview, parse_smoke_subjects(args.smoke_subjects), args.smoke_max_windows_per_recording
+                metadata_preview, parse_smoke_subjects(args.smoke_subjects),
+                args.smoke_max_windows_per_recording, args.min_age, args.max_age
             )
         audit, metadata, subject_rows, recording_rows, ages, subject_sidecar, input_issues = audit_input(
             dataset, input_dir, inspected, smoke_indices,
             args.expected_subjects, args.expected_recordings,
+            args.min_age, args.max_age,
         )
         write_stage_outputs(temp, input_audit=audit, schema=dataset.schema, subject_summary=subject_rows, recording_summary=recording_rows, age_distribution=ages, input_issues=input_issues)
         adaptation_issues.extend(input_issues)

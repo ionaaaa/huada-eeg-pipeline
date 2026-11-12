@@ -486,19 +486,49 @@ bash commands/run\_dortmund\_age\_preprocessing\_smoke.sh
 
 #### Dortmund 原样命令 2：年龄正式预处理（没有做FBMAE适配）
 
-- 任务：`train-1709336860913960704`
+先inspect得到sub和recording数量 
+
+`train-1715953296965643008`
+```bash
+set -euo pipefail
+
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
+export DORTMUND_DATA_DIR="/opt/ml/cos_input/data/Dortmund_Vital_Study"
+export DORTMUND_SOURCE_URI="/opt/ml/cos_input/data/Dortmund_Vital_Study"
+export TIONE_OUTPUT_ROOT="/opt/ml/cfs_input/data/preprocess_common"
+
+
+cd "$HUADA_ROOT"
+python scripts/preprocess_dortmund_age_windows.py \
+  --data-dir "$DORTMUND_DATA_DIR" \
+  --config configs/huada_resting_preprocessing.toml \
+  --output-dir "/opt/ml/cos_input/preprocessing_audit/dortmund_inventory_age20_44_$(date -u +%Y%m%d_%H%M%S)" \
+  --min-age 20 \
+  --max-age 44 \
+  --cohort-id age20_44_ses1_pre_profile_a \
+  --inventory-only
+```
+
+
+- 正式跑，任务：`train-1715957096208149248`
 
 ```bash
 set -euo pipefail
 
-export HUADA\_ROOT="/opt/ml/cfs\_input"
-export PYTHON\_BIN="python"
-export DORTMUND\_DATA\_DIR="/opt/ml/cos\_input/data/Dortmund\_Vital\_Study"
-export DORTMUND\_SOURCE\_URI="/opt/ml/cos\_input/data/Dortmund\_Vital\_Study"
-export TIONE\_OUTPUT\_ROOT="/opt/ml/cfs\_input/data/preprocess\_common"
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
+export DORTMUND_DATA_DIR="/opt/ml/cos_input/data/Dortmund_Vital_Study"
+export DORTMUND_SOURCE_URI="/opt/ml/cos_input/data/Dortmund_Vital_Study"
+export TIONE_OUTPUT_ROOT="/opt/ml/cfs_input/data/preprocess_common"
+export DORTMUND_MIN_AGE=20
+export DORTMUND_MAX_AGE=44
+export DORTMUND_EXPECTED_SUBJECTS=291
+export DORTMUND_EXPECTED_RECORDINGS=582
+export DORTMUND_COHORT_ID="age20_44_ses1_pre_profile_a"
 
-cd "$HUADA\_ROOT"
-bash commands/run\_dortmund\_age\_preprocessing\_full.sh
+cd "$HUADA_ROOT"
+bash commands/run_dortmund_age_preprocessing_full.sh
 ```
 
 #### Dortmund 原样命令 3：把少量“公共预处理窗口”转换成 FBMAE 可以直接读取的 token 格式。
