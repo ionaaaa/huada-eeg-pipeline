@@ -6,7 +6,7 @@ data/
 # 处理产物
 preprocessed_common/
 preprocessed_common_smoke/
-
+audit_mipdb_age/
 audit_resting_state/
 audit_dortmund_age/
 audit_tdbrain_age_sample/
@@ -15,6 +15,7 @@ downstream_output/
 model_tokens/
 model_tokens_smoke/
 downstream_smoke/
+mipdb_preprocessing_smoke/
 synthetic_smoke_dortmund/
 *.lance/
 *.lance

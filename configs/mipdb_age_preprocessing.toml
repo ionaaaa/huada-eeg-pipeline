@@ -1,0 +1,35 @@
+[preprocessing]
+target_sfreq = 200.0
+window_seconds = 10.0
+hop_seconds = 10.0
+segment_samples = 2000
+
+bandpass_low = 0.3
+bandpass_high = 75.0
+notch_hz = 60.0
+
+unit_before_normalization = "uV"
+normalization = "clip_divide_200"
+normalization_detail = "x_uV / 200, then clip to [-1, 1]"
+
+[windowing]
+drop_incomplete_tail = true
+padding = false
+
+[source_expectations]
+format = "BrainVision"
+sampling_rate_hz = 500.0
+n_eeg_channels = 128
+core_channel_first = "E1"
+core_channel_last = "E128"
+reference = "unknown/unchanged"
+
+[line_frequency]
+decision = "sampled_psd"
+sidecar_status = "PowerLineFrequency is n/a in inspected MIPDB v1.0.2 sidecars"
+selected_hz = 60.0
+psd_method = "Welch, 120 s or full shorter recording, 0.1 Hz resolution; narrow-band power divided by local neighboring median"
+psd_sample_recordings = 5
+aggregate_50hz_median_ratio = 1.0464122209786324
+aggregate_60hz_median_ratio = 63.33607939233325
+evidence_date = "2026-11-13"

@@ -464,15 +464,14 @@ def rows_to_arrow(rows: list[dict[str, Any]], schema: pa.Schema | None = None) -
     columns: dict[str, pa.Array] = {}
     for field in schema:
         values = [row[field.name] for row in rows]
-        if field.name == "data":
-            flat = np.concatenate([np.asarray(v, dtype=np.float32).reshape(-1) for v in values])
-            columns[field.name] = pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.float32()), 128000)
-        elif field.name in {"channel_mask", "bad_channel_mask"}:
-            flat = np.concatenate([np.asarray(v, dtype=bool).reshape(-1) for v in values])
-            columns[field.name] = pa.FixedSizeListArray.from_arrays(pa.array(flat, type=pa.bool_()), 64)
-        elif field.name in {"channel_names", "channel_status"} and pa.types.is_fixed_size_list(field.type):
-            flat = [item for value in values for item in value]
-            columns[field.name] = pa.FixedSizeListArray.from_arrays(pa.array(flat, type=field.type.value_type), 64)
+        if pa.types.is_fixed_size_list(field.type):
+            list_size = field.type.list_size
+            flat_values = [item for value in values for item in np.asarray(value).reshape(-1).tolist()]
+            if any(len(np.asarray(value).reshape(-1)) != list_size for value in values):
+                raise ValueError(f"Fixed-size list field {field.name} does not match list_size={list_size}")
+            columns[field.name] = pa.FixedSizeListArray.from_arrays(
+                pa.array(flat_values, type=field.type.value_type), list_size
+            )
         else:
             columns[field.name] = pa.array(values, type=field.type)
     return pa.Table.from_arrays([columns[field.name] for field in schema], schema=schema)
