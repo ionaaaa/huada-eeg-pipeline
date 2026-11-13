@@ -149,22 +149,31 @@ def test_training_profiles_mask_dortmund_and_mipdb_without_new_geometry():
     inputs = np.ones((640, 100), np.float32)
     targets = np.ones((640, 5, 5), np.float32)
     native64 = np.ones(64, bool)
+    matched_profile = training_profiles.resolve_training_profile(
+        profiles, "dortmund_matched18", "dortmund"
+    )
     matched = training_profiles.apply_training_profile(
-        token_inputs=inputs, targets=targets, channel_valid_mask=native64,
-        profiles=profiles, profile_name="matched18", dataset_name="dortmund",
+        inputs, np.ones(640, bool), "dortmund", matched_profile,
+        targets=targets, channel_valid_mask=native64,
     )
     assert matched["channel_valid_mask"].sum() == 18
     assert matched["token_valid_mask"].sum() == 180
     assert np.all(matched["token_inputs"][matched["token_valid_mask"] == 0] == 0)
+    sensitivity_profile = training_profiles.resolve_training_profile(
+        profiles, "joint_native64_vs_sparse18", "dortmund"
+    )
     sensitivity = training_profiles.apply_training_profile(
-        token_inputs=inputs, targets=targets, channel_valid_mask=native64,
-        profiles=profiles, profile_name="native64_vs_sparse18", dataset_name="dortmund",
+        inputs, np.ones(640, bool), "dortmund", sensitivity_profile,
+        targets=targets, channel_valid_mask=native64,
     )
     assert sensitivity["channel_valid_mask"].sum() == 64
     assert sensitivity["token_valid_mask"].sum() == 640
+    mipdb_profile = training_profiles.resolve_training_profile(
+        profiles, "joint_native64_vs_sparse18", "mipdb"
+    )
     mipdb = training_profiles.apply_training_profile(
-        token_inputs=inputs, targets=targets, channel_valid_mask=native64,
-        profiles=profiles, profile_name="native64_vs_sparse18", dataset_name="mipdb",
+        inputs, np.ones(640, bool), "mipdb", mipdb_profile,
+        targets=targets, channel_valid_mask=native64,
     )
     assert mipdb["channel_valid_mask"].sum() == 18
     assert mipdb["token_valid_mask"].sum() == 180
@@ -194,7 +203,10 @@ def test_end_to_end_fixture_preserves_source_and_writes_one_cache(tmp_path):
     assert len(list(output.glob("*.lance"))) == 1
     summary = json.loads((output / "adapter_summary.json").read_text(encoding="utf-8"))
     assert summary["one_physical_token_cache"] is True
-    assert summary["training_profiles"] == ["matched18", "native64_vs_sparse18"]
+    assert summary["training_profiles"] == [
+        "dortmund_native64", "dortmund_matched18", "joint_matched18",
+        "joint_native64_vs_sparse18",
+    ]
 
 
 def test_full_entrypoint_has_no_hardcoded_cohort_counts_or_overwrite():

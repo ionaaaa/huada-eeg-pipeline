@@ -16,6 +16,9 @@ PROJECT = Path(__file__).resolve().parents[1]
 MODULE_DIR = PROJECT / "scripts" / "downstream_50m"
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
+SCRIPTS_DIR = PROJECT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 from configs import Config
 from dataset import collate_fn
@@ -32,6 +35,11 @@ from largeScale_fineTune import (
     validate_subject_split_manifest,
 )
 from model import EEGPretrainModel
+from fbmae_training_profiles import (  # noqa: E402
+    ProfiledTokenDataset,
+    load_training_profiles,
+    resolve_training_profile,
+)
 
 
 SMOKE_LANCE = Path(
@@ -88,6 +96,36 @@ def test_age_is_float32_and_sub5_is_excluded_without_imputation(smoke_lance):
     assert {row["subject_id"] for row in dataset.get_subject_label_rows()} == {"SUB1"}
     assert {float(dataset[index]["label"]) for index in range(len(dataset))} == {31.0}
     assert all(dataset[index]["label"].dtype == torch.float32 for index in range(len(dataset)))
+
+
+def test_age_range_filter_is_inclusive_and_preserves_order(smoke_lance):
+    original = LanceEEGPretrainDataset(smoke_lance, task="age_regression")
+    selected = LanceEEGPretrainDataset(
+        smoke_lance, task="age_regression", min_age=31, max_age=31,
+    )
+    excluded = LanceEEGPretrainDataset(
+        smoke_lance, task="age_regression", min_age=20, max_age=30,
+    )
+    assert [row["sample_id"] for row in selected.get_sampling_rows()] == [
+        row["sample_id"] for row in original.get_sampling_rows()
+    ]
+    assert len(excluded) == 0
+
+
+def test_profiled_dataset_batches_keep_metadata_and_fixed_model_geometry(smoke_lance):
+    source = LanceEEGPretrainDataset(smoke_lance, task="age_regression")
+    catalog = load_training_profiles(
+        PROJECT / "configs" / "mipdb_dortmund_fbmae_training_profiles_v1.json"
+    )
+    profile = resolve_training_profile(catalog, "dortmund_matched18", "dortmund")
+    profiled = ProfiledTokenDataset(source, "dortmund", profile)
+    batch = next(iter(DataLoader(profiled, batch_size=2, collate_fn=collate_fn)))
+    assert batch["token_inputs"].shape == (2, 640, 100)
+    assert batch["token_valid_mask"].shape == (2, 640)
+    assert batch["sample_id"] == [row["sample_id"] for row in source.get_sampling_rows()]
+    assert torch.equal(batch["label"], torch.stack([source[index]["label"] for index in range(2)]))
+    assert torch.all(batch["token_valid_mask"].sum(dim=1) <= 180)
+    assert torch.all(batch["token_inputs"][batch["token_valid_mask"].bool().logical_not()] == 0)
 
 
 def _write_manifest(path, rows):

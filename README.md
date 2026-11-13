@@ -1608,7 +1608,15 @@ TIONE_OUTPUT_ROOT=/opt/ml/cfs_input/data/preprocess_common \
 bash /opt/ml/cfs_input/commands/run_mipdb_age_preprocessing_full.sh
 ```
 
-
+#### `train-1716734261874928384`：MIPDB processed lance 转为fbmae适配格式（E1-E128通道，用的biot映射，最终只有18通道）
+```BASH
+HUADA_ROOT=/opt/ml/cfs_input \
+MIPDB_COMMON_DIR=/opt/ml/cfs_input/data/preprocess_common/mipdb_age_preprocessing_20261113_054753 \
+MIPDB_COMMON_LANCE=/opt/ml/cfs_input/data/preprocess_common/mipdb_age_preprocessing_20261113_054753/dataset.lance \
+MIPDB_COMMON_SOURCE_URI=cos://jianyu-1442740494/huada/preprocessed_common/mipdb_age_preprocessing_20261113_054753/ \
+TIONE_OUTPUT_ROOT=/opt/ml/cfs_input/data/model_tokens_full/fbmae_tokens/ \
+bash /opt/ml/cfs_input/commands/run_mipdb_fbmae_adapter_full.sh
+```
 
 
 
@@ -1640,3 +1648,8 @@ train-<task-id>/log_<task-id>_..._<export-id>.tar.gz
 ![FBMAE+labram+reve](downstream_output\age_model_comparison_20261110\age_prediction_vs_ground_truth.png)
 
 ![都是Dortmund数据集，old是20-35岁，new是20-44岁](downstream_output\age_experiment_comparison\four_experiment_error_20261112_162934\age_prediction_error_scatter.png)
+来源：/mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_huada\_zero\_shot\_20261112\_155358/
+/mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_probe\_transfer\_cv7\_20261112\_080637/
+/mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_huada\_zero\_shot\_20261103\_154351/
+/mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_probe\_transfer\_cv7\_20261103\_081646/
+

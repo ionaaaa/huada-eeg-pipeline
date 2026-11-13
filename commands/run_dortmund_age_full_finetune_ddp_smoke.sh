@@ -5,6 +5,8 @@ set -euo pipefail
 : "${INPUT_LANCE:=/mnt/cfs/jianyu/huada-eeg-pipeline/data/model_tokens_full/fbmae_tokens/20261103_112918/dortmund_fbmae_tokens.lance}"
 : "${PRETRAINED_50M_CKPT:=${HUADA_ROOT}/data/checkpoint/pretrain_checkpoint_4.pt}"
 : "${SPLIT_MANIFEST:=${HUADA_ROOT}/downstream_output/dortmund_age_split_seed42/subject_split_manifest.csv}"
+: "${TRAINING_PROFILES:=${HUADA_ROOT}/configs/mipdb_dortmund_fbmae_training_profiles_v1.json}"
+: "${TRAINING_PROFILE:=dortmund_native64}"
 : "${AUDIT_SUMMARY:=${HUADA_ROOT}/audit_dortmund_fbmae_tokens/20261103_124436/audit_summary.json}"
 : "${OUTPUT_ROOT:=${HUADA_ROOT}/downstream_output}"
 : "${NPROC_PER_NODE:=2}"
@@ -26,6 +28,8 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   --input-lance "${INPUT_LANCE}" \
   --checkpoint "${PRETRAINED_50M_CKPT}" \
   --split-manifest "${SPLIT_MANIFEST}" \
+  --training-profiles "${TRAINING_PROFILES}" \
+  --training-profile "${TRAINING_PROFILE}" \
   --audit-summary "${AUDIT_SUMMARY}" \
   --output-dir "${RUN_OUTPUT}" \
   --epochs 2 --batch-size 2 --accumulation-steps 1 \

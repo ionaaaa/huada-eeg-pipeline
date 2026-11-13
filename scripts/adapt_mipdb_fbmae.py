@@ -32,7 +32,7 @@ import pyarrow as pa
 
 import build_huada_model_tokens as token_core
 from adapt_dortmund_fbmae import git_metadata, json_dump, sha256_file, snapshot_tree, write_csv
-from fbmae_training_profiles import load_training_profiles
+from fbmae_training_profiles import load_training_profiles, resolve_training_profile
 
 
 VERSION = "mipdb-fbmae-sparse18-adapter-v1"
@@ -476,7 +476,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_ids, target_ids = load_electrode_ids(args.electrode_vocab.resolve())
         selected_targets = [row["target"] for row in mapping["mappings"]]
         for name, profile in profiles["profiles"].items():
-            mipdb_allowed = profile["mipdb_allowed_target_channels"]
+            if "mipdb" not in profile["datasets"]:
+                continue
+            mipdb_allowed = resolve_training_profile(profiles, name, "mipdb")["allowed_target_channels"]
             if mipdb_allowed != selected_targets:
                 raise ValueError(f"training profile {name} MIPDB channels differ from frozen mapping order")
 
@@ -591,7 +593,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 - normal valid tokens: 180; missing slots: 46
 - source common cache unchanged: true
 - task_semantics=unknown; resting_state_confirmed=false
-- physical cache: one; profiles: matched18 and native64_vs_sparse18
+- physical cache: one; profiles are applied at training read time from the unified profile catalog
 
 The adapter only scatters sparse18 before reusing the authoritative Huada/Dortmund tokenizer.
 It does not repeat bandpass, notch, common preprocessing, `/200`, clipping, rereferencing, or windowing.

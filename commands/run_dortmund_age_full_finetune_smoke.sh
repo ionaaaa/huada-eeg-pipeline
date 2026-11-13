@@ -6,6 +6,8 @@ set -euo pipefail
 : "${COS_ROOT:=/opt/ml/cos_input}"
 : "${INPUT_LANCE:=${HUADA_ROOT}/data/model_tokens_full/fbmae_tokens/20261103_112918/dortmund_fbmae_tokens.lance}"
 : "${SPLIT_MANIFEST:=${HUADA_ROOT}/downstream_output/dortmund_age_split_seed42_20261103_153000/subject_split_manifest.csv}"
+: "${TRAINING_PROFILES:=${HUADA_ROOT}/configs/mipdb_dortmund_fbmae_training_profiles_v1.json}"
+: "${TRAINING_PROFILE:=dortmund_native64}"
 : "${AUDIT_SUMMARY:=${HUADA_ROOT}/audit_dortmund_fbmae_tokens/20261103_124436/audit_summary.json}"
 : "${OUTPUT_ROOT:=${HUADA_ROOT}/downstream_output}"
 : "${TRAIN_SEED:=42}"
@@ -25,12 +27,13 @@ if [[ -z "${PRETRAINED_50M_CKPT:-}" ]]; then
   fi
 fi
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_OUTPUT="${OUTPUT_ROOT}/dortmund_age_full_finetune_smoke_${STAMP}"
+RUN_OUTPUT="${OUTPUT_ROOT}/dortmund_age_full_finetune_smoke_${TRAINING_PROFILE}_${STAMP}"
 
 cd "${HUADA_ROOT}"
 export PYTHONPATH="${HUADA_ROOT}/scripts/downstream_50m:${PYTHONPATH:-}"
 test -d "${INPUT_LANCE}"
 test -f "${SPLIT_MANIFEST}"
+test -f "${TRAINING_PROFILES}"
 test -f "${PRETRAINED_50M_CKPT}"
 printf '%s  %s\n' "${EXPECTED_CKPT_SHA256}" "${PRETRAINED_50M_CKPT}" | sha256sum -c -
 
@@ -49,12 +52,15 @@ echo "effective_global_batch_size=${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "backbone_lr=${BACKBONE_LR}"
 echo "head_lr=${HEAD_LR}"
 echo "num_workers=0"
+echo "training_profile=${TRAINING_PROFILE}"
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   scripts/downstream_50m/run_dortmund_age_full_finetune.py \
   --input-lance "${INPUT_LANCE}" \
   --checkpoint "${PRETRAINED_50M_CKPT}" \
   --split-manifest "${SPLIT_MANIFEST}" \
+  --training-profiles "${TRAINING_PROFILES}" \
+  --training-profile "${TRAINING_PROFILE}" \
   "${AUDIT_ARGS[@]}" \
   --output-dir "${RUN_OUTPUT}" \
   --epochs "${SMOKE_EPOCHS}" \

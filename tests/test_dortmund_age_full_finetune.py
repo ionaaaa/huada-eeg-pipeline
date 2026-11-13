@@ -42,6 +42,16 @@ from dortmund_age_finetune import (  # noqa: E402
     zero_initialize_age_head,
 )
 from model import EEGPretrainModel  # noqa: E402
+import run_dortmund_age_full_finetune as full_entry  # noqa: E402
+
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+from fbmae_training_profiles import (  # noqa: E402
+    apply_training_profile,
+    load_training_profiles,
+    resolve_training_profile,
+)
 
 
 def subjects(count=214):
@@ -122,6 +132,41 @@ def test_train_only_subject_equal_target_transform_and_roundtrip():
     assert transform.equal_subject_weight and not transform.window_weighted and transform.ddof == 0
     ages = np.array([20.0, 25.0, 30.0])
     assert np.max(np.abs(transform.inverse_numpy(transform.transform_numpy(ages)) - ages)) < 1e-12
+
+
+def test_profile_age_filter_is_stable_and_channel_choice_does_not_change_scaler():
+    rows = [
+        {"subject_id": f"s{age}-{split}", "age": str(age), "sex": "female", "split": split}
+        for split in ("train", "validation", "test") for age in (20, 30, 35, 36, 44)
+    ]
+    filtered = full_entry._filter_manifest_rows(rows, 20, 35)
+    assert [row["subject_id"] for row in filtered] == [
+        row["subject_id"] for row in rows if float(row["age"]) <= 35
+    ]
+    assert all(20 <= float(row["age"]) <= 35 for row in filtered)
+    fingerprint = full_entry._manifest_csv_sha256(filtered)
+    native = build_target_transform(filtered, fingerprint)
+    matched = build_target_transform(filtered, fingerprint)
+    assert native == matched
+
+
+def test_dortmund_profiles_keep_fixed_geometry_and_authoritative_invalid_tokens():
+    catalog = load_training_profiles(
+        ROOT / "configs" / "mipdb_dortmund_fbmae_training_profiles_v1.json"
+    )
+    native = resolve_training_profile(catalog, "dortmund_native64", "dortmund")
+    matched = resolve_training_profile(catalog, "dortmund_matched18", "dortmund")
+    inputs = np.ones((640, 100), dtype=np.float32)
+    source_valid = np.ones(640, dtype=bool)
+    source_valid[0] = False
+    native_result = apply_training_profile(inputs, source_valid, "dortmund", native)
+    matched_result = apply_training_profile(inputs, source_valid, "dortmund", matched)
+    assert native_result["token_inputs"].shape == matched_result["token_inputs"].shape == (640, 100)
+    assert native_result["token_valid_mask"].sum() == 639
+    assert not native_result["token_valid_mask"][0]
+    assert matched_result["token_valid_mask"].sum() == 179
+    assert matched_result["channel_valid_mask"].sum() == 18
+    assert np.all(matched_result["token_inputs"][matched_result["token_valid_mask"] == 0] == 0)
 
 
 def sampler_rows():
@@ -293,6 +338,8 @@ def test_command_contracts_and_formal_command_is_not_executed_by_tests():
     ddp = (commands / "run_dortmund_age_full_finetune_ddp_smoke.sh").read_text(encoding="utf-8")
     assert "torchrun --standalone" in full and '--nproc_per_node="${NPROC_PER_NODE}"' in full
     assert "--probe-layer-idx 8" in full and "--pooling mean" in full
+    assert '--training-profile "${TRAINING_PROFILE}"' in full
+    assert "--n-channels" not in full
     assert "--amp-mode bf16" in full and "--skip-test" not in full
     assert "--smoke --skip-test" in ddp
     smoke = (commands / "run_dortmund_age_full_finetune_smoke.sh").read_text(encoding="utf-8")

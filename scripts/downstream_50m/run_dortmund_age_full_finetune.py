@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -36,6 +37,9 @@ from torch.utils.data import DataLoader, Subset
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+SCRIPTS_ROOT = HERE.parent
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from configs import Config
 from dataset import collate_fn
@@ -71,6 +75,11 @@ from dortmund_age_finetune import (
 from lance_dataset import LanceEEGPretrainDataset, load_subject_manifest
 from largeScale_fineTune import build_backbone, compute_shape_params
 from utils import set_seed
+from fbmae_training_profiles import (
+    ProfiledTokenDataset,
+    load_training_profiles,
+    resolve_training_profile,
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -78,6 +87,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-lance", required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--split-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--training-profiles", type=Path,
+        default=SCRIPTS_ROOT.parent / "configs" / "mipdb_dortmund_fbmae_training_profiles_v1.json",
+    )
+    parser.add_argument(
+        "--training-profile", choices=["dortmund_native64", "dortmund_matched18"],
+        default="dortmund_native64",
+    )
     parser.add_argument("--audit-summary", type=Path)
     parser.add_argument(
         "--audit-policy", choices=["enforce", "record_only"], default="enforce",
@@ -255,6 +272,75 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _filter_manifest_rows(
+    rows: Sequence[dict[str, Any]], min_age: float, max_age: float,
+) -> list[dict[str, Any]]:
+    """Stable inclusive age filter; split assignments are never recomputed."""
+    selected = [row for row in rows if min_age <= float(row["age"]) <= max_age]
+    if not selected:
+        raise ValueError(f"No manifest subjects in configured age range {min_age:g}-{max_age:g}")
+    split_ids = {
+        split: {str(row["subject_id"]) for row in selected if str(row["split"]) == split}
+        for split in ("train", "validation", "test")
+    }
+    if any(not values for values in split_ids.values()):
+        raise ValueError(f"Profile age filter produced an empty split: {split_ids}")
+    return selected
+
+
+def _manifest_csv_sha256(rows: Sequence[dict[str, Any]]) -> str:
+    if not rows:
+        raise ValueError("Cannot fingerprint an empty effective manifest")
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]), extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return hashlib.sha256(buffer.getvalue().encode("utf-8")).hexdigest()
+
+
+def _model_state_fingerprint(model: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        array = tensor.detach().cpu().contiguous().numpy()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _profile_dataset_audit(
+    source: LanceEEGPretrainDataset, profiled: ProfiledTokenDataset,
+) -> dict[str, Any]:
+    source_ids = [str(row["sample_id"]) for row in source.get_sampling_rows()]
+    profiled_ids = [str(row["sample_id"]) for row in profiled.get_sampling_rows()]
+    if source_ids != profiled_ids:
+        raise RuntimeError("Training profile changed sample_id order")
+    original = source[0]
+    transformed = profiled[0]
+    for key in ("sample_id", "subject_id", "recording_id", "label", "sex", "eyes_condition"):
+        if key in original and key in transformed:
+            left = original[key].item() if torch.is_tensor(original[key]) else original[key]
+            right = transformed[key].item() if torch.is_tensor(transformed[key]) else transformed[key]
+            if left != right:
+                raise RuntimeError(f"Training profile changed metadata field {key}")
+    if tuple(transformed["token_inputs"].shape) != (640, 100):
+        raise RuntimeError("Training profile changed checkpoint input geometry")
+    token_valid = transformed["token_valid_mask"].bool()
+    if not torch.all(transformed["token_inputs"][~token_valid] == 0):
+        raise RuntimeError("Training profile left nonzero data in an invalid token")
+    return {
+        "sample_id_order_unchanged": True,
+        "sample_id_order_sha256": sha256_json(source_ids),
+        "label_and_metadata_unchanged_on_probe": True,
+        "checkpoint_input_shape": [640, 100],
+        "source_probe_valid_tokens": int(original["token_valid_mask"].sum().item()),
+        "profiled_probe_valid_tokens": int(transformed["token_valid_mask"].sum().item()),
+        "profiled_probe_valid_channels": int(transformed["channel_valid_mask"].sum().item()),
+        "invalid_token_inputs_strictly_zero": True,
+    }
+
+
 def _smoke_subset(dataset: LanceEEGPretrainDataset, subject_limit: int, windows_per_subject: int) -> Subset:
     rows = dataset.get_sampling_rows()
     subjects = sorted({row["subject_id"] for row in rows})[:subject_limit]
@@ -377,7 +463,7 @@ def _checkpoint_payload(
     raw_model: StrictDortmundAgeModel,
     *, args, cfg, shape, transform, manifest_sha, token_snapshot, pretrained_report,
     selection, gradient_scope, gradient_audit, optimizer_report, scheduler_report,
-    resolved_hash, git_state, critical_hashes,
+    resolved_hash, git_state, critical_hashes, training_profile, initial_model_fingerprint,
 ) -> dict[str, Any]:
     return {
         "checkpoint_kind": "dortmund_age_50m_full_finetune",
@@ -406,6 +492,8 @@ def _checkpoint_payload(
         "source_token_lance_fingerprint": token_snapshot["fingerprint"],
         "source_token_adapter_provenance": token_snapshot["adapter_provenance"],
         "pretrained_checkpoint": pretrained_report,
+        "training_profile": training_profile,
+        "initial_model_fingerprint": initial_model_fingerprint,
         "best_epoch": None if selection is None else selection["epoch"],
         "validation_metrics": None if selection is None else selection.get("metrics"),
         "optimizer_configuration": optimizer_report,
@@ -432,8 +520,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         gate = _audit_gate(args.audit_summary, args.smoke, args.audit_policy)
         if not args.split_manifest.is_file():
             raise FileNotFoundError(args.split_manifest)
-        manifest_rows = _read_manifest(args.split_manifest)
-        manifest_sha = sha256_file(args.split_manifest)
+        if not args.training_profiles.is_file():
+            raise FileNotFoundError(args.training_profiles)
+        profile_catalog = load_training_profiles(args.training_profiles)
+        training_profile = resolve_training_profile(
+            profile_catalog, args.training_profile, "dortmund"
+        )
+        source_manifest_rows = _read_manifest(args.split_manifest)
+        source_manifest_sha = sha256_file(args.split_manifest)
+        manifest_rows = _filter_manifest_rows(
+            source_manifest_rows, training_profile["min_age"], training_profile["max_age"]
+        )
+        manifest_sha = _manifest_csv_sha256(manifest_rows)
         transform = build_target_transform(manifest_rows, manifest_sha)
         token_snapshot = _lance_fingerprint(args.input_lance)
         token_snapshot["adapter_provenance"] = _token_adapter_provenance(args.input_lance)
@@ -443,6 +541,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolved.update({
             "checkpoint": None if args.checkpoint is None else str(args.checkpoint),
             "split_manifest": str(args.split_manifest),
+            "source_split_manifest_sha256": source_manifest_sha,
+            "effective_split_manifest_sha256": manifest_sha,
+            "training_profiles": str(args.training_profiles),
+            "resolved_training_profile": training_profile,
             "audit_summary": None if args.audit_summary is None else str(args.audit_summary),
             "output_dir": str(args.output_dir), "resume": None if args.resume is None else str(args.resume),
             "distributed": context,
@@ -470,28 +572,49 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (args.output_dir / "checkpoints").mkdir()
             _json(args.output_dir / "resolved_config.json", resolved)
             _json(args.output_dir / "target_transform.json", asdict(transform))
-            shutil.copyfile(args.split_manifest, args.output_dir / "subject_split_manifest.csv")
-            for filename in (
-                "split_summary.json", "split_age_distribution.csv",
-                "split_age_sex_distribution.csv", "resolved_split_config.json",
-            ):
-                source = args.split_manifest.parent / filename
-                if source.is_file():
-                    shutil.copyfile(source, args.output_dir / filename)
-            if not (args.output_dir / "split_summary.json").exists():
-                split_counts = {
-                    split: sum(str(row["split"]) == split for row in manifest_rows)
-                    for split in ("train", "validation", "test")
-                }
-                _json(args.output_dir / "split_summary.json", {"split_counts": split_counts, "manifest_sha256": manifest_sha})
-            for filename, header in (
-                ("split_age_distribution.csv", ["split", "age", "subject_count"]),
-                ("split_age_sex_distribution.csv", ["split", "age", "sex", "subject_count"]),
-            ):
-                if not (args.output_dir / filename).exists():
-                    _csv(args.output_dir / filename, [], header)
-            if not (args.output_dir / "resolved_split_config.json").exists():
-                _json(args.output_dir / "resolved_split_config.json", {"source_manifest": str(args.split_manifest), "manifest_sha256": manifest_sha})
+            _csv(args.output_dir / "subject_split_manifest.csv", manifest_rows, list(manifest_rows[0]))
+            shutil.copyfile(args.split_manifest, args.output_dir / "source_subject_split_manifest.csv")
+            split_counts = {
+                split: sum(str(row["split"]) == split for row in manifest_rows)
+                for split in ("train", "validation", "test")
+            }
+            _json(args.output_dir / "split_summary.json", {
+                "split_counts": split_counts,
+                "manifest_sha256": manifest_sha,
+                "source_manifest_sha256": source_manifest_sha,
+                "source_subject_count": len(source_manifest_rows),
+                "effective_subject_count": len(manifest_rows),
+                "stable_subset_of_source_manifest": True,
+                "split_assignments_recomputed": False,
+            })
+            age_rows = []
+            age_sex_rows = []
+            for split in ("train", "validation", "test"):
+                split_rows = [row for row in manifest_rows if str(row["split"]) == split]
+                for age in sorted({float(row["age"]) for row in split_rows}):
+                    age_rows.append({
+                        "split": split, "age": age,
+                        "subject_count": sum(float(row["age"]) == age for row in split_rows),
+                    })
+                pairs = sorted({(float(row["age"]), str(row.get("sex", ""))) for row in split_rows})
+                for age, sex in pairs:
+                    age_sex_rows.append({
+                        "split": split, "age": age, "sex": sex,
+                        "subject_count": sum(
+                            float(row["age"]) == age and str(row.get("sex", "")) == sex
+                            for row in split_rows
+                        ),
+                    })
+            _csv(args.output_dir / "split_age_distribution.csv", age_rows, ["split", "age", "subject_count"])
+            _csv(args.output_dir / "split_age_sex_distribution.csv", age_sex_rows, ["split", "age", "sex", "subject_count"])
+            _json(args.output_dir / "resolved_split_config.json", {
+                "source_manifest": str(args.split_manifest),
+                "source_manifest_sha256": source_manifest_sha,
+                "effective_manifest_sha256": manifest_sha,
+                "training_profile": args.training_profile,
+                "age_range": [training_profile["min_age"], training_profile["max_age"]],
+                "split_assignments_recomputed": False,
+            })
             if not resume_in_place:
                 _csv(args.output_dir / "training_issues.csv", [], ["severity", "category", "message"])
                 (args.output_dir / "training_errors.log").write_text("", encoding="utf-8")
@@ -517,15 +640,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             pooling="mean", num_tokens=shape["num_tokens"],
         ).to(device)
         zero_initialize_age_head(raw_model)
+        initial_model_fingerprint = _model_state_fingerprint(raw_model) if rank == 0 else None
+        initial_model_fingerprint = broadcast_object(initial_model_fingerprint, rank)
         gradient_scope = configure_probe_gradient_scope(raw_model, args.probe_layer_idx)
         optimizer, optimizer_report = build_optimizer(raw_model, backbone_lr=args.backbone_lr, head_lr=args.head_lr, weight_decay=args.weight_decay)
 
-        train_dataset: LanceEEGPretrainDataset | Subset = LanceEEGPretrainDataset(
-            args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest, split="train"
+        train_source = LanceEEGPretrainDataset(
+            args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
+            split="train", min_age=training_profile["min_age"], max_age=training_profile["max_age"],
         )
-        validation_dataset: LanceEEGPretrainDataset | Subset = LanceEEGPretrainDataset(
-            args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest, split="validation"
+        validation_source = LanceEEGPretrainDataset(
+            args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
+            split="validation", min_age=training_profile["min_age"], max_age=training_profile["max_age"],
         )
+        train_dataset: ProfiledTokenDataset | Subset = ProfiledTokenDataset(
+            train_source, "dortmund", training_profile
+        )
+        validation_dataset: ProfiledTokenDataset | Subset = ProfiledTokenDataset(
+            validation_source, "dortmund", training_profile
+        )
+        profile_dataset_audit = {
+            "train": _profile_dataset_audit(train_source, train_dataset),
+            "validation": _profile_dataset_audit(validation_source, validation_dataset),
+        }
         if args.smoke:
             train_dataset = _smoke_subset(train_dataset, args.smoke_train_subjects, args.smoke_windows_per_subject)
             validation_dataset = _smoke_subset(validation_dataset, args.smoke_validation_subjects, args.smoke_windows_per_subject)
@@ -552,7 +689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         critical_paths = [
             Path(__import__(module).__file__).resolve()
             for module in ("model", "largeScale_fineTune", "lance_dataset", "dortmund_age_finetune")
-        ] + [Path(__file__).resolve()]
+        ] + [Path(__file__).resolve(), SCRIPTS_ROOT / "fbmae_training_profiles.py", args.training_profiles.resolve()]
         critical_hashes = {path.name: sha256_file(path) for path in critical_paths}
         git_state = _git_state()
         if rank == 0:
@@ -561,6 +698,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "lance": lance.__version__, "pyarrow": pyarrow.__version__, "git": git_state,
                 "audit_gate": gate, "token_snapshot_before": token_snapshot,
                 "split_manifest_sha256": manifest_sha, "pretrained_checkpoint": pretrained_report,
+                "source_split_manifest_sha256": source_manifest_sha,
+                "training_profile": training_profile,
+                "training_profiles_sha256": sha256_file(args.training_profiles),
+                "profile_dataset_audit": profile_dataset_audit,
+                "initial_model_fingerprint": initial_model_fingerprint,
                 "critical_code_sha256": critical_hashes, "formal_training_performed": not args.smoke,
             })
             _csv(args.output_dir / "parameter_group_summary.csv", optimizer_report, ["group_name", "owner", "decay_policy", "lr", "weight_decay", "parameter_count", "tensor_count", "parameter_names"])
@@ -683,6 +825,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         gradient_scope=gradient_scope, gradient_audit=gradient_audit,
                         optimizer_report=optimizer_report, scheduler_report=scheduler_report,
                         resolved_hash=resolved_hash, git_state=git_state, critical_hashes=critical_hashes,
+                        training_profile=training_profile,
+                        initial_model_fingerprint=initial_model_fingerprint,
                     )
                     atomic_torch_save(payload, args.output_dir / "checkpoints" / "best_full_checkpoint.pt")
                 else:
@@ -745,6 +889,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     gradient_scope=gradient_scope, gradient_audit=gradient_audit,
                     optimizer_report=optimizer_report, scheduler_report=scheduler_report,
                     resolved_hash=resolved_hash, git_state=git_state, critical_hashes=critical_hashes,
+                    training_profile=training_profile,
+                    initial_model_fingerprint=initial_model_fingerprint,
                 )
                 last.update({
                     "optimizer_state_dict": optimizer.state_dict(), "scheduler_state_dict": scheduler.state_dict(),
@@ -802,8 +948,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         test_metrics = {"status": "not_performed", "reason": "--skip-test"}
         if not args.skip_test:
             guard.mark_dataset_created()
-            test_dataset: LanceEEGPretrainDataset | Subset = LanceEEGPretrainDataset(
-                args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest, split="test"
+            test_source = LanceEEGPretrainDataset(
+                args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
+                split="test", min_age=training_profile["min_age"], max_age=training_profile["max_age"],
+            )
+            test_dataset: ProfiledTokenDataset | Subset = ProfiledTokenDataset(
+                test_source, "dortmund", training_profile
             )
             test_sampler = NoPaddingDistributedEvalSampler(len(test_dataset), rank, context["world_size"])
             guard.mark_dataloader_created()
@@ -863,6 +1013,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "smoke": args.smoke, "cloud_full_training_performed": not args.smoke,
                 "stopped_at_epoch_boundary_for_resume_smoke": resume_ready,
                 "audit_gate": gate, "best_epoch": best_payload["best_epoch"],
+                "training_profile": training_profile,
+                "profile_dataset_audit": profile_dataset_audit,
+                "initial_model_fingerprint": initial_model_fingerprint,
                 "input_lance_unchanged": unchanged,
                 "pretrained_checkpoint_unchanged": pretrained_unchanged,
                 "pretrained_checkpoint_unchanged_reason": pretrained_unchanged_reason,
@@ -877,6 +1030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             (args.output_dir / "training_report.md").write_text(
                 "# Dortmund age 50M full-finetune run\n\n" +
                 f"- Status: `{summary['status']}`\n- Smoke: `{args.smoke}`\n" +
+                f"- Training profile: `{args.training_profile}` ({training_profile['min_age']:g}-{training_profile['max_age']:g}, {training_profile['channel_mode']})\n" +
                 f"- Best epoch: `{best_payload['best_epoch']}`\n- Audit gate: `{gate['conclusion']}`\n" +
                 f"- Test: `{'skipped' if args.skip_test else 'performed once after lock'}`\n" +
                 f"- Input Lance unchanged: `{unchanged}`\n",

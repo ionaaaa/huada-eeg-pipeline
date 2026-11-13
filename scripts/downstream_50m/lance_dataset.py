@@ -69,6 +69,8 @@ class LanceEEGPretrainDataset(Dataset):
         task="sex_classification",
         subject_split_manifest=None,
         split=None,
+        min_age=None,
+        max_age=None,
         max_samples=None,
     ):
         if task not in SUPPORTED_TASKS:
@@ -78,6 +80,10 @@ class LanceEEGPretrainDataset(Dataset):
         self.columns = list(columns) if columns is not None else list(self.FULL_COLUMNS)
         self.task = task
         self.split = split
+        self.min_age = None if min_age is None else float(min_age)
+        self.max_age = None if max_age is None else float(max_age)
+        if self.min_age is not None and self.max_age is not None and self.min_age > self.max_age:
+            raise ValueError("min_age cannot exceed max_age")
         self.manifest = load_subject_manifest(subject_split_manifest)
         self.ds = None
         self._metadata = self._read_metadata()
@@ -162,6 +168,11 @@ class LanceEEGPretrainDataset(Dataset):
                     )
             if label is None:  # Missing age is excluded; it is never imputed.
                 continue
+            if self.task == "age_regression" and (
+                (self.min_age is not None and float(label) < self.min_age)
+                or (self.max_age is not None and float(label) > self.max_age)
+            ):
+                continue
             previous = subject_labels.setdefault(subject_id, label)
             if previous != label:
                 raise ValueError(f"Inconsistent labels within subject {subject_id}")
@@ -173,6 +184,13 @@ class LanceEEGPretrainDataset(Dataset):
                 subject for subject, row in self.manifest.items()
                 if not str(row.get("exclusion_reason", "")).strip()
                 and (self.split is None or str(row.get("split", "")).strip() == self.split)
+                and (
+                    self.task != "age_regression"
+                    or (
+                        (self.min_age is None or float(row.get("age", row.get("label"))) >= self.min_age)
+                        and (self.max_age is None or float(row.get("age", row.get("label"))) <= self.max_age)
+                    )
+                )
             }.difference(manifest_subjects_seen)
             if missing_subjects:
                 raise ValueError(f"Manifest subjects absent from input Lance: {sorted(missing_subjects)}")
