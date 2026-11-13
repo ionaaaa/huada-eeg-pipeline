@@ -1,0 +1,33 @@
+{
+  "profile_name": "mipdb_egi128_to_standard64_sparse18_v1",
+  "profile_version": 1,
+  "source_layout": "EGI HydroCel E1-E128 native order",
+  "target_layout": "FBMAE STANDARD_64_CHANNELS",
+  "observed_source_channels": 18,
+  "target_slots": 64,
+  "missing_target_slots": 46,
+  "interpolation_applied": false,
+  "zero_fill_missing_slots": true,
+  "zero_fill_semantics": "missing_and_masked",
+  "mapping_order_semantics": "ordered_as_declared_below",
+  "mappings": [
+    {"source": "E22", "target": "Fp1"},
+    {"source": "E9", "target": "Fp2"},
+    {"source": "E11", "target": "Fz"},
+    {"source": "E24", "target": "F3"},
+    {"source": "E33", "target": "F7"},
+    {"source": "E36", "target": "C3"},
+    {"source": "E45", "target": "T7"},
+    {"source": "E52", "target": "P3"},
+    {"source": "E58", "target": "P7"},
+    {"source": "E62", "target": "Pz"},
+    {"source": "E70", "target": "O1"},
+    {"source": "E83", "target": "O2"},
+    {"source": "E92", "target": "P4"},
+    {"source": "E96", "target": "P8"},
+    {"source": "E104", "target": "C4"},
+    {"source": "E108", "target": "T8"},
+    {"source": "E122", "target": "F8"},
+    {"source": "E124", "target": "F4"}
+  ]
+}

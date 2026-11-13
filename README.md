@@ -564,16 +564,22 @@ bash "${HUADA_ROOT}/commands/run_dortmund_fbmae_adapter_smoke.sh"
 ```bash
 set -euo pipefail
 
-export HUADA\_ROOT="/opt/ml/cfs\_input"
-export PYTHON\_BIN="python"
-export DORTMUND\_COMMON\_DIR="/opt/ml/cfs\_input/data/preprocess\_common/dortmund\_age\_preprocessing\_full\_20261103\_022751"
-export DORTMUND\_COMMON\_LANCE=""
-export DORTMUND\_SOURCE\_URI="cos\://jianyu-1442740494/huada/preprocessed\_common/dortmund\_age\_preprocessing\_full\_20261103\_022751/"
-export ADAPTER\_OUTPUT\_DIR="/opt/ml/cfs\_input/data/model\_tokens\_full/fbmae\_tokens/$(date +%Y%m%d\_%H%M%S)"
-export ADAPTER\_BATCH\_SIZE="32"
-export ADAPTER\_NUM\_WORKERS="4"
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
+export DORTMUND_COMMON_DIR="/opt/ml/cfs_input/data/preprocess_common/dortmund_age_preprocessing_age20_44_ses1_pre_profile_a_20261112_054059"
+export DORTMUND_COMMON_LANCE="${DORTMUND_COMMON_DIR}/dataset.lance"
+export DORTMUND_SOURCE_URI="cos://jianyu-1442740494/dortmund_age_preprocessing_age20_44_ses1_pre_profile_a_20261112_054059"
+export ADAPTER_OUTPUT_DIR="/opt/ml/cfs_input/data/model_tokens_full/fbmae_tokens_smoke/$(date +%Y%m%d_%H%M%S)"
+export ADAPTER_BATCH_SIZE="8"
+export ADAPTER_NUM_WORKERS="4"
 
-bash "${HUADA\_ROOT}/commands/run\_dortmund\_fbmae\_adapter\_full.sh"
+export DORTMUND_MIN_AGE=20
+export DORTMUND_MAX_AGE=44
+export DORTMUND_COHORT_ID="age20_44_ses1_pre_profile_a"
+export DORTMUND_EXPECTED_SUBJECTS=291
+export DORTMUND_EXPECTED_RECORDINGS=582
+
+bash "${HUADA_ROOT}/commands/run_dortmund_fbmae_adapter_full.sh"
 ```
 
 #### Dortmund 原样命令 5：随机初始化FBMAE full-finetune smoke，测试训练链路
@@ -1588,6 +1594,23 @@ echo "REVE\_CACHE\_ROOT=$CACHE\_RUN\_ROOT"
 ```bash
 /opt/venv/bin/python -m scripts.native_backends.run_huada_portable_age_zero_init_probe_cv7 --model-family reve --native-cache-run-root /mnt/cfs/jianyu/huada-eeg-pipeline/data/native_recording_cache/huada_reve/20261109T085249Z --subject-manifest /mnt/cfs/jianyu/huada-eeg-pipeline/preprocessing_audit/20261030_105520/subject_manifest.json --target-input-contract /mnt/cfs/jianyu/huada-eeg-pipeline/data/native_recording_cache/huada_reve/20261109T085249Z/huada_reve_target_input_contract_v1.json --expected-target-contract-file-sha256 8df337850379faac426040d2304a6a9245efbbe98facddbaa0e9b2fbcf702120 --portable-checkpoint /mnt/cfs/jianyu/neuroai-repro/repro_heavy_local/portable_checkpoints/dortmund_age_reve/20261109T052927Z/dortmund_age_reve_fft_portable_v1.pt --portable-sidecar /mnt/cfs/jianyu/neuroai-repro/repro_heavy_local/portable_checkpoints/dortmund_age_reve/20261109T052927Z/dortmund_age_reve_fft_portable_v1.sidecar.json --expected-portable-checkpoint-sha256 e2a7f72d435e7c8bc7688e7c27d0db5cccbc226b8dcf0acaf21172a38ed8fff4 --expected-source-checkpoint-sha256 ca3474382da2f03937232eedcdbaf7faf511725af2542561eeb5e7e0d5631201 --expected-source-age-mean 27.5 --expected-source-age-std 4.218591213226318 --dynamic-parity-dir /mnt/cfs/jianyu/neuroai-repro/repro_heavy_local/portable_parity/dortmund_age_reve/20261109T072416Z --strict-zero-shot-reference-dir /mnt/cfs/jianyu/huada-eeg-pipeline/downstream_output/native_portable_age_zero_shot/huada_reve_dortmund_age_strict_zero_shot_20261109T094439Z --feature-cache-root /mnt/cfs/jianyu/huada-eeg-pipeline/data/native_feature_cache/huada_reve_portable_age_mean --feature-cache-policy auto --output-dir /mnt/cfs/jianyu/huada-eeg-pipeline/downstream_output/native_portable_age_zero_init_probe_cv7/huada_reve_zero_init_probe_cv7_20261110T021852Z --device cuda:0 --feature-cache-batch-size 8 --batch-size 64 --head-lr 1e-5 --weight-decay 0 --epochs 100 --early-stopping-patience 15 --seed 42 --split-seed 42
 ```
+## MIPDB
+
+#### `train-1716683466224295808`：MIPDB raw2lance
+
+```bash
+HUADA_ROOT=/opt/ml/cfs_input \
+MIPDB_DATA_DIR=/opt/ml/cos_input/data/MIPDB/mipdb_download/nm000153_py \
+MIPDB_AGE_METADATA=/opt/ml/cos_input/data/MIPDB/MIPDB_PublicFile.csv \
+MIPDB_ALLOWLIST=/opt/ml/cfs_input/configs/mipdb_age_20_35_subjects.txt \
+MIPDB_SOURCE_URI=cos://jianyu-1442740494/huada/data/MIPDB/mipdb_download/nm000153_py \
+TIONE_OUTPUT_ROOT=/opt/ml/cfs_input/data/preprocess_common \
+bash /opt/ml/cfs_input/commands/run_mipdb_age_preprocessing_full.sh
+```
+
+
+
+
 
 ## 无有效 stdout 的成功任务
 

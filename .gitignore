@@ -16,6 +16,7 @@ model_tokens/
 model_tokens_smoke/
 downstream_smoke/
 mipdb_preprocessing_smoke/
+mipdb_fbmae_smoke/
 synthetic_smoke_dortmund/
 *.lance/
 *.lance

@@ -1,0 +1,19 @@
+{
+  "profile_set": "mipdb_dortmund_fbmae_training_profiles_v1",
+  "physical_cache_policy": "one_cache_per_dataset_profiles_applied_at_training_read_time",
+  "standard_channels_source": "scripts/build_huada_model_tokens.py:STANDARD_64_CHANNELS",
+  "profiles": {
+    "matched18": {
+      "role": "primary_experiment",
+      "description": "Dortmund and MIPDB both expose only the shared sparse18 target slots.",
+      "dortmund_allowed_target_channels": ["Fp1", "Fp2", "Fz", "F3", "F7", "C3", "T7", "P3", "P7", "Pz", "O1", "O2", "P4", "P8", "C4", "T8", "F8", "F4"],
+      "mipdb_allowed_target_channels": ["Fp1", "Fp2", "Fz", "F3", "F7", "C3", "T7", "P3", "P7", "Pz", "O1", "O2", "P4", "P8", "C4", "T8", "F8", "F4"]
+    },
+    "native64_vs_sparse18": {
+      "role": "sensitivity_experiment",
+      "description": "Dortmund retains its native valid standard64 slots while MIPDB retains sparse18.",
+      "dortmund_allowed_target_channels": "all",
+      "mipdb_allowed_target_channels": ["Fp1", "Fp2", "Fz", "F3", "F7", "C3", "T7", "P3", "P7", "Pz", "O1", "O2", "P4", "P8", "C4", "T8", "F8", "F4"]
+    }
+  }
+}
