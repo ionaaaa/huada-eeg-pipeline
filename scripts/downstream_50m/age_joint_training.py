@@ -27,6 +27,7 @@ from dortmund_age_finetune import (
     metric_bundle,
     regression_metrics,
     sha256_file,
+    sha256_json,
 )
 
 
@@ -129,6 +130,21 @@ def read_csv_rows(path: str | Path) -> list[dict[str, str]]:
     return rows
 
 
+def canonical_csv_sha256(path: str | Path) -> str:
+    """Hash CSV content independent of UTF-8 BOM and LF/CRLF transport."""
+    with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        fields = list(reader.fieldnames or [])
+    return sha256_json({"format": "canonical-csv-v1", "fieldnames": fields, "rows": rows})
+
+
+def canonical_json_sha256(path: str | Path) -> str:
+    """Hash parsed JSON semantics independent of whitespace and line endings."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    return sha256_json({"format": "canonical-json-v1", "payload": payload})
+
+
 def validate_joint_manifest(
     rows: Sequence[Mapping[str, Any]], *, strict_counts: bool = True
 ) -> list[dict[str, Any]]:
@@ -183,25 +199,66 @@ def validate_frozen_joint_contract(
     contract_path: str | Path, strict_counts: bool = True,
 ) -> tuple[list[dict[str, Any]], TargetTransform, dict[str, Any]]:
     contract = json.loads(Path(contract_path).read_text(encoding="utf-8"))
-    expected = contract.get("sha256", {})
-    actual = {
+    expected_raw = contract.get("sha256", {})
+    actual_raw = {
         "joint_subject_split_manifest": sha256_file(joint_manifest_path),
         "joint_target_transform": sha256_file(target_transform_path),
     }
-    mismatches = {
-        key: {"expected": expected.get(key), "actual": value}
-        for key, value in actual.items() if expected.get(key) != value
+    expected_canonical = contract.get("canonical_sha256", {})
+    actual_canonical = {
+        "joint_subject_split_manifest": canonical_csv_sha256(joint_manifest_path),
+        "joint_target_transform": canonical_json_sha256(target_transform_path),
     }
+    if expected_canonical:
+        mismatches = {
+            key: {"expected": expected_canonical.get(key), "actual": value}
+            for key, value in actual_canonical.items()
+            if expected_canonical.get(key) != value
+        }
+    else:
+        # Backward compatibility for the first v1 contract: a JSON file that
+        # differs only by line endings is accepted only when its parsed payload
+        # exactly equals the transform embedded in the signed contract.
+        frozen_payload = json.loads(Path(target_transform_path).read_text(encoding="utf-8-sig"))
+        mismatches = {}
+        if expected_raw.get("joint_subject_split_manifest") != actual_raw["joint_subject_split_manifest"]:
+            mismatches["joint_subject_split_manifest"] = {
+                "expected": expected_raw.get("joint_subject_split_manifest"),
+                "actual": actual_raw["joint_subject_split_manifest"],
+            }
+        if (
+            expected_raw.get("joint_target_transform") != actual_raw["joint_target_transform"]
+            and frozen_payload != contract.get("target_transform")
+        ):
+            mismatches["joint_target_transform"] = {
+                "expected": expected_raw.get("joint_target_transform"),
+                "actual": actual_raw["joint_target_transform"],
+            }
     if mismatches:
         raise ValueError(f"Frozen joint contract SHA mismatch: {mismatches}")
     rows = validate_joint_manifest(read_csv_rows(joint_manifest_path), strict_counts=strict_counts)
-    recomputed = build_joint_target_transform(rows, actual["joint_subject_split_manifest"])
-    frozen = json.loads(Path(target_transform_path).read_text(encoding="utf-8"))
+    frozen = json.loads(Path(target_transform_path).read_text(encoding="utf-8-sig"))
+    manifest_fingerprint = (
+        actual_canonical["joint_subject_split_manifest"]
+        if expected_canonical else str(frozen["train_subject_manifest_sha256"])
+    )
+    recomputed = build_joint_target_transform(
+        rows, manifest_fingerprint
+    )
     if asdict(recomputed) != frozen:
         raise ValueError(
             "Frozen joint target transform does not exactly match the joint train subjects"
         )
-    return rows, recomputed, contract
+    resolved_contract = dict(contract)
+    resolved_contract["validation"] = {
+        "fingerprint_policy": "canonical_content_v1",
+        "canonical_sha256": actual_canonical,
+        "raw_transport_sha256": actual_raw,
+        "raw_transport_changed": {
+            key: expected_raw.get(key) != value for key, value in actual_raw.items()
+        },
+    }
+    return rows, recomputed, resolved_contract
 
 
 def joint_metric_bundle(window_rows: Sequence[dict[str, Any]]) -> dict[str, Any]:

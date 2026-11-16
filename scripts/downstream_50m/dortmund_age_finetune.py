@@ -682,6 +682,16 @@ def initialize_distributed(device_arg: str | None = None) -> tuple[dict[str, Any
         use_cuda = torch.cuda.is_available() and device_arg != "cpu"
         backend = "nccl" if use_cuda else "gloo"
         if use_cuda:
+            visible_devices = int(torch.cuda.device_count())
+            if context["world_size"] > visible_devices or context["local_rank"] >= visible_devices:
+                raise RuntimeError(
+                    "Distributed CUDA topology mismatch: "
+                    f"WORLD_SIZE={context['world_size']}, LOCAL_RANK={context['local_rank']}, "
+                    f"torch.cuda.device_count()={visible_devices}, "
+                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}. "
+                    "Set --nproc_per_node no higher than the visible GPU count, or allocate "
+                    "the requested number of GPUs."
+                )
             torch.cuda.set_device(context["local_rank"])
             device = torch.device("cuda", context["local_rank"])
         else:
@@ -690,6 +700,8 @@ def initialize_distributed(device_arg: str | None = None) -> tuple[dict[str, Any
     else:
         backend = None
         if device_arg:
+            if device_arg == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError("--device cuda was requested but CUDA is not available")
             device = torch.device(device_arg)
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

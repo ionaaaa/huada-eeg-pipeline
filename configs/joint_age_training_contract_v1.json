@@ -1,13 +1,19 @@
 {
+  "canonical_sha256": {
+    "joint_subject_split_manifest": "83750b352fe6150e1f561f389b0f814dfc94fb0ed5ada1b4777bc50c025119bb",
+    "joint_target_transform": "bd5fb365e0cc82df3d71a0322897879b45fe9f2e6d349812107b61d6d1c17d19",
+    "mipdb_subject_split_manifest": "0a91b605fd32a265043b51a41e165b8c6649e4131072def935f2dc0e1622f7e7"
+  },
   "contract_version": "dortmund-mipdb-joint-age-v1",
   "dortmund_split_policy": "inherited_172_21_21_unchanged",
+  "fingerprint_policy": "canonical_content_v1",
   "joint_train_subject_count": 187,
   "mipdb_block_filter": "block01",
   "mipdb_sex_used_for_stratification": false,
   "mipdb_split_policy": "age_only_deterministic_15_2_2",
   "sha256": {
     "joint_subject_split_manifest": "057456a7c47d00e83ef55ec83c128edd67479cd5bcbe4852a76b8c482fc1d68b",
-    "joint_target_transform": "001ad6b30a414bab5644cba1dbd0859e411e432ff5270cf45ecc14b047d1396e",
+    "joint_target_transform": "854f549cc907932b329bfa4e918a87f4ef103e66f552d964a8d22bc3fb95bd85",
     "mipdb_subject_split_manifest": "e020f6d346a3dbc31f7f6d809071052f2b00c1bb2b8af82c4e595ef13d908019"
   },
   "source": {
@@ -26,7 +32,7 @@
     "target_transform": "zscore",
     "target_unit": "year",
     "train_subject_count": 187,
-    "train_subject_manifest_sha256": "057456a7c47d00e83ef55ec83c128edd67479cd5bcbe4852a76b8c482fc1d68b",
+    "train_subject_manifest_sha256": "83750b352fe6150e1f561f389b0f814dfc94fb0ed5ada1b4777bc50c025119bb",
     "version": "train-subject-equal-zscore-ddof0-v1",
     "window_weighted": false
   }

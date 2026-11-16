@@ -23,6 +23,7 @@ from age_joint_training import (  # noqa: E402
     validate_frozen_joint_contract,
 )
 from dortmund_age_finetune import SubjectBalancedDistributedSampler  # noqa: E402
+import dortmund_age_finetune as age_core  # noqa: E402
 from fbmae_training_profiles import (  # noqa: E402
     ProfiledTokenDataset,
     load_training_profiles,
@@ -203,6 +204,40 @@ def test_frozen_contract_fails_closed_on_tamper(tmp_path):
             target_transform_path=path,
             contract_path=tmp_path / "joint_age_training_contract_v1.json",
         )
+
+
+def test_frozen_contract_accepts_lf_crlf_transport_change(tmp_path):
+    for name in (
+        "joint_subject_split_manifest_v1.csv", "joint_target_transform_v1.json",
+        "joint_age_training_contract_v1.json",
+    ):
+        source = ROOT / "configs" / name
+        text = source.read_text(encoding="utf-8").replace("\r\n", "\n")
+        with (tmp_path / name).open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+    rows, transform, contract = validate_frozen_joint_contract(
+        joint_manifest_path=tmp_path / "joint_subject_split_manifest_v1.csv",
+        target_transform_path=tmp_path / "joint_target_transform_v1.json",
+        contract_path=tmp_path / "joint_age_training_contract_v1.json",
+    )
+    assert len(rows) == 233 and transform.train_subject_count == 187
+    assert contract["validation"]["fingerprint_policy"] == "canonical_content_v1"
+
+
+def test_distributed_cuda_topology_fails_before_set_device(monkeypatch):
+    monkeypatch.setattr(age_core, "distributed_context", lambda: {
+        "distributed_enabled": True, "rank": 1, "local_rank": 1, "world_size": 4,
+    })
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(RuntimeError, match="Distributed CUDA topology mismatch"):
+        age_core.initialize_distributed("cuda")
+
+
+def test_cloud_entry_preflights_visible_gpu_count():
+    text = (ROOT / "commands" / "run_dortmund_mipdb_age_joint_finetune_full.sh").read_text()
+    assert "torch.cuda.device_count()" in text
+    assert "NPROC_PER_NODE > VISIBLE_GPU_COUNT" in text
 
 
 @pytest.mark.parametrize("profile", ["joint_matched18", "joint_native64_vs_sparse18"])

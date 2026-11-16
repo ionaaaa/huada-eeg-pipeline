@@ -15,7 +15,7 @@ set -euo pipefail
 : "${PRETRAINED_50M_CKPT:=${HUADA_ROOT}/data/checkpoint/pretrain_checkpoint_4.pt}"
 : "${EXPECTED_CKPT_SHA256:=97335b696b3ae9138dcb51c736f49ee1c6008fdc22fc42f13ea9a5301452f36e}"
 : "${OUTPUT_ROOT:=${HUADA_ROOT}/downstream_output}"
-: "${NPROC_PER_NODE:=2}"
+: "${NPROC_PER_NODE:=}"
 : "${PER_DEVICE_BATCH_SIZE:=2}"
 : "${ACCUMULATION_STEPS:=16}"
 : "${FULL_EPOCHS:=100}"
@@ -49,6 +49,19 @@ test -f "${PRETRAINED_50M_CKPT}"
 test ! -e "${RUN_OUTPUT}"
 printf '%s  %s\n' "${EXPECTED_CKPT_SHA256}" "${PRETRAINED_50M_CKPT}" | sha256sum -c -
 
+VISIBLE_GPU_COUNT="$("${PYTHON_BIN}" -c 'import torch; print(torch.cuda.device_count())')"
+if [[ -z "${NPROC_PER_NODE}" ]]; then
+  NPROC_PER_NODE="${VISIBLE_GPU_COUNT}"
+fi
+if (( VISIBLE_GPU_COUNT < 1 )); then
+  echo "No CUDA GPU is visible to PyTorch" >&2
+  exit 2
+fi
+if (( NPROC_PER_NODE < 1 || NPROC_PER_NODE > VISIBLE_GPU_COUNT )); then
+  echo "Invalid NPROC_PER_NODE=${NPROC_PER_NODE}; visible_gpu_count=${VISIBLE_GPU_COUNT}; CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}" >&2
+  exit 2
+fi
+
 cd "${HUADA_ROOT}"
 export PYTHONPATH="${HUADA_ROOT}/scripts/downstream_50m:${PYTHONPATH:-}"
 
@@ -58,6 +71,8 @@ if [[ -n "${AUDIT_SUMMARY:-}" && -f "${AUDIT_SUMMARY}" ]]; then
 fi
 
 echo "training_profile=${TRAINING_PROFILE}"
+echo "visible_gpu_count=${VISIBLE_GPU_COUNT}"
+echo "nproc_per_node=${NPROC_PER_NODE}"
 echo "samples_per_epoch=${SAMPLES_PER_EPOCH}"
 echo "effective_global_batch_size=$((PER_DEVICE_BATCH_SIZE * NPROC_PER_NODE * ACCUMULATION_STEPS))"
 echo "mipdb_filter=block01"

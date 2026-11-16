@@ -16,7 +16,12 @@ DOWNSTREAM = HERE / "downstream_50m"
 if str(DOWNSTREAM) not in sys.path:
     sys.path.insert(0, str(DOWNSTREAM))
 
-from age_joint_training import build_joint_target_transform, validate_joint_manifest
+from age_joint_training import (
+    build_joint_target_transform,
+    canonical_csv_sha256,
+    canonical_json_sha256,
+    validate_joint_manifest,
+)
 from dortmund_age_finetune import sha256_file
 
 
@@ -99,7 +104,7 @@ def main() -> int:
     write_csv(mipdb_path, mipdb_rows, fields)
     write_csv(joint_path, joint_rows, fields)
 
-    transform = build_joint_target_transform(joint_rows, sha256_file(joint_path))
+    transform = build_joint_target_transform(joint_rows, canonical_csv_sha256(joint_path))
     transform_path.write_text(
         json.dumps(asdict(transform), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -111,6 +116,7 @@ def main() -> int:
         "mipdb_sex_used_for_stratification": False,
         "joint_train_subject_count": 187,
         "target_transform": asdict(transform),
+        "fingerprint_policy": "canonical_content_v1",
         "source": {
             "dortmund_manifest": str(args.dortmund_manifest),
             "dortmund_manifest_sha256": sha256_file(args.dortmund_manifest),
@@ -123,6 +129,11 @@ def main() -> int:
             "mipdb_subject_split_manifest": sha256_file(mipdb_path),
             "joint_subject_split_manifest": sha256_file(joint_path),
             "joint_target_transform": sha256_file(transform_path),
+        },
+        "canonical_sha256": {
+            "mipdb_subject_split_manifest": canonical_csv_sha256(mipdb_path),
+            "joint_subject_split_manifest": canonical_csv_sha256(joint_path),
+            "joint_target_transform": canonical_json_sha256(transform_path),
         },
     }
     contract_path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
