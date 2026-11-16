@@ -77,22 +77,39 @@ from largeScale_fineTune import build_backbone, compute_shape_params
 from utils import set_seed
 from fbmae_training_profiles import (
     ProfiledTokenDataset,
+    build_checkpoint_profile_contract,
     load_training_profiles,
     resolve_training_profile,
+)
+from age_joint_training import (
+    JOINT_PROFILE_IDS,
+    MIPDB_BLOCK_FILTER,
+    MultiSourceAgeDataset,
+    joint_metric_bundle,
+    split_prediction_rows,
+    validate_frozen_joint_contract,
 )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-lance", required=True)
+    parser.add_argument("--mipdb-input-lance")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--split-manifest", type=Path, required=True)
+    parser.add_argument("--mipdb-split-manifest", type=Path)
+    parser.add_argument("--joint-subject-split-manifest", type=Path)
+    parser.add_argument("--joint-target-transform", type=Path)
+    parser.add_argument("--joint-training-contract", type=Path)
+    parser.add_argument("--mipdb-block-id", default=MIPDB_BLOCK_FILTER)
     parser.add_argument(
         "--training-profiles", type=Path,
         default=SCRIPTS_ROOT.parent / "configs" / "mipdb_dortmund_fbmae_training_profiles_v1.json",
     )
     parser.add_argument(
-        "--training-profile", choices=["dortmund_native64", "dortmund_matched18"],
+        "--training-profile", choices=[
+            "dortmund_native64", "dortmund_matched18", *JOINT_PROFILE_IDS,
+        ],
         default="dortmund_native64",
     )
     parser.add_argument("--audit-summary", type=Path)
@@ -167,6 +184,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--audit-summary is required when --audit-policy=enforce")
     if args.max_epochs_this_run is not None and (not args.smoke or args.max_epochs_this_run < 1):
         raise ValueError("--max-epochs-this-run is a positive smoke-only control")
+    if args.training_profile in JOINT_PROFILE_IDS:
+        required = {
+            "mipdb_input_lance": args.mipdb_input_lance,
+            "mipdb_split_manifest": args.mipdb_split_manifest,
+            "joint_subject_split_manifest": args.joint_subject_split_manifest,
+            "joint_target_transform": args.joint_target_transform,
+            "joint_training_contract": args.joint_training_contract,
+        }
+        missing = sorted(key for key, value in required.items() if value is None)
+        if missing:
+            raise ValueError(f"Joint training requires: {missing}")
+        if args.mipdb_block_id != MIPDB_BLOCK_FILTER:
+            raise ValueError("Joint protocol v1 is frozen to MIPDB block01")
 
 
 def _json(path: Path, payload: Any) -> None:
@@ -329,6 +359,18 @@ def _profile_dataset_audit(
     token_valid = transformed["token_valid_mask"].bool()
     if not torch.all(transformed["token_inputs"][~token_valid] == 0):
         raise RuntimeError("Training profile left nonzero data in an invalid token")
+    if "targets" in transformed and not torch.all(transformed["targets"][~token_valid] == 0):
+        raise RuntimeError("Training profile left nonzero TF target in an invalid token")
+    def tensor_fingerprint(sample: dict[str, Any]) -> str:
+        digest = hashlib.sha256()
+        for key in ("token_inputs", "token_valid_mask", "targets", "channel_valid_mask"):
+            if key in sample:
+                value = sample[key].detach().cpu().contiguous().numpy()
+                digest.update(key.encode("utf-8"))
+                digest.update(str(value.dtype).encode("ascii"))
+                digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+                digest.update(value.tobytes())
+        return digest.hexdigest()
     return {
         "sample_id_order_unchanged": True,
         "sample_id_order_sha256": sha256_json(source_ids),
@@ -338,6 +380,9 @@ def _profile_dataset_audit(
         "profiled_probe_valid_tokens": int(transformed["token_valid_mask"].sum().item()),
         "profiled_probe_valid_channels": int(transformed["channel_valid_mask"].sum().item()),
         "invalid_token_inputs_strictly_zero": True,
+        "invalid_tf_targets_strictly_zero": True,
+        "source_probe_tensor_sha256": tensor_fingerprint(original),
+        "profiled_probe_tensor_sha256": tensor_fingerprint(transformed),
     }
 
 
@@ -350,6 +395,24 @@ def _smoke_subset(dataset: LanceEEGPretrainDataset, subject_limit: int, windows_
         selected.extend(choices[:windows_per_subject])
     if not selected:
         raise ValueError("Smoke subset is empty")
+    return Subset(dataset, selected)
+
+
+def _joint_smoke_subset(
+    dataset: MultiSourceAgeDataset, subject_limit: int, windows_per_subject: int,
+) -> Subset:
+    rows = dataset.get_sampling_rows()
+    selected = []
+    for dataset_id in sorted({str(row["dataset_id"]) for row in rows}):
+        source_rows = [row for row in rows if str(row["dataset_id"]) == dataset_id]
+        subjects = sorted({str(row["sampling_subject_id"]) for row in source_rows})[:subject_limit]
+        for subject in subjects:
+            selected.extend([
+                int(row["index"]) for row in source_rows
+                if str(row["sampling_subject_id"]) == subject
+            ][:windows_per_subject])
+    if not selected:
+        raise ValueError("Joint smoke subset is empty")
     return Subset(dataset, selected)
 
 
@@ -440,7 +503,9 @@ def _evaluate(
                 local_rows.append({
                     "sample_id": str(sample_id),
                     "subject_id": str(batch["subject_id"][index]),
+                    "dataset_id": str(batch.get("dataset_id", ["dortmund"] * len(batch["sample_id"]))[index]),
                     "recording_id": str(batch.get("recording_id", [""] * len(batch["sample_id"]))[index]),
+                    "block_id": str(batch.get("block_id", [""] * len(batch["sample_id"]))[index]),
                     "eyes_condition": str(batch.get("eyes_condition", [""] * len(batch["sample_id"]))[index]),
                     "sex": str(batch.get("sex", [""] * len(batch["sample_id"]))[index]),
                     "true_age": float(truth_year[index].item()),
@@ -455,15 +520,87 @@ def _evaluate(
     metrics = None
     if context["rank"] == 0:
         validate_prediction_coverage(gathered, expected_ids)
-        metrics = metric_bundle(gathered)
+        dataset_ids = {str(row.get("dataset_id", "dortmund")) for row in gathered}
+        metrics = joint_metric_bundle(gathered) if len(dataset_ids) > 1 else metric_bundle(gathered)
     return loss, gathered if context["rank"] == 0 else [], metrics
+
+
+WINDOW_PREDICTION_FIELDS = [
+    "dataset_id", "sample_id", "subject_id", "recording_id", "block_id",
+    "eyes_condition", "sex", "true_age", "predicted_age", "predicted_z",
+]
+SUBJECT_PREDICTION_FIELDS = [
+    "dataset_id", "subject_id", "sex", "true_age", "mean_predicted_age",
+    "median_predicted_age", "prediction_std", "signed_error", "absolute_error",
+    "window_count", "eyes_open_windows", "eyes_closed_windows",
+]
+
+
+def _write_evaluation_outputs(
+    output_dir: Path, split: str, rows: list[dict[str, Any]], metrics: dict[str, Any],
+    z_loss: float, train_mean: float, is_joint: bool,
+) -> dict[str, Any]:
+    _csv(output_dir / f"{split}_window_predictions.csv", rows, WINDOW_PREDICTION_FIELDS)
+    if not is_joint:
+        subjects = aggregate_subject_predictions(rows)
+        for row in subjects:
+            row["dataset_id"] = "dortmund"
+        baseline = train_mean_baseline(subjects, train_mean)
+        baseline["model_delta_mae"] = metrics["subject_mean"]["mae"] - baseline["mae"]
+        baseline["model_better_than_baseline"] = metrics["subject_mean"]["mae"] < baseline["mae"]
+        _csv(output_dir / f"{split}_subject_predictions.csv", subjects, SUBJECT_PREDICTION_FIELDS)
+        _json(output_dir / f"{split}_metrics.json", {**metrics, "subject_rows": None, "z_loss": z_loss})
+        _json(output_dir / f"{split}_baseline_metrics.json", baseline)
+        return {**metrics, "subject_rows": None, "z_loss": z_loss}
+
+    combined_subjects = []
+    baselines = {}
+    serializable = {
+        **metrics,
+        "datasets": {
+            dataset_id: {**bundle, "subject_rows": None}
+            for dataset_id, bundle in metrics["datasets"].items()
+        },
+        "z_loss": z_loss,
+    }
+    for dataset_id, bundle in metrics["datasets"].items():
+        dataset_rows = split_prediction_rows(rows, dataset_id)
+        subjects = aggregate_subject_predictions(dataset_rows)
+        for row in subjects:
+            row["dataset_id"] = dataset_id
+        combined_subjects.extend(subjects)
+        baseline = train_mean_baseline(subjects, train_mean)
+        baseline["model_delta_mae"] = bundle["subject_mean"]["mae"] - baseline["mae"]
+        baseline["model_better_than_baseline"] = bundle["subject_mean"]["mae"] < baseline["mae"]
+        baselines[dataset_id] = baseline
+        _csv(
+            output_dir / f"{split}_{dataset_id}_window_predictions.csv",
+            dataset_rows, WINDOW_PREDICTION_FIELDS,
+        )
+        _csv(
+            output_dir / f"{split}_{dataset_id}_subject_predictions.csv",
+            subjects, SUBJECT_PREDICTION_FIELDS,
+        )
+        _json(
+            output_dir / f"{split}_{dataset_id}_metrics.json",
+            {**bundle, "subject_rows": None},
+        )
+        _json(output_dir / f"{split}_{dataset_id}_baseline_metrics.json", baseline)
+    _csv(output_dir / f"{split}_subject_predictions.csv", combined_subjects, SUBJECT_PREDICTION_FIELDS)
+    _json(output_dir / f"{split}_metrics.json", serializable)
+    _json(output_dir / f"{split}_baseline_metrics.json", {
+        "datasets": baselines, "baseline_prediction": train_mean,
+        "aggregation_policy": "reported_per_dataset_no_window_pooling",
+    })
+    return serializable
 
 
 def _checkpoint_payload(
     raw_model: StrictDortmundAgeModel,
     *, args, cfg, shape, transform, manifest_sha, token_snapshot, pretrained_report,
     selection, gradient_scope, gradient_audit, optimizer_report, scheduler_report,
-    resolved_hash, git_state, critical_hashes, training_profile, initial_model_fingerprint,
+    resolved_hash, git_state, critical_hashes, training_profile,
+    checkpoint_profile_contract, initial_model_fingerprint,
 ) -> dict[str, Any]:
     return {
         "checkpoint_kind": "dortmund_age_50m_full_finetune",
@@ -486,13 +623,24 @@ def _checkpoint_payload(
             "channel_profile_resolved.json", {"status": "not_recorded"}
         ),
         "token_mask_semantics_version": MASK_SEMANTICS_VERSION,
-        "source_reference_metadata": {"source_reference": "FCz", "processing_reference": "unchanged", "rereference_applied": False},
+        "source_reference_metadata": (
+            {
+                "by_dataset": {
+                    "dortmund": {"source_reference": "FCz", "processing_reference": "unchanged", "rereference_applied": False},
+                    "mipdb": {"source_reference": "unknown", "processing_reference": "unchanged", "rereference_applied": False},
+                }
+            }
+            if args.training_profile in JOINT_PROFILE_IDS else
+            {"source_reference": "FCz", "processing_reference": "unchanged", "rereference_applied": False}
+        ),
         "target_transform": asdict(transform),
         "split_manifest_sha256": manifest_sha,
         "source_token_lance_fingerprint": token_snapshot["fingerprint"],
         "source_token_adapter_provenance": token_snapshot["adapter_provenance"],
         "pretrained_checkpoint": pretrained_report,
-        "training_profile": training_profile,
+        "checkpoint_profile_contract_version": checkpoint_profile_contract["checkpoint_profile_contract_version"],
+        "training_profile": checkpoint_profile_contract["training_profile"],
+        "deployment_profiles": checkpoint_profile_contract["deployment_profiles"],
         "initial_model_fingerprint": initial_model_fingerprint,
         "best_epoch": None if selection is None else selection["epoch"],
         "validation_metrics": None if selection is None else selection.get("metrics"),
@@ -523,28 +671,97 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.training_profiles.is_file():
             raise FileNotFoundError(args.training_profiles)
         profile_catalog = load_training_profiles(args.training_profiles)
+        is_joint = args.training_profile in JOINT_PROFILE_IDS
         training_profile = resolve_training_profile(
             profile_catalog, args.training_profile, "dortmund"
+        )
+        dataset_profiles = {"dortmund": training_profile}
+        if is_joint:
+            dataset_profiles["mipdb"] = resolve_training_profile(
+                profile_catalog, args.training_profile, "mipdb"
+            )
+            if dataset_profiles["mipdb"]["dataset_filter"].get("block_id") != args.mipdb_block_id:
+                raise ValueError("CLI MIPDB block filter does not match the training profile")
+        checkpoint_profile_contract = build_checkpoint_profile_contract(
+            profile_catalog, args.training_profile
         )
         source_manifest_rows = _read_manifest(args.split_manifest)
         source_manifest_sha = sha256_file(args.split_manifest)
         manifest_rows = _filter_manifest_rows(
             source_manifest_rows, training_profile["min_age"], training_profile["max_age"]
         )
-        manifest_sha = _manifest_csv_sha256(manifest_rows)
-        transform = build_target_transform(manifest_rows, manifest_sha)
-        token_snapshot = _lance_fingerprint(args.input_lance)
-        token_snapshot["adapter_provenance"] = _token_adapter_provenance(args.input_lance)
-        token_before = token_snapshot["fingerprint"]
+        source_manifest_shas = {"dortmund": source_manifest_sha}
+        joint_contract = None
+        if is_joint:
+            assert args.mipdb_split_manifest is not None
+            assert args.joint_subject_split_manifest is not None
+            assert args.joint_target_transform is not None
+            assert args.joint_training_contract is not None
+            manifest_rows, transform, joint_contract = validate_frozen_joint_contract(
+                joint_manifest_path=args.joint_subject_split_manifest,
+                target_transform_path=args.joint_target_transform,
+                contract_path=args.joint_training_contract,
+            )
+            manifest_sha = sha256_file(args.joint_subject_split_manifest)
+            mipdb_manifest_rows = _read_manifest(args.mipdb_split_manifest)
+            source_manifest_shas["mipdb"] = sha256_file(args.mipdb_split_manifest)
+            expected_dortmund = {
+                (str(row["subject_id"]), float(row["age"]), str(row["split"]))
+                for row in manifest_rows if str(row["dataset_id"]) == "dortmund"
+            }
+            actual_dortmund = {
+                (str(row["subject_id"]), float(row["age"]), str(row["split"]))
+                for row in _filter_manifest_rows(
+                    source_manifest_rows, training_profile["min_age"], training_profile["max_age"]
+                )
+            }
+            expected_mipdb = {
+                (str(row["subject_id"]), float(row["age"]), str(row["split"]))
+                for row in manifest_rows if str(row["dataset_id"]) == "mipdb"
+            }
+            actual_mipdb = {
+                (str(row["subject_id"]), float(row["age"]), str(row["split"]))
+                for row in mipdb_manifest_rows
+            }
+            if expected_dortmund != actual_dortmund or expected_mipdb != actual_mipdb:
+                raise ValueError("Source split manifests do not match frozen joint manifest")
+        else:
+            manifest_sha = _manifest_csv_sha256(manifest_rows)
+            transform = build_target_transform(manifest_rows, manifest_sha)
+
+        dortmund_snapshot = _lance_fingerprint(args.input_lance)
+        dortmund_snapshot["adapter_provenance"] = _token_adapter_provenance(args.input_lance)
+        token_sources = {"dortmund": dortmund_snapshot}
+        if is_joint:
+            assert args.mipdb_input_lance is not None
+            mipdb_snapshot = _lance_fingerprint(args.mipdb_input_lance)
+            mipdb_snapshot["adapter_provenance"] = _token_adapter_provenance(args.mipdb_input_lance)
+            token_sources["mipdb"] = mipdb_snapshot
+            token_snapshot = {
+                "fingerprint": sha256_json({key: value["fingerprint"] for key, value in token_sources.items()}),
+                "row_count": sum(int(value["row_count"]) for value in token_sources.values()),
+                "sources": token_sources,
+                "adapter_provenance": {
+                    "sidecars": dortmund_snapshot["adapter_provenance"].get("sidecars", {}),
+                    "sources": {key: value["adapter_provenance"] for key, value in token_sources.items()},
+                },
+            }
+        else:
+            token_snapshot = dortmund_snapshot
+        token_before = {key: value["fingerprint"] for key, value in token_sources.items()}
 
         resolved = vars(args).copy()
         resolved.update({
             "checkpoint": None if args.checkpoint is None else str(args.checkpoint),
             "split_manifest": str(args.split_manifest),
             "source_split_manifest_sha256": source_manifest_sha,
+            "source_split_manifest_sha256_by_dataset": source_manifest_shas,
             "effective_split_manifest_sha256": manifest_sha,
             "training_profiles": str(args.training_profiles),
             "resolved_training_profile": training_profile,
+            "resolved_dataset_profiles": dataset_profiles,
+            "joint_training_contract": joint_contract,
+            "checkpoint_profile_contract": checkpoint_profile_contract,
             "audit_summary": None if args.audit_summary is None else str(args.audit_summary),
             "output_dir": str(args.output_dir), "resume": None if args.resume is None else str(args.resume),
             "distributed": context,
@@ -573,7 +790,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _json(args.output_dir / "resolved_config.json", resolved)
             _json(args.output_dir / "target_transform.json", asdict(transform))
             _csv(args.output_dir / "subject_split_manifest.csv", manifest_rows, list(manifest_rows[0]))
-            shutil.copyfile(args.split_manifest, args.output_dir / "source_subject_split_manifest.csv")
+            shutil.copyfile(args.split_manifest, args.output_dir / "dortmund_subject_split_manifest.csv")
+            if is_joint:
+                assert args.mipdb_split_manifest is not None
+                shutil.copyfile(args.mipdb_split_manifest, args.output_dir / "mipdb_subject_split_manifest.csv")
+            else:
+                shutil.copyfile(args.split_manifest, args.output_dir / "source_subject_split_manifest.csv")
             split_counts = {
                 split: sum(str(row["split"]) == split for row in manifest_rows)
                 for split in ("train", "validation", "test")
@@ -582,8 +804,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "split_counts": split_counts,
                 "manifest_sha256": manifest_sha,
                 "source_manifest_sha256": source_manifest_sha,
-                "source_subject_count": len(source_manifest_rows),
+                "source_manifest_sha256_by_dataset": source_manifest_shas,
+                "source_subject_count": len(manifest_rows) if is_joint else len(source_manifest_rows),
                 "effective_subject_count": len(manifest_rows),
+                "split_counts_by_dataset": {
+                    dataset_id: {
+                        split: sum(
+                            str(row.get("dataset_id", "dortmund")) == dataset_id
+                            and str(row["split"]) == split for row in manifest_rows
+                        ) for split in ("train", "validation", "test")
+                    } for dataset_id in dataset_profiles
+                },
                 "stable_subset_of_source_manifest": True,
                 "split_assignments_recomputed": False,
             })
@@ -645,29 +876,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         gradient_scope = configure_probe_gradient_scope(raw_model, args.probe_layer_idx)
         optimizer, optimizer_report = build_optimizer(raw_model, backbone_lr=args.backbone_lr, head_lr=args.head_lr, weight_decay=args.weight_decay)
 
-        train_source = LanceEEGPretrainDataset(
-            args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
-            split="train", min_age=training_profile["min_age"], max_age=training_profile["max_age"],
-        )
-        validation_source = LanceEEGPretrainDataset(
-            args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
-            split="validation", min_age=training_profile["min_age"], max_age=training_profile["max_age"],
-        )
-        train_dataset: ProfiledTokenDataset | Subset = ProfiledTokenDataset(
-            train_source, "dortmund", training_profile
-        )
-        validation_dataset: ProfiledTokenDataset | Subset = ProfiledTokenDataset(
-            validation_source, "dortmund", training_profile
-        )
+        def build_split_dataset(split: str):
+            sources: dict[str, LanceEEGPretrainDataset] = {}
+            profiled: dict[str, ProfiledTokenDataset] = {}
+            sources["dortmund"] = LanceEEGPretrainDataset(
+                args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
+                split=split, min_age=dataset_profiles["dortmund"]["min_age"],
+                max_age=dataset_profiles["dortmund"]["max_age"],
+            )
+            profiled["dortmund"] = ProfiledTokenDataset(
+                sources["dortmund"], "dortmund", dataset_profiles["dortmund"]
+            )
+            if is_joint:
+                assert args.mipdb_input_lance is not None
+                assert args.mipdb_split_manifest is not None
+                sources["mipdb"] = LanceEEGPretrainDataset(
+                    args.mipdb_input_lance, task="age_regression",
+                    subject_split_manifest=args.mipdb_split_manifest,
+                    split=split, min_age=dataset_profiles["mipdb"]["min_age"],
+                    max_age=dataset_profiles["mipdb"]["max_age"],
+                    metadata_filters={"block_id": [args.mipdb_block_id]},
+                )
+                profiled["mipdb"] = ProfiledTokenDataset(
+                    sources["mipdb"], "mipdb", dataset_profiles["mipdb"]
+                )
+            dataset = MultiSourceAgeDataset(profiled) if is_joint else profiled["dortmund"]
+            audit = {
+                dataset_id: _profile_dataset_audit(sources[dataset_id], profiled[dataset_id])
+                for dataset_id in profiled
+            }
+            return dataset, audit
+
+        train_dataset, train_profile_audit = build_split_dataset("train")
+        validation_dataset, validation_profile_audit = build_split_dataset("validation")
         profile_dataset_audit = {
-            "train": _profile_dataset_audit(train_source, train_dataset),
-            "validation": _profile_dataset_audit(validation_source, validation_dataset),
+            "train": train_profile_audit if is_joint else train_profile_audit["dortmund"],
+            "validation": validation_profile_audit if is_joint else validation_profile_audit["dortmund"],
         }
         if args.smoke:
-            train_dataset = _smoke_subset(train_dataset, args.smoke_train_subjects, args.smoke_windows_per_subject)
-            validation_dataset = _smoke_subset(validation_dataset, args.smoke_validation_subjects, args.smoke_windows_per_subject)
+            if is_joint:
+                train_dataset = _joint_smoke_subset(
+                    train_dataset, args.smoke_train_subjects, args.smoke_windows_per_subject
+                )
+                validation_dataset = _joint_smoke_subset(
+                    validation_dataset, args.smoke_validation_subjects, args.smoke_windows_per_subject
+                )
+            else:
+                train_dataset = _smoke_subset(train_dataset, args.smoke_train_subjects, args.smoke_windows_per_subject)
+                validation_dataset = _smoke_subset(validation_dataset, args.smoke_validation_subjects, args.smoke_windows_per_subject)
         train_rows = _sampling_rows(train_dataset)
-        samples_per_epoch = args.samples_per_epoch or len(train_dataset)
+        samples_per_epoch = args.samples_per_epoch or (6200 if is_joint else len(train_dataset))
         train_sampler = SubjectBalancedDistributedSampler(
             train_rows, samples_per_epoch=samples_per_epoch, seed=args.train_seed,
             rank=rank, world_size=context["world_size"], per_device_batch_size=args.batch_size,
@@ -688,7 +946,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         critical_paths = [
             Path(__import__(module).__file__).resolve()
-            for module in ("model", "largeScale_fineTune", "lance_dataset", "dortmund_age_finetune")
+            for module in (
+                "model", "largeScale_fineTune", "lance_dataset",
+                "dortmund_age_finetune", "age_joint_training",
+            )
         ] + [Path(__file__).resolve(), SCRIPTS_ROOT / "fbmae_training_profiles.py", args.training_profiles.resolve()]
         critical_hashes = {path.name: sha256_file(path) for path in critical_paths}
         git_state = _git_state()
@@ -699,7 +960,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "audit_gate": gate, "token_snapshot_before": token_snapshot,
                 "split_manifest_sha256": manifest_sha, "pretrained_checkpoint": pretrained_report,
                 "source_split_manifest_sha256": source_manifest_sha,
+                "source_split_manifest_sha256_by_dataset": source_manifest_shas,
                 "training_profile": training_profile,
+                "dataset_profiles": dataset_profiles,
+                "joint_training_contract": joint_contract,
+                "checkpoint_profile_contract": checkpoint_profile_contract,
                 "training_profiles_sha256": sha256_file(args.training_profiles),
                 "profile_dataset_audit": profile_dataset_audit,
                 "initial_model_fingerprint": initial_model_fingerprint,
@@ -808,7 +1073,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             decision = None
             if rank == 0:
                 assert validation_metrics is not None
-                subject_metrics = validation_metrics["subject_mean"]
+                selection_metrics = (
+                    validation_metrics["datasets"]["dortmund"] if is_joint
+                    else validation_metrics
+                )
+                subject_metrics = selection_metrics["subject_mean"]
                 candidate = {
                     "epoch": epoch, "subject_mae": subject_metrics["mae"],
                     "subject_rmse": subject_metrics["rmse"], "validation_loss": validation_loss,
@@ -826,6 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         optimizer_report=optimizer_report, scheduler_report=scheduler_report,
                         resolved_hash=resolved_hash, git_state=git_state, critical_hashes=critical_hashes,
                         training_profile=training_profile,
+                        checkpoint_profile_contract=checkpoint_profile_contract,
                         initial_model_fingerprint=initial_model_fingerprint,
                     )
                     atomic_torch_save(payload, args.output_dir / "checkpoints" / "best_full_checkpoint.pt")
@@ -847,7 +1117,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "validation_z_loss": validation_loss,
                     "validation_subject_mae": subject_metrics["mae"],
                     "validation_subject_rmse": subject_metrics["rmse"],
-                    "validation_window_mae": validation_metrics["window"]["mae"],
+                    "validation_window_mae": selection_metrics["window"]["mae"],
+                    "mipdb_validation_subject_mae": (
+                        validation_metrics["datasets"]["mipdb"]["subject_mean"]["mae"]
+                        if is_joint else None
+                    ),
+                    "joint_macro_validation_subject_mae": (
+                        validation_metrics["joint_macro"]["subject_mean_mae"]
+                        if is_joint else None
+                    ),
                     "backbone_lr": current_backbone_lr,
                     "head_lr": current_head_lr,
                     "gradient_norm": max_grad_norm, "parameter_norm": _parameter_norm(raw_model),
@@ -871,7 +1149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 _csv(
                     args.output_dir / "sampler_epoch_statistics.csv", sampler_rows,
-                    ["epoch", "requested_samples", "global_samples", "local_samples_per_rank", "subject_counts", "subject_condition_counts", "missing_condition_subjects", "unique_window_count", "unique_window_fraction", "repeated_draw_count", "cross_rank_window_identity_overlap", "ddp_padding_duplicates", "rank_lengths"],
+                    ["epoch", "requested_samples", "global_samples", "local_samples_per_rank", "subject_counts", "subject_condition_counts", "missing_condition_subjects", "unique_window_count", "unique_window_fraction", "repeated_draw_count", "cross_rank_window_identity_overlap", "ddp_padding_duplicates", "rank_lengths", "sample_id_sequence_sha256", "sampling_schedule_sha256", "dataset_count", "subject_count"],
                 )
                 local_rng = capture_rng_state()
             else:
@@ -890,6 +1168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     optimizer_report=optimizer_report, scheduler_report=scheduler_report,
                     resolved_hash=resolved_hash, git_state=git_state, critical_hashes=critical_hashes,
                     training_profile=training_profile,
+                    checkpoint_profile_contract=checkpoint_profile_contract,
                     initial_model_fingerprint=initial_model_fingerprint,
                 )
                 last.update({
@@ -936,25 +1215,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if rank == 0:
             assert final_val_metrics is not None
-            val_subjects = aggregate_subject_predictions(final_val_rows)
-            val_baseline = train_mean_baseline(val_subjects, transform.source_age_mean)
-            val_baseline["model_delta_mae"] = final_val_metrics["subject_mean"]["mae"] - val_baseline["mae"]
-            val_baseline["model_better_than_baseline"] = final_val_metrics["subject_mean"]["mae"] < val_baseline["mae"]
-            _csv(args.output_dir / "validation_window_predictions.csv", final_val_rows, ["sample_id", "subject_id", "recording_id", "eyes_condition", "sex", "true_age", "predicted_age", "predicted_z"])
-            _csv(args.output_dir / "validation_subject_predictions.csv", val_subjects, ["subject_id", "sex", "true_age", "mean_predicted_age", "median_predicted_age", "prediction_std", "signed_error", "absolute_error", "window_count", "eyes_open_windows", "eyes_closed_windows"])
-            _json(args.output_dir / "validation_metrics.json", {**final_val_metrics, "subject_rows": None, "z_loss": final_val_loss})
-            _json(args.output_dir / "validation_baseline_metrics.json", val_baseline)
+            _write_evaluation_outputs(
+                args.output_dir, "validation", final_val_rows, final_val_metrics,
+                final_val_loss, transform.source_age_mean, is_joint,
+            )
 
         test_metrics = {"status": "not_performed", "reason": "--skip-test"}
         if not args.skip_test:
             guard.mark_dataset_created()
-            test_source = LanceEEGPretrainDataset(
-                args.input_lance, task="age_regression", subject_split_manifest=args.split_manifest,
-                split="test", min_age=training_profile["min_age"], max_age=training_profile["max_age"],
-            )
-            test_dataset: ProfiledTokenDataset | Subset = ProfiledTokenDataset(
-                test_source, "dortmund", training_profile
-            )
+            test_dataset, test_profile_audit = build_split_dataset("test")
             test_sampler = NoPaddingDistributedEvalSampler(len(test_dataset), rank, context["world_size"])
             guard.mark_dataloader_created()
             test_loader = _dataloader(test_dataset, sampler=test_sampler, args=args)
@@ -964,17 +1233,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if rank == 0:
                 guard.mark_metrics()
                 assert test_bundle is not None
-                test_subjects = aggregate_subject_predictions(test_rows)
-                test_baseline = train_mean_baseline(test_subjects, transform.source_age_mean)
-                test_baseline["model_delta_mae"] = test_bundle["subject_mean"]["mae"] - test_baseline["mae"]
-                test_baseline["model_better_than_baseline"] = test_bundle["subject_mean"]["mae"] < test_baseline["mae"]
-                test_metrics = {**test_bundle, "subject_rows": None, "z_loss": test_loss}
-                _csv(args.output_dir / "test_window_predictions.csv", test_rows, ["sample_id", "subject_id", "recording_id", "eyes_condition", "sex", "true_age", "predicted_age", "predicted_z"])
-                _csv(args.output_dir / "test_subject_predictions.csv", test_subjects, ["subject_id", "sex", "true_age", "mean_predicted_age", "median_predicted_age", "prediction_std", "signed_error", "absolute_error", "window_count", "eyes_open_windows", "eyes_closed_windows"])
-                _json(args.output_dir / "test_baseline_metrics.json", test_baseline)
+                test_metrics = _write_evaluation_outputs(
+                    args.output_dir, "test", test_rows, test_bundle, test_loss,
+                    transform.source_age_mean, is_joint,
+                )
         if rank == 0 and args.skip_test:
-            _csv(args.output_dir / "test_window_predictions.csv", [], ["sample_id", "subject_id", "recording_id", "eyes_condition", "sex", "true_age", "predicted_age", "predicted_z"])
-            _csv(args.output_dir / "test_subject_predictions.csv", [], ["subject_id", "sex", "true_age", "mean_predicted_age", "median_predicted_age", "prediction_std", "signed_error", "absolute_error", "window_count"])
+            _csv(args.output_dir / "test_window_predictions.csv", [], WINDOW_PREDICTION_FIELDS)
+            _csv(args.output_dir / "test_subject_predictions.csv", [], SUBJECT_PREDICTION_FIELDS)
             _json(args.output_dir / "test_baseline_metrics.json", {"status": "not_performed", "reason": "--skip-test"})
         if rank == 0:
             _json(args.output_dir / "test_metrics.json", test_metrics)
@@ -983,9 +1248,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _csv(args.output_dir / "training_trajectory.csv", epoch_rows, epoch_fields)
             _csv(args.output_dir / "gradient_statistics.csv", gradient_rows, ["epoch", "gradient_norm", "parameter_norm", "unexplained_trainable_without_gradient"])
             _json(args.output_dir / "sampler_summary.json", {"version": train_sampler.statistics().get("version"), "requested_samples_per_epoch": samples_per_epoch, "global_rounding_multiple": context["world_size"] * args.batch_size, "ddp_padding_duplicates": 0})
-            _csv(args.output_dir / "sampler_epoch_statistics.csv", sampler_rows, ["epoch", "requested_samples", "global_samples", "local_samples_per_rank", "subject_counts", "subject_condition_counts", "missing_condition_subjects", "unique_window_count", "unique_window_fraction", "repeated_draw_count", "cross_rank_window_identity_overlap", "ddp_padding_duplicates", "rank_lengths"])
-            token_after = _lance_fingerprint(args.input_lance)
-            unchanged = token_after["fingerprint"] == token_before
+            _csv(args.output_dir / "sampler_epoch_statistics.csv", sampler_rows, ["epoch", "requested_samples", "global_samples", "local_samples_per_rank", "subject_counts", "subject_condition_counts", "missing_condition_subjects", "unique_window_count", "unique_window_fraction", "repeated_draw_count", "cross_rank_window_identity_overlap", "ddp_padding_duplicates", "rank_lengths", "sample_id_sequence_sha256", "sampling_schedule_sha256", "dataset_count", "subject_count"])
+            token_after = {"dortmund": _lance_fingerprint(args.input_lance)["fingerprint"]}
+            if is_joint:
+                assert args.mipdb_input_lance is not None
+                token_after["mipdb"] = _lance_fingerprint(args.mipdb_input_lance)["fingerprint"]
+            unchanged = token_after == token_before
             if not unchanged:
                 raise RuntimeError("Input Lance changed during training")
             if pretrained_report["random_init"]:
@@ -1017,6 +1285,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "profile_dataset_audit": profile_dataset_audit,
                 "initial_model_fingerprint": initial_model_fingerprint,
                 "input_lance_unchanged": unchanged,
+                "input_lance_unchanged_by_dataset": {
+                    key: token_after[key] == token_before[key] for key in token_before
+                },
                 "pretrained_checkpoint_unchanged": pretrained_unchanged,
                 "pretrained_checkpoint_unchanged_reason": pretrained_unchanged_reason,
                 "subject_split_isolation": "passed", "train_only_target_zscore": "passed",
@@ -1030,7 +1301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             (args.output_dir / "training_report.md").write_text(
                 "# Dortmund age 50M full-finetune run\n\n" +
                 f"- Status: `{summary['status']}`\n- Smoke: `{args.smoke}`\n" +
-                f"- Training profile: `{args.training_profile}` ({training_profile['min_age']:g}-{training_profile['max_age']:g}, {training_profile['channel_mode']})\n" +
+                f"- Training profile: `{args.training_profile}` ({training_profile['min_age']:g}-{training_profile['max_age']:g}, {training_profile['channel_profile_id']})\n" +
                 f"- Best epoch: `{best_payload['best_epoch']}`\n- Audit gate: `{gate['conclusion']}`\n" +
                 f"- Test: `{'skipped' if args.skip_test else 'performed once after lock'}`\n" +
                 f"- Input Lance unchanged: `{unchanged}`\n",

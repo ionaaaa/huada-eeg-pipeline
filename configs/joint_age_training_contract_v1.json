@@ -1,0 +1,33 @@
+{
+  "contract_version": "dortmund-mipdb-joint-age-v1",
+  "dortmund_split_policy": "inherited_172_21_21_unchanged",
+  "joint_train_subject_count": 187,
+  "mipdb_block_filter": "block01",
+  "mipdb_sex_used_for_stratification": false,
+  "mipdb_split_policy": "age_only_deterministic_15_2_2",
+  "sha256": {
+    "joint_subject_split_manifest": "057456a7c47d00e83ef55ec83c128edd67479cd5bcbe4852a76b8c482fc1d68b",
+    "joint_target_transform": "001ad6b30a414bab5644cba1dbd0859e411e432ff5270cf45ecc14b047d1396e",
+    "mipdb_subject_split_manifest": "e020f6d346a3dbc31f7f6d809071052f2b00c1bb2b8af82c4e595ef13d908019"
+  },
+  "source": {
+    "dortmund_manifest": "downstream_output\\dortmund_age_full_finetune_20261103_142815\\subject_split_manifest.csv",
+    "dortmund_manifest_sha256": "4d8f0d0e81e42aceb2646f992ad057080081c45914a7281e55608caeb6bcc1b5",
+    "mipdb_allowlist": "configs\\mipdb_age_20_35_subjects.txt",
+    "mipdb_allowlist_sha256": "8523e7d009d1eade666e8846482814e7f991796f0aa47e9fd93a53803545a521",
+    "mipdb_metadata": "data\\MIPDB\\MIPDB_PublicFile.csv",
+    "mipdb_metadata_sha256": "f023abd3932c831ff556fea751e81406c597ffbfea2af89600be12d457e68701"
+  },
+  "target_transform": {
+    "ddof": 0,
+    "equal_subject_weight": true,
+    "source_age_mean": 27.459893048128343,
+    "source_age_std": 4.20621465212978,
+    "target_transform": "zscore",
+    "target_unit": "year",
+    "train_subject_count": 187,
+    "train_subject_manifest_sha256": "057456a7c47d00e83ef55ec83c128edd67479cd5bcbe4852a76b8c482fc1d68b",
+    "version": "train-subject-equal-zscore-ddof0-v1",
+    "window_weighted": false
+  }
+}

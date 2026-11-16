@@ -21,6 +21,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+from fbmae_training_profiles import (
+    NATIVE64_PROFILE_ID, SPARSE18_PROFILE_ID, ProfiledTokenDataset,
+)
+
 try:
     from .dortmund_huada_zero_shot import (
         EXPECTED_SUBJECTS, FORMAL_CHECKPOINT_CONTRACT, MASK_SEMANTICS_VERSION,
@@ -82,6 +89,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
+        "--input-profile", choices=("auto", NATIVE64_PROFILE_ID, SPARSE18_PROFILE_ID),
+        default="auto",
+    )
+    parser.add_argument("--allow-profile-override", action="store_true")
+    parser.add_argument(
         "--expected-source-age-mean", type=float,
         help="Optional checkpoint source-scaler lock; must be supplied together with --expected-source-age-std.",
     )
@@ -119,6 +131,8 @@ def _dry_run(args: argparse.Namespace) -> int:
         "checkpoint": args.checkpoint, "output_dir": args.output_dir,
         "device": args.device, "batch_size": args.batch_size,
         "num_workers": args.num_workers, "stages": STAGES,
+        "input_profile": args.input_profile,
+        "allow_profile_override": args.allow_profile_override,
         "will_open_lance": False, "will_read_checkpoint": False,
         "will_create_model": False, "will_create_output_dir": False,
         "will_execute_forward": False, "will_write_predictions": False,
@@ -331,6 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             contract=replace(FORMAL_CHECKPOINT_CONTRACT, best_epoch=None),
             expected_source_mean=args.expected_source_age_mean,
             expected_source_std=args.expected_source_age_std,
+            target_dataset="huada",
+            requested_input_profile=args.input_profile,
+            allow_profile_override=args.allow_profile_override,
         )
         checkpoint_report["sha256_expectation_enforced"] = args.expected_checkpoint_sha256 is not None
         checkpoint_report["source_scaler_expectation_enforced"] = args.expected_source_age_mean is not None
@@ -348,7 +365,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _json(output / "model_fingerprint_before.json", fingerprint_before)
 
         logging.info("[stage 4/7] zero-shot inference")
-        data = HuadaAllSubjectDataset(input_path, lance_ds, metadata)
+        source_data = HuadaAllSubjectDataset(input_path, lance_ds, metadata)
+        data = ProfiledTokenDataset(
+            source_data, "huada", checkpoint_report["deployment_profile"]
+        )
         loader_kwargs = {"dataset": data, "batch_size": args.batch_size, "shuffle": False, "num_workers": args.num_workers, "collate_fn": label_blind_collate}
         if args.num_workers > 0:
             loader_kwargs["multiprocessing_context"] = "spawn"

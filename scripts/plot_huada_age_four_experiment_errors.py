@@ -223,6 +223,76 @@ def plot_errors(
     plt.close(fig)
 
 
+def plot_predicted_vs_true(
+    datasets: Mapping[str, Mapping[str, Mapping[str, float]]],
+    metrics: Mapping[str, Mapping[str, Any]],
+    output_dir: Path,
+    dpi: int,
+    font_family: str,
+) -> None:
+    """Render one consistently scaled panel per experiment."""
+    plt.rcParams.update({
+        "font.family": font_family,
+        "font.size": 9.5,
+        "axes.titlesize": 11.5,
+        "axes.labelsize": 10,
+        "legend.fontsize": 8.5,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+    })
+    all_values = []
+    for experiment in EXPERIMENTS:
+        rows = datasets[experiment["key"]]
+        all_values.extend(rows[subject]["true_age"] for subject in SUBJECTS)
+        all_values.extend(rows[subject]["prediction"] for subject in SUBJECTS)
+    values = np.asarray(all_values, dtype=float)
+    margin = max(1.0, float(np.ptp(values)) * 0.10)
+    lower, upper = float(values.min() - margin), float(values.max() + margin)
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.2, 10.0), sharex=True, sharey=True)
+    for ax, experiment in zip(axes.flat, EXPERIMENTS):
+        key = experiment["key"]
+        rows = datasets[key]
+        truth = np.asarray([rows[subject]["true_age"] for subject in SUBJECTS])
+        prediction = np.asarray([rows[subject]["prediction"] for subject in SUBJECTS])
+        ax.plot(
+            [lower, upper], [lower, upper], color="#777777", linestyle="--",
+            linewidth=1.1, label="Ideal: predicted = true", zorder=1,
+        )
+        ax.scatter(
+            truth, prediction, s=72, marker=experiment["marker"],
+            color=experiment["color"], edgecolor="white", linewidth=0.8, zorder=3,
+        )
+        for subject, x_value, y_value in zip(SUBJECTS, truth, prediction):
+            ax.annotate(
+                subject, (x_value, y_value), xytext=(5, 5),
+                textcoords="offset points", fontsize=7.5,
+                color=experiment["color"],
+            )
+        item = metrics[key]
+        ax.set_title(
+            f"{experiment['label']}\n"
+            f"MAE={item['mae']:.3f}, RMSE={item['rmse']:.3f}, r={item['pearson_r']:.3f}"
+        )
+        ax.set_xlim(lower, upper)
+        ax.set_ylim(lower, upper)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(color="#E0E0E0", linewidth=0.7, alpha=0.75)
+        ax.spines[["top", "right"]].set_visible(False)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Predicted age (years)")
+    for ax in axes[-1, :]:
+        ax.set_xlabel("Ground-truth age (years)")
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", frameon=False)
+    fig.suptitle("Huada Subject-level Age Prediction vs. Ground Truth", fontsize=16, y=0.985)
+    fig.tight_layout(rect=(0.02, 0.05, 0.98, 0.96))
+    fig.savefig(output_dir / "age_predicted_vs_ground_truth_scatter.png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(output_dir / "age_predicted_vs_ground_truth_scatter.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 def git_state(root: Path) -> dict[str, Any]:
     def run(*parts: str) -> str:
         result = subprocess.run(["git", *parts], cwd=root, capture_output=True, text=True, check=False)
@@ -294,6 +364,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     font_family = select_font()
     plot_errors(datasets, metrics, output_dir, args.dpi, font_family)
+    plot_predicted_vs_true(datasets, metrics, output_dir, args.dpi, font_family)
     summary = {
         "status": "passed",
         "subjects": len(SUBJECTS),
@@ -305,6 +376,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "metrics": metrics,
         "best_mae_experiment": min(metrics, key=lambda key: metrics[key]["mae"]),
         "best_rmse_experiment": min(metrics, key=lambda key: metrics[key]["rmse"]),
+        "predicted_vs_ground_truth_scatter_generated": True,
         "font_family": font_family,
     }
     write_json(output_dir / "age_prediction_error_summary.json", summary)

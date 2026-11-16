@@ -1,0 +1,12 @@
+{
+  "ddof": 0,
+  "equal_subject_weight": true,
+  "source_age_mean": 27.459893048128343,
+  "source_age_std": 4.20621465212978,
+  "target_transform": "zscore",
+  "target_unit": "year",
+  "train_subject_count": 187,
+  "train_subject_manifest_sha256": "057456a7c47d00e83ef55ec83c128edd67479cd5bcbe4852a76b8c482fc1d68b",
+  "version": "train-subject-equal-zscore-ddof0-v1",
+  "window_weighted": false
+}

@@ -72,6 +72,7 @@ class LanceEEGPretrainDataset(Dataset):
         min_age=None,
         max_age=None,
         max_samples=None,
+        metadata_filters=None,
     ):
         if task not in SUPPORTED_TASKS:
             raise ValueError(f"Unsupported task={task!r}; expected {sorted(SUPPORTED_TASKS)}")
@@ -82,12 +83,22 @@ class LanceEEGPretrainDataset(Dataset):
         self.split = split
         self.min_age = None if min_age is None else float(min_age)
         self.max_age = None if max_age is None else float(max_age)
+        self.metadata_filters = {
+            str(key): {str(item) for item in (value if isinstance(value, (list, tuple, set)) else [value])}
+            for key, value in (metadata_filters or {}).items()
+        }
         if self.min_age is not None and self.max_age is not None and self.min_age > self.max_age:
             raise ValueError("min_age cannot exceed max_age")
         self.manifest = load_subject_manifest(subject_split_manifest)
         self.ds = None
         self._metadata = self._read_metadata()
-        for optional_name in ("window_index", "eyes_condition"):
+        missing_filter_columns = sorted(set(self.metadata_filters) - set(self._open().schema.names))
+        if missing_filter_columns:
+            raise ValueError(f"Input Lance is missing metadata filter fields: {missing_filter_columns}")
+        for optional_name in (
+            "window_index", "eyes_condition", "block_id", "task_semantics",
+            "resting_state_confirmed", "source_path", "header_signature",
+        ):
             if optional_name in self._open().schema.names and optional_name not in self.columns:
                 self.columns.append(optional_name)
         self.indices = self._select_indices(max_samples=max_samples)
@@ -106,7 +117,11 @@ class LanceEEGPretrainDataset(Dataset):
         if missing:
             raise ValueError(f"Input Lance is missing required fields: {missing}")
         optional = [
-            name for name in ("recording_id", "window_index", "eyes_condition")
+            name for name in dict.fromkeys((
+                "recording_id", "window_index", "eyes_condition", "block_id",
+                "task_semantics", "resting_state_confirmed", "source_path",
+                "header_signature", *self.metadata_filters,
+            ))
             if name in ds.schema.names
         ]
         return ds.to_table(
@@ -139,6 +154,8 @@ class LanceEEGPretrainDataset(Dataset):
         subject_labels = {}
         manifest_subjects_seen = set()
         for index, row in enumerate(self._metadata):
+            if any(str(row.get(key, "")) not in allowed for key, allowed in self.metadata_filters.items()):
+                continue
             subject_id = self._normalize_subject_id(row["subject_id"])
             label, label_name = self._label_from_row(row)
             manifest_row = self.manifest.get(subject_id)
@@ -222,9 +239,14 @@ class LanceEEGPretrainDataset(Dataset):
             "model_sfreq": torch.tensor(float(row["model_sfreq"]), dtype=torch.float32),
             "label_name": label_name,
         }
-        for metadata_key in ("sex", "eyes_condition"):
+        for metadata_key in (
+            "sex", "eyes_condition", "block_id", "task_semantics", "source_path",
+            "header_signature",
+        ):
             if metadata_key in row:
                 sample[metadata_key] = str(row[metadata_key])
+        if "resting_state_confirmed" in row:
+            sample["resting_state_confirmed"] = bool(row["resting_state_confirmed"])
         if "window_index" in row:
             sample["window_index"] = torch.tensor(
                 int(row["window_index"]), dtype=torch.int64
@@ -284,6 +306,7 @@ class LanceEEGPretrainDataset(Dataset):
                 "subject_id": self._normalize_subject_id(row["subject_id"]),
                 "recording_id": str(row.get("recording_id", "")),
                 "eyes_condition": str(row.get("eyes_condition", "")),
+                "block_id": str(row.get("block_id", "")),
                 "age": None if row.get("age") is None else float(row["age"]),
                 "sex": str(row.get("sex", "")),
             })

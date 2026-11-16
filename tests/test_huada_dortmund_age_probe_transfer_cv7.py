@@ -17,6 +17,7 @@ sys.path.insert(0, str(MODULE_ROOT))
 
 import age_cv7
 import run_huada_dortmund_age_probe_transfer_cv7 as transfer
+from fbmae_training_profiles import NATIVE64_PROFILE_ID, get_channel_profile
 
 
 AGES = {"SUB1": 22.0, "SUB2": 24.0, "SUB3": 25.0, "SUB4": 27.0, "SUB6": 28.0, "SUB7": 30.0, "SUB8": 31.0}
@@ -46,7 +47,7 @@ def source_state():
     return {"weight": torch.zeros(1, 512), "bias": torch.zeros(1)}
 
 
-def fake_source_loader(_path, _sha):
+def fake_source_loader(_path, _sha, **_kwargs):
     state = source_state()
     scaler = transfer.FixedSourceScaler(27.5, 4.218591123456, 0)
     report = {"sha256": "a" * 64, "path": str(Path("fake_best_full_checkpoint.pt").resolve())}
@@ -126,9 +127,15 @@ def test_sub5_is_rejected_from_age_cv7(tmp_path):
 
 def test_cache_key_binds_source_checkpoint_vocab_mask_and_input():
     info = {"row_count": 14, "sample_id_fingerprint": "samples"}
+    native = get_channel_profile(NATIVE64_PROFILE_ID)
+    deployment = {
+        **native, "effective_profile_id": NATIVE64_PROFILE_ID,
+        "profile_override": False,
+    }
     base = {
         "sha256": "a" * 64, "electrode_vocabulary_sha256": "vocab-a",
         "token_mask_semantics_version": transfer.MASK_SEMANTICS_VERSION, "best_epoch": 20,
+        "deployment_profile": deployment,
     }
     identity_a, key_a = transfer.build_dortmund_cache_identity(
         input_fingerprint="input-a", input_info=info, checkpoint_report=base,
@@ -207,7 +214,8 @@ def test_head_only_checkpoint_validation_rejects_backbone():
 
 def test_fold_reloads_source_epoch0_can_win_and_test_runs_once(tmp_path, monkeypatch):
     calls = []
-    def loader(path, sha):
+    def loader(path, sha, **kwargs):
+        del kwargs
         calls.append((path, sha)); return fake_source_loader(path, sha)
     monkeypatch.setattr(transfer, "load_source_probe_state", loader)
     def deliberately_worsen(model, loader, optimizer, device, scaler):

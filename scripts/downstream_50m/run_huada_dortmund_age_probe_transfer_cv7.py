@@ -33,6 +33,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
+SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+from fbmae_training_profiles import (
+    NATIVE64_PROFILE_ID, SPARSE18_PROFILE_ID, ProfiledTokenDataset,
+    resolve_checkpoint_deployment_profile,
+)
+
 try:
     from . import age_cv7
     from . import feature_cache as cache
@@ -106,6 +114,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--input-profile", choices=("auto", NATIVE64_PROFILE_ID, SPARSE18_PROFILE_ID),
+        default="auto",
+    )
+    parser.add_argument("--allow-profile-override", action="store_true")
     parser.add_argument("--expected-source-age-mean", type=float)
     parser.add_argument("--expected-source-age-std", type=float)
     parser.add_argument("--log-level", default="INFO")
@@ -171,6 +184,9 @@ def load_source_probe_state(
     expected_sha256: str | None,
     expected_source_mean: float | None = None,
     expected_source_std: float | None = None,
+    target_dataset: str | None = None,
+    requested_input_profile: str = "auto",
+    allow_profile_override: bool = False,
 ):
     """Strictly re-read and validate the authoritative full checkpoint per fold."""
     path = Path(checkpoint_path)
@@ -187,6 +203,10 @@ def load_source_probe_state(
         expected_source_mean=expected_source_mean,
         expected_source_std=expected_source_std,
     )
+    if target_dataset is not None:
+        report["deployment_profile"] = resolve_checkpoint_deployment_profile(
+            payload, target_dataset, requested_input_profile, allow_profile_override
+        )
     state = payload["age_probe_state_dict"]
     probe = {"weight": state["weight"].detach().cpu().clone(), "bias": state["bias"].detach().cpu().clone()}
     if tuple(probe["weight"].shape) != (1, 512) or tuple(probe["bias"].shape) != (1,):
@@ -431,6 +451,7 @@ def run_fold(
     expected_source_mean=None, expected_source_std=None, cache_info,
     split_manifest_sha256, output_dir, device, batch_size, num_workers, seed,
     head_lr, weight_decay, epochs, patience, logger, provenance=None,
+    input_profile="auto", allow_profile_override=False,
 ):
     fold = int(fold_info["fold"]); fold_seed = int(seed) + fold
     fold_dir = output_dir / f"fold_{fold}"; checkpoint_dir = fold_dir / "checkpoints"
@@ -446,11 +467,15 @@ def run_fold(
     # Required full-checkpoint re-read; previous fold state can never enter.
     if expected_source_mean is None and expected_source_std is None:
         source_state, source_fingerprint, checkpoint_info, scaler = load_source_probe_state(
-            checkpoint_path, expected_sha256,
+            checkpoint_path, expected_sha256, target_dataset="huada",
+            requested_input_profile=input_profile,
+            allow_profile_override=allow_profile_override,
         )
     else:
         source_state, source_fingerprint, checkpoint_info, scaler = load_source_probe_state(
             checkpoint_path, expected_sha256, expected_source_mean, expected_source_std,
+            target_dataset="huada", requested_input_profile=input_profile,
+            allow_profile_override=allow_profile_override,
         )
     model = build_source_initialized_probe(source_state, device)
     initial_fingerprint = tensor_state_fingerprint(probe_state_cpu(model))
@@ -552,6 +577,7 @@ def _critical_code_hashes(project_root: Path) -> dict[str, str]:
         "scripts/downstream_50m/model.py", "scripts/downstream_50m/feature_cache.py",
         "scripts/downstream_50m/age_cv7.py", "scripts/downstream_50m/dortmund_huada_zero_shot.py",
         "scripts/downstream_50m/run_huada_dortmund_age_probe_transfer_cv7.py",
+        "scripts/fbmae_training_profiles.py",
     ]
     return {path: sha256_file(project_root / path) for path in paths}
 
@@ -581,6 +607,12 @@ def build_dortmund_cache_identity(
         "token_mask_semantics_version": checkpoint_report["token_mask_semantics_version"],
         "source_checkpoint_best_epoch": checkpoint_report["best_epoch"],
         "source_checkpoint_architecture": architecture,
+        "target_dataset": "huada",
+        "input_profile_id": checkpoint_report["deployment_profile"]["effective_profile_id"],
+        "input_profile_sha256": checkpoint_report["deployment_profile"]["canonical_sha256"],
+        "allowed_channel_slots": checkpoint_report["deployment_profile"]["allowed_channels"],
+        "effective_valid_token_policy": checkpoint_report["deployment_profile"]["effective_valid_token_policy"],
+        "profile_override": checkpoint_report["deployment_profile"]["profile_override"],
     })
     return identity, cache.sha256_json(identity)
 
@@ -593,6 +625,9 @@ def ensure_dortmund_mean_cache(args, logger):
         args.expected_checkpoint_sha256,
         args.expected_source_age_mean,
         args.expected_source_age_std,
+        target_dataset="huada",
+        requested_input_profile=args.input_profile,
+        allow_profile_override=args.allow_profile_override,
     )
     git_commit, git_dirty = cache.get_git_state(project_root)
     critical = _critical_code_hashes(project_root); code_sha = cache.sha256_json(critical)
@@ -600,7 +635,10 @@ def ensure_dortmund_mean_cache(args, logger):
         input_fingerprint=input_fingerprint, input_info=input_info,
         checkpoint_report=checkpoint_report, code_sha256=code_sha, git_commit=git_commit,
     )
-    root = Path(args.feature_cache_root).resolve()
+    deployment = checkpoint_report["deployment_profile"]
+    root = Path(args.feature_cache_root).resolve() / (
+        f"huada_{deployment['effective_profile_id']}"
+    )
     final_dir, manifest, reused = cache.resolve_cache_policy(root, cache_key, args.feature_cache_policy, identity)
     if reused:
         if manifest.get("requested_poolings") != ["mean"] or (final_dir / cache.FLATTEN_CACHE_NAME).exists():
@@ -618,7 +656,8 @@ def ensure_dortmund_mean_cache(args, logger):
     if build_root == root or root in build_root.parents:
         raise ValueError("Feature cache build root must be outside final cache root")
     temporary = build_root / f".{cache_key}.building.{uuid.uuid4().hex}"
-    source = cache.TokenFeatureSourceDataset(args.input_lance)
+    source_raw = cache.TokenFeatureSourceDataset(args.input_lance)
+    source = ProfiledTokenDataset(source_raw, "huada", deployment)
     device = torch.device(args.device)
     model, full_report, payload = load_strict_checkpoint(
         args.checkpoint,
@@ -627,6 +666,9 @@ def ensure_dortmund_mean_cache(args, logger):
         contract=replace(FORMAL_CHECKPOINT_CONTRACT, best_epoch=None),
         expected_source_mean=args.expected_source_age_mean,
         expected_source_std=args.expected_source_age_std,
+        target_dataset="huada",
+        requested_input_profile=args.input_profile,
+        allow_profile_override=args.allow_profile_override,
     )
     # Reuse the zero-shot semantic channel compatibility validator.
     try:
@@ -649,6 +691,7 @@ def ensure_dortmund_mean_cache(args, logger):
         "source_checkpoint_best_epoch": checkpoint_report["best_epoch"],
         "electrode_vocabulary_sha256": checkpoint_report["electrode_vocabulary_sha256"],
         "token_mask_semantics_version": MASK_SEMANTICS_VERSION,
+        "deployment_profile": deployment,
         "critical_code_sha256": critical, "git_commit": git_commit, "git_dirty": git_dirty,
         "requested_poolings": ["mean"], "backbone_fingerprint_before": before,
     }
@@ -937,6 +980,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 batch_size=args.batch_size, num_workers=args.num_workers, seed=args.seed,
                 head_lr=args.head_lr, weight_decay=args.weight_decay, epochs=args.epochs,
                 patience=args.early_stopping_patience, logger=logger, provenance=fold_provenance,
+                input_profile=args.input_profile,
+                allow_profile_override=args.allow_profile_override,
             )
             fold_summaries.append(summary); oof_rows.extend(rows); all_epochs.extend(epochs)
         aggregate = aggregate_oof_artifacts(
@@ -955,6 +1000,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "source_full_checkpoint_sha256": cache_info["checkpoint_report"]["sha256"],
             "source_checkpoint_sha256_expectation_enforced": args.expected_checkpoint_sha256 is not None,
             "source_checkpoint_best_epoch": cache_info["checkpoint_report"]["best_epoch"],
+            "deployment_profile": cache_info["checkpoint_report"]["deployment_profile"],
             "source_target_scaler": {
                 "mean": cache_info["checkpoint_report"]["source_age_mean"],
                 "std": cache_info["checkpoint_report"]["source_age_std"],
@@ -984,6 +1030,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "oof_subject_count": aggregate["oof_subject_count"],
             "oof_subject_mean_metrics": aggregate["oof_subject_mean_metrics"],
             "feature_cache_key": cache_info["feature_cache_key"], "feature_cache_reused": cache_info["feature_cache_reused"],
+            "deployment_profile": cache_info["checkpoint_report"]["deployment_profile"],
             "source_probe_initialization_identical_across_folds": True,
             "source_scaler_reused": True, "target_scaler_fitted_on_huada": False,
             "source_full_checkpoint_sha256": cache_info["checkpoint_report"]["sha256"],

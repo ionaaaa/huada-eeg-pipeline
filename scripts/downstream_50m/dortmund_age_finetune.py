@@ -32,7 +32,7 @@ except ImportError:
 
 SELECTION_ATOL = 1e-6
 TARGET_TRANSFORM_VERSION = "train-subject-equal-zscore-ddof0-v1"
-SAMPLER_VERSION = "global-subject-condition-balanced-sharded-v1"
+SAMPLER_VERSION = "global-subject-condition-balanced-sharded-v2"
 MASK_SEMANTICS_VERSION = "token_valid_mask_true_is_valid_v1"
 GRADIENT_SCOPE_VERSION = "probe-layer-inclusive-explicit-freeze-v1"
 
@@ -134,15 +134,17 @@ class SubjectBalancedDistributedSampler(Sampler[int]):
         self.epoch = 0
         grouped: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
         self.sample_ids = {}
+        self.row_by_index = {}
         for row in self.rows:
             index = int(row["index"])
-            subject = str(row["subject_id"])
+            subject = str(row.get("sampling_subject_id", row["subject_id"]))
             condition = (
                 str(row.get("eyes_condition", "")).strip().lower()
                 .replace("-", "_").replace(" ", "_")
             ) or "unknown"
             grouped[subject][condition].append(index)
             self.sample_ids[index] = str(row["sample_id"])
+            self.row_by_index[index] = dict(row)
         self.grouped = {
             subject: {condition: tuple(sorted(indices)) for condition, indices in conditions.items()}
             for subject, conditions in grouped.items()
@@ -191,6 +193,23 @@ class SubjectBalancedDistributedSampler(Sampler[int]):
                 subject_counts[subject] += 1
                 condition_counts[(subject, condition)] += 1
         sample_counts = Counter(sequence)
+        sample_id_sequence = [self.sample_ids[index] for index in sequence]
+        schedule = []
+        dataset_counts = Counter()
+        selected_subjects = set()
+        for index in sequence:
+            row = self.row_by_index[index]
+            dataset_id = str(row.get("dataset_id", "dortmund"))
+            sampling_subject = str(row.get("sampling_subject_id", row["subject_id"]))
+            dataset_counts[dataset_id] += 1
+            selected_subjects.add(sampling_subject)
+            schedule.append({
+                "dataset_id": dataset_id,
+                "subject_id": sampling_subject,
+                "recording_id": str(row.get("recording_id", "")),
+                "condition": str(row.get("eyes_condition", "")),
+                "sample_id": str(row["sample_id"]),
+            })
         rank_sequences = [sequence[rank::self.world_size] for rank in range(self.world_size)]
         position_overlap = sum(
             len(set(rank_sequences[left]).intersection(rank_sequences[right]))
@@ -215,6 +234,10 @@ class SubjectBalancedDistributedSampler(Sampler[int]):
             "cross_rank_window_identity_overlap": position_overlap,
             "ddp_padding_duplicates": 0,
             "rank_lengths": [len(values) for values in rank_sequences],
+            "sample_id_sequence_sha256": sha256_json(sample_id_sequence),
+            "sampling_schedule_sha256": sha256_json(schedule),
+            "dataset_count": dict(sorted(dataset_counts.items())),
+            "subject_count": len(selected_subjects),
         }
         self._last_global = sequence
         return sequence

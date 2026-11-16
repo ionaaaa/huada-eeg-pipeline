@@ -19,6 +19,8 @@ DEVICE="${DEVICE:-cuda}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 FEATURE_CACHE_POLICY="${FEATURE_CACHE_POLICY:-auto}"
 FEATURE_CACHE_BATCH_SIZE="${FEATURE_CACHE_BATCH_SIZE:-8}"
+INPUT_PROFILE="${INPUT_PROFILE:-auto}"
+ALLOW_PROFILE_OVERRIDE="${ALLOW_PROFILE_OVERRIDE:-0}"
 
 test -d "$HUADA_ROOT"
 test -d "$HUADA_TOKEN_LANCE"
@@ -52,6 +54,7 @@ ARGS=(
   --batch-size "$BATCH_SIZE"
   --seed "$TRAIN_SEED"
   --split-seed "$SPLIT_SEED"
+  --input-profile "$INPUT_PROFILE"
 )
 
 if test -n "${EXPECTED_CKPT_SHA256:-}"; then
@@ -60,6 +63,9 @@ fi
 
 if test -n "${FEATURE_CACHE_BUILD_ROOT:-}"; then
   ARGS+=(--feature-cache-build-root "$FEATURE_CACHE_BUILD_ROOT")
+fi
+if test "$ALLOW_PROFILE_OVERRIDE" = "1"; then
+  ARGS+=(--allow-profile-override)
 fi
 if test -n "${ZERO_SHOT_REFERENCE_DIR:-}"; then
   ARGS+=(--zero-shot-reference-dir "$ZERO_SHOT_REFERENCE_DIR")

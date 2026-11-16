@@ -844,66 +844,101 @@ set -euo pipefail
 export HUADA_ROOT="/opt/ml/cfs_input"
 export PYTHON_BIN="python"
 
-# 必须指向包含新增被试的新 token Lance
 export INPUT_LANCE="$HUADA_ROOT/data/model_tokens_full/fbmae_tokens/20261112_142653/dortmund_fbmae_tokens.lance"
-
 export PRETRAINED_50M_CKPT="$HUADA_ROOT/data/checkpoint/pretrain_checkpoint_4.pt"
+
+export TRAINING_PROFILES="$HUADA_ROOT/configs/mipdb_dortmund_fbmae_training_profiles_v1.json"
 
 export TRAIN_RATIO="0.8"
 export VALIDATION_RATIO="0.1"
 export TEST_RATIO="0.1"
 export SPLIT_SEED="42"
 
-# 必须生成新的冻结 split，不能继续使用旧的 214 人 manifest
+# 不要使用 *；它在引号内会成为路径名的一部分
 export SPLIT_OUTPUT="$HUADA_ROOT/downstream_output/dortmund_age_split_seed${SPLIT_SEED}_$(date +%Y%m%d_%H%M%S)"
 
 test -d "$HUADA_ROOT"
 test -d "$INPUT_LANCE"
 test -f "$PRETRAINED_50M_CKPT"
+test -f "$TRAINING_PROFILES"
 test ! -e "$SPLIT_OUTPUT"
 
 cd "$HUADA_ROOT"
 
+# 针对新20–44岁Lance生成新的冻结split
 bash commands/create_dortmund_age_split.sh
 
 export SPLIT_MANIFEST="$SPLIT_OUTPUT/subject_split_manifest.csv"
 test -f "$SPLIT_MANIFEST"
 
-# 强制确认 token Lance 和新 manifest 的被试集合完全一致
+# 验证完整Lance与新manifest一致，并确认20–35岁有效子集在三个split中均非空
 "$PYTHON_BIN" - "$INPUT_LANCE" "$SPLIT_MANIFEST" <<'PY'
 import csv
 import sys
+
 import lance
 
 lance_path, manifest_path = sys.argv[1:]
 
 ds = lance.dataset(lance_path)
-token_subjects = {
-    str(x)
-    for x in ds.to_table(columns=["subject_id"])["subject_id"].to_pylist()
+token_rows = ds.to_table(
+    columns=["subject_id", "age"]
+).to_pylist()
+
+token_subject_ages = {}
+for row in token_rows:
+    subject_id = str(row["subject_id"]).strip()
+    age = float(row["age"])
+    previous = token_subject_ages.setdefault(subject_id, age)
+    assert previous == age, (
+        f"Inconsistent age for {subject_id}: {previous} vs {age}"
+    )
+
+with open(manifest_path, encoding="utf-8-sig", newline="") as handle:
+    manifest_rows = list(csv.DictReader(handle))
+
+manifest_subjects = {
+    row["subject_id"].strip()
+    for row in manifest_rows
 }
-
-with open(manifest_path, encoding="utf-8-sig", newline="") as f:
-    manifest_rows = list(csv.DictReader(f))
-
-manifest_subjects = {row["subject_id"].strip() for row in manifest_rows}
+token_subjects = set(token_subject_ages)
 
 print("token_subject_count =", len(token_subjects))
 print("manifest_subject_count =", len(manifest_subjects))
 print("token_only =", sorted(token_subjects - manifest_subjects))
 print("manifest_only =", sorted(manifest_subjects - token_subjects))
 
-assert token_subjects == manifest_subjects, \
+assert token_subjects == manifest_subjects, (
     "Token Lance and split manifest subject sets differ"
+)
 
-split_counts = {}
+full_split_counts = {}
+eligible_split_counts = {}
+
 for row in manifest_rows:
-    split_counts[row["split"]] = split_counts.get(row["split"], 0) + 1
+    split = row["split"].strip()
+    age = float(row["age"])
 
-print("split_counts =", split_counts)
-assert all(split_counts.get(x, 0) > 0 for x in ("train", "validation", "test"))
+    full_split_counts[split] = full_split_counts.get(split, 0) + 1
 
-print("NEW SPLIT MANIFEST VALIDATION PASSED")
+    if 20.0 <= age <= 35.0:
+        eligible_split_counts[split] = (
+            eligible_split_counts.get(split, 0) + 1
+        )
+
+print("full_20_44_split_counts =", full_split_counts)
+print("effective_20_35_split_counts =", eligible_split_counts)
+
+assert all(
+    full_split_counts.get(split, 0) > 0
+    for split in ("train", "validation", "test")
+)
+assert all(
+    eligible_split_counts.get(split, 0) > 0
+    for split in ("train", "validation", "test")
+), "20-35 profile produced an empty split"
+
+print("NEW SPLIT AND 20-35 PROFILE VALIDATION PASSED")
 PY
 
 export NPROC_PER_NODE="4"
@@ -913,14 +948,20 @@ export ACCUMULATION_STEPS="4"
 export BACKBONE_LR="5e-6"
 export HEAD_LR="5e-5"
 export FULL_EPOCHS="40"
-
-# Lance 必须保持 0
 export NUM_WORKERS="0"
 
-# 不要让新数据错误关联旧的审计报告。
-# 如果已有针对新 token Lance 的审计，请把这里换成其 audit_summary.json。
-# 这个不存在的路径会让当前 record_only 入口不附加旧审计。
+# 不关联旧Lance的审计报告
 export AUDIT_SUMMARY="$HUADA_ROOT/audit_dortmund_fbmae_tokens/NO_MATCHING_AUDIT_SUPPLIED.json"
+
+# 方案一：Dortmund原生有效64槽
+export TRAINING_PROFILE="dortmund_native64"
+
+bash commands/run_dortmund_age_full_finetune_full.sh
+```
+
+如果要换成18ch，最后两行改成
+```bash
+export TRAINING_PROFILE="dortmund_matched18"
 
 bash commands/run_dortmund_age_full_finetune_full.sh
 ```
@@ -958,9 +999,9 @@ bash commands/run_dortmund_age_full_finetune_full.sh
 
 ### FBMAE：华大 strict zero-shot 与 probe transfer
 
-#### `train-1716024027476929280`：Dortmund 年龄数据集在FBMAE上fft后在华大数据集上的 strict zero-shot
+#### `train-1716024027476929280`：Dortmund 年龄数据集在FBMAE上fft后在华大数据集上的 strict zero-shot（每次只用改ckpt就能运行，不用再改脚本，不管是Dortmund单个数据集还是和MIPDB的joint）
 
-- 任务：`train-1709495944922652544`
+- 任务：`train-1716803504344260480`
 - 产物：`/opt/ml/cfs_input/downstream_output/50m_dortmund_age_huada_zero_shot_20261103_154351`
 
 ```bash
@@ -971,19 +1012,30 @@ export PYTHON_BIN="python"
 
 export HUADA_TOKEN_LANCE="/opt/ml/cfs_input/model_tokens_full/20261030_140104/huada_model_tokens_8sub.lance"
 
-# 改成新训练输出的 best_full_checkpoint.pt
-export DORTMUND_AGE_CKPT="/opt/ml/cfs_input/downstream_output/dortmund_age_full_finetune_20261112_145413/checkpoints/best_full_checkpoint.pt"
+# 唯一需要按实验修改的主要路径
+export DORTMUND_AGE_CKPT="/opt/ml/cfs_input/downstream_output/dortmund_age_full_finetune_dortmund_matched18_20261113_164737/checkpoints/best_full_checkpoint.pt"
 
 export OUTPUT_ROOT="/opt/ml/cfs_input/downstream_output"
 export DEVICE="cuda"
 export BATCH_SIZE="8"
 
-# Lance 建议保持 0
+# Lance 建议保持0
 export NUM_WORKERS="0"
+
+# 正式运行固定为自动读取checkpoint契约
+export INPUT_PROFILE="auto"
+export ALLOW_PROFILE_OVERRIDE="0"
 
 test -d "$HUADA_ROOT"
 test -d "$HUADA_TOKEN_LANCE"
 test -f "$DORTMUND_AGE_CKPT"
+test "$(basename "$DORTMUND_AGE_CKPT")" = "best_full_checkpoint.pt"
+
+# 锁定本次实际使用的checkpoint
+export EXPECTED_CKPT_SHA256="$(
+  sha256sum "$DORTMUND_AGE_CKPT" | awk '{print $1}'
+)"
+echo "EXPECTED_CKPT_SHA256=$EXPECTED_CKPT_SHA256"
 
 cd "$HUADA_ROOT"
 
@@ -1618,6 +1670,51 @@ TIONE_OUTPUT_ROOT=/opt/ml/cfs_input/data/model_tokens_full/fbmae_tokens/ \
 bash /opt/ml/cfs_input/commands/run_mipdb_fbmae_adapter_full.sh
 ```
 
+#### dortmund+MIPDB联合训练
+- B：主实验，Dortmund公共18通道，MIPDB用block01 candidate、映射18通道，检验MIPDB是否真正带来提升
+- C：通道敏感性，Dortmund原生64通道，MIPDB用block01 candidate、映射18通道，检验可变通道数量的影响
+```bash
+set -euo pipefail
+
+export HUADA_ROOT="/mnt/cfs/jianyu/huada-eeg-pipeline"
+export PYTHON_BIN="python"
+
+export DORTMUND_INPUT_LANCE="$HUADA_ROOT/data/model_tokens_full/fbmae_tokens/20261112_142653/dortmund_fbmae_tokens.lance"
+export MIPDB_INPUT_LANCE="$HUADA_ROOT/data/mipdb_fbmae_tokens_full/<MIPDB_RUN>/mipdb_fbmae_tokens.lance"
+
+# 必须是原有固定172/21/21 manifest
+export DORTMUND_SPLIT_MANIFEST="$HUADA_ROOT/downstream_output/<FROZEN_172_21_21_SPLIT>/subject_split_manifest.csv"
+
+export PRETRAINED_50M_CKPT="$HUADA_ROOT/data/checkpoint/pretrain_checkpoint_4.pt"
+export EXPECTED_CKPT_SHA256="97335b696b3ae9138dcb51c736f49ee1c6008fdc22fc42f13ea9a5301452f36e"
+
+export OUTPUT_ROOT="$HUADA_ROOT/downstream_output"
+
+export NPROC_PER_NODE="4"
+export PER_DEVICE_BATCH_SIZE="4"
+export ACCUMULATION_STEPS="4"
+export FULL_EPOCHS="40"
+export SAMPLES_PER_EPOCH="6200"
+
+export BACKBONE_LR="5e-6"
+export HEAD_LR="5e-5"
+export WEIGHT_DECAY="0.05"
+export WARMUP_RATIO="0.1"
+export EARLY_STOPPING_PATIENCE="15"
+
+export TRAIN_SEED="42"
+export NUM_WORKERS="0"
+
+cd "$HUADA_ROOT"
+
+# B：Dortmund matched18 + MIPDB block01 sparse18
+export TRAINING_PROFILE="joint_matched18"
+bash commands/run_dortmund_mipdb_age_joint_finetune_full.sh
+
+# C：Dortmund native64 + MIPDB block01 sparse18
+export TRAINING_PROFILE="joint_native64_vs_sparse18"
+bash commands/run_dortmund_mipdb_age_joint_finetune_full.sh
+```
 
 
 ## 无有效 stdout 的成功任务
@@ -1653,3 +1750,41 @@ train-<task-id>/log_<task-id>_..._<export-id>.tar.gz
 /mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_huada\_zero\_shot\_20261103\_154351/
 /mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_probe\_transfer\_cv7\_20261103\_081646/
 
+
+![都是Dortmund数据集，old是全通道，new是18通道](downstream_output\age_experiment_comparison\four_experiment_audit_20261113_180200\age_predicted_vs_ground_truth_scatter.png)
+来源：/mnt/cfs/jianyu/huada-eeg-pipeline/downstream_output/50m_dortmund_age_huada_zero_shot_20261113_174243/
+/mnt/cfs/jianyu/huada-eeg-pipeline/downstream_output/50m_dortmund_age_probe_transfer_cv7_20261113_094541/
+/mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_huada\_zero\_shot\_20261103\_154351/
+/mnt/cfs/jianyu/huada-eeg-pipeline/downstream\_output/50m\_dortmund\_age\_probe\_transfer\_cv7\_20261103\_081646/
+## Dortmund + MIPDB age joint full-finetune (B/C)
+
+Joint training opens the two physical token Lance datasets independently.  It
+filters MIPDB to `block01` at read time and uses the frozen 172/21/21 Dortmund
+split plus the versioned 15/2/2 MIPDB split.  Both experiments use the same
+187-subject, subject-equal age transform and the same subject-balanced sampling
+schedule; the only B/C difference is the Dortmund channel profile.
+
+Required frozen inputs are:
+
+- `configs/mipdb_subject_split_manifest_v1.csv`
+- `configs/joint_subject_split_manifest_v1.csv`
+- `configs/joint_target_transform_v1.json`
+- `configs/joint_age_training_contract_v1.json`
+
+Run B with `TRAINING_PROFILE=joint_matched18`, or C with
+`TRAINING_PROFILE=joint_native64_vs_sparse18`:
+
+```bash
+export HUADA_ROOT="/opt/ml/cfs_input"
+export PYTHON_BIN="python"
+export DORTMUND_INPUT_LANCE="$HUADA_ROOT/data/model_tokens_full/fbmae_tokens/<DORTMUND_RUN>/dortmund_fbmae_tokens.lance"
+export MIPDB_INPUT_LANCE="$HUADA_ROOT/data/mipdb_fbmae_tokens_full/<MIPDB_RUN>/mipdb_fbmae_tokens.lance"
+export DORTMUND_SPLIT_MANIFEST="$HUADA_ROOT/downstream_output/<FROZEN_172_21_21_SPLIT>/subject_split_manifest.csv"
+export PRETRAINED_50M_CKPT="$HUADA_ROOT/data/checkpoint/pretrain_checkpoint_4.pt"
+export TRAINING_PROFILE="joint_matched18"
+bash commands/run_dortmund_mipdb_age_joint_finetune_full.sh
+```
+
+The command refuses profiles other than the two joint profiles, validates all
+frozen artifact SHA256 values, checks the pretrained checkpoint SHA256, and
+writes a new timestamped output directory.

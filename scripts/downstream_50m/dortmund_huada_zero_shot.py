@@ -10,6 +10,7 @@ import csv
 import hashlib
 import json
 import math
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,11 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import torch
 from scipy import stats
+
+SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+from fbmae_training_profiles import resolve_checkpoint_deployment_profile
 
 try:
     from .model import EEGPretrainModel
@@ -296,6 +302,9 @@ def load_strict_checkpoint(
     contract: CheckpointContract = FORMAL_CHECKPOINT_CONTRACT,
     expected_source_mean: float | None = SOURCE_AGE_MEAN,
     expected_source_std: float | None = SOURCE_AGE_STD,
+    target_dataset: str | None = None,
+    requested_input_profile: str = "auto",
+    allow_profile_override: bool = False,
 ) -> tuple[torch.nn.Module, dict[str, Any], Mapping[str, Any]]:
     path = Path(checkpoint)
     if path.name == "last_training_checkpoint.pt":
@@ -315,6 +324,13 @@ def load_strict_checkpoint(
         expected_source_mean=expected_source_mean,
         expected_source_std=expected_source_std,
     )
+    if target_dataset is not None:
+        try:
+            report["deployment_profile"] = resolve_checkpoint_deployment_profile(
+                payload, target_dataset, requested_input_profile, allow_profile_override
+            )
+        except ValueError as error:
+            raise ZeroShotValidationError(str(error)) from error
     model.backbone.load_state_dict(payload["backbone_state_dict"], strict=True, assign=True)
     model.head.load_state_dict(payload["age_probe_state_dict"], strict=True, assign=True)
     for parameter in model.parameters():

@@ -1,50 +1,43 @@
 {
   "profile_set": "mipdb_dortmund_fbmae_training_profiles_v1",
-  "physical_cache_policy": "one_cache_per_dataset_profiles_applied_at_training_read_time",
-  "standard_channels_source": "scripts/build_huada_model_tokens.py:STANDARD_64_CHANNELS",
-  "shared_target_channels": [
-    "Fp1", "Fp2", "Fz", "F3", "F7", "C3", "T7", "P3", "P7",
-    "Pz", "O1", "O2", "P4", "P8", "C4", "T8", "F8", "F4"
-  ],
-  "channel_modes": {
-    "native64": {
-      "allowed_target_channels": "all",
-      "description": "Keep every valid source slot from the physical standard64 token cache."
-    },
-    "matched18": {
-      "allowed_target_channels": "shared_target_channels",
-      "description": "Keep only the 18 Dortmund/MIPDB shared standard64 slots."
-    },
-    "sparse18": {
-      "allowed_target_channels": "shared_target_channels",
-      "description": "MIPDB sparse18 slots; semantically identical slot set to matched18."
-    }
-  },
+  "checkpoint_profile_contract_version": "fbmae-deployment-profile-v1",
+  "physical_cache_policy": "one_cache_per_dataset_profiles_applied_at_read_time",
+  "channel_profile_registry": "scripts/fbmae_training_profiles.py:CHANNEL_PROFILE_REGISTRY",
   "profiles": {
     "dortmund_native64": {
       "role": "dortmund_baseline",
-      "datasets": {"dortmund": "native64"},
+      "datasets": {"dortmund": "standard64_native_v1"},
+      "deployment_profiles": {"huada": "standard64_native_v1"},
       "dataset_filters": {"dortmund": {"min_age": 20, "max_age": 35}}
     },
     "dortmund_matched18": {
       "role": "dortmund_matched_channel_control",
-      "datasets": {"dortmund": "matched18"},
+      "datasets": {"dortmund": "standard64_sparse18_v1"},
+      "deployment_profiles": {"huada": "standard64_sparse18_v1"},
       "dataset_filters": {"dortmund": {"min_age": 20, "max_age": 35}}
     },
     "joint_matched18": {
       "role": "primary_joint_experiment",
-      "datasets": {"dortmund": "matched18", "mipdb": "sparse18"},
+      "datasets": {
+        "dortmund": "standard64_sparse18_v1",
+        "mipdb": "standard64_sparse18_v1"
+      },
+      "deployment_profiles": {"huada": "standard64_sparse18_v1"},
       "dataset_filters": {
         "dortmund": {"min_age": 20, "max_age": 35},
-        "mipdb": {"min_age": 20, "max_age": 35}
+        "mipdb": {"min_age": 20, "max_age": 35, "block_id": "block01"}
       }
     },
     "joint_native64_vs_sparse18": {
       "role": "joint_channel_sensitivity_experiment",
-      "datasets": {"dortmund": "native64", "mipdb": "sparse18"},
+      "datasets": {
+        "dortmund": "standard64_native_v1",
+        "mipdb": "standard64_sparse18_v1"
+      },
+      "deployment_profiles": {"huada": "standard64_native_v1"},
       "dataset_filters": {
         "dortmund": {"min_age": 20, "max_age": 35},
-        "mipdb": {"min_age": 20, "max_age": 35}
+        "mipdb": {"min_age": 20, "max_age": 35, "block_id": "block01"}
       }
     }
   }

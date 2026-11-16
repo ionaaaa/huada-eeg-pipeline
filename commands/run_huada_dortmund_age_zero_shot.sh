@@ -9,6 +9,8 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${BATCH_SIZE:=8}"
 : "${NUM_WORKERS:=0}"
+: "${INPUT_PROFILE:=auto}"
+: "${ALLOW_PROFILE_OVERRIDE:=0}"
 
 test -d "${HUADA_ROOT}"
 test -d "${HUADA_TOKEN_LANCE}"
@@ -31,11 +33,16 @@ checkpoint_args=()
 if [[ -n "${EXPECTED_CKPT_SHA256:-}" ]]; then
   checkpoint_args+=(--expected-checkpoint-sha256 "${EXPECTED_CKPT_SHA256}")
 fi
+profile_args=(--input-profile "${INPUT_PROFILE}")
+if [[ "${ALLOW_PROFILE_OVERRIDE}" == "1" ]]; then
+  profile_args+=(--allow-profile-override)
+fi
 
 exec "${PYTHON_BIN}" scripts/downstream_50m/run_huada_dortmund_age_zero_shot.py \
   --input-lance "${HUADA_TOKEN_LANCE}" \
   --checkpoint "${DORTMUND_AGE_CKPT}" \
   "${checkpoint_args[@]}" \
+  "${profile_args[@]}" \
   --output-dir "${run_output}" \
   --device "${DEVICE}" \
   --batch-size "${BATCH_SIZE}" \
