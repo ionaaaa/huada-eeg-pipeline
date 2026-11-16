@@ -140,8 +140,12 @@ def collate_fn(batch):
         "sex", "eyes_condition", "dataset_id", "block_id", "source_path",
         "task_semantics", "header_signature", "subject", "subj_id", "participant_id",
     ]:
-        if meta_key in batch[0]:
-            out[meta_key] = [str(x[meta_key]) for x in batch]
+        if any(meta_key in sample for sample in batch):
+            # Multi-source batches legitimately mix dataset-specific optional
+            # metadata (for example Dortmund eyes_condition and MIPDB block_id).
+            # Missing values are explicit empty strings; they must not make a
+            # rank fail while peers enter a DDP collective.
+            out[meta_key] = [str(sample.get(meta_key, "")) for sample in batch]
 
     for tensor_key in ["source_sfreq", "model_sfreq", "window_index"]:
         if tensor_key in batch[0]:

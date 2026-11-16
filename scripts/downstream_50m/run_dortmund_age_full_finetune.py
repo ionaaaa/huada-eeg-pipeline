@@ -913,6 +913,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "train": train_profile_audit if is_joint else train_profile_audit["dortmund"],
             "validation": validation_profile_audit if is_joint else validation_profile_audit["dortmund"],
         }
+        if is_joint:
+            if not isinstance(train_dataset, MultiSourceAgeDataset):
+                raise RuntimeError("Joint training dataset wrapper is missing")
+            probe_indices = [0, *train_dataset.cumulative_sizes[:-1]]
+            mixed_probe = collate_fn([train_dataset[index] for index in probe_indices])
+            if mixed_probe.get("dataset_id") != list(train_dataset.dataset_ids):
+                raise RuntimeError("Mixed-source collate changed dataset order")
+            if tuple(mixed_probe["token_inputs"].shape) != (
+                len(train_dataset.dataset_ids), 640, 100,
+            ):
+                raise RuntimeError("Mixed-source collate changed checkpoint geometry")
+            profile_dataset_audit["mixed_source_collate"] = {
+                "status": "passed",
+                "dataset_order": list(train_dataset.dataset_ids),
+                "token_inputs_shape": list(mixed_probe["token_inputs"].shape),
+                "optional_metadata_missing_value": "empty_string",
+            }
         if args.smoke:
             if is_joint:
                 train_dataset = _joint_smoke_subset(

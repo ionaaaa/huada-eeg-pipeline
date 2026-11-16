@@ -30,6 +30,7 @@ from fbmae_training_profiles import (  # noqa: E402
     resolve_training_profile,
 )
 from run_dortmund_mipdb_age_joint_finetune import validate_joint_cli  # noqa: E402
+from dataset import collate_fn  # noqa: E402
 
 
 class SyntheticTokens(Dataset):
@@ -54,7 +55,7 @@ class SyntheticTokens(Dataset):
 
     def __getitem__(self, index):
         row = self.rows[index]
-        return {
+        sample = {
             "sample_id": row["sample_id"],
             "subject_id": row["subject_id"],
             "recording_id": row["recording_id"],
@@ -67,8 +68,10 @@ class SyntheticTokens(Dataset):
             "channel_valid_mask": torch.ones(64),
             "label": torch.tensor(row["age"]),
             "sex": "",
-            "eyes_condition": row["eyes_condition"],
         }
+        if self.dataset_id == "dortmund":
+            sample["eyes_condition"] = row["eyes_condition"]
+        return sample
 
     def get_sampling_rows(self):
         return [dict(row) for row in self.rows]
@@ -128,6 +131,20 @@ def test_mipdb_is_bitwise_identical_b_c(catalog):
     mipdb_index = next(row["index"] for row in b.get_sampling_rows() if row["dataset_id"] == "mipdb")
     for field in ("token_inputs", "token_valid_mask", "targets", "channel_valid_mask"):
         assert torch.equal(b[mipdb_index][field], c[mipdb_index][field])
+
+
+def test_mixed_source_collate_fills_missing_optional_metadata(catalog):
+    b, _ = build_pair(catalog)
+    rows = b.get_sampling_rows()
+    dortmund_index = next(row["index"] for row in rows if row["dataset_id"] == "dortmund")
+    mipdb_index = next(row["index"] for row in rows if row["dataset_id"] == "mipdb")
+    batch = collate_fn([b[dortmund_index], b[mipdb_index]])
+    assert batch["dataset_id"] == ["dortmund", "mipdb"]
+    assert batch["eyes_condition"] == ["eyes_open", ""]
+    assert batch["block_id"] == ["", "block01"]
+    reversed_batch = collate_fn([b[mipdb_index], b[dortmund_index]])
+    assert reversed_batch["eyes_condition"] == ["", "eyes_open"]
+    assert reversed_batch["block_id"] == ["block01", ""]
 
 
 def test_only_dortmund_profile_differs_and_invalid_values_are_zero(catalog):
